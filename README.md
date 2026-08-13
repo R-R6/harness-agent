@@ -20,8 +20,27 @@
 - [ ] 阶段 2：闭环接入 + 审查看板
 - [ ] 阶段 3：MCP 健康检查 + 打包
 
+## 目录结构
+
+```
+Harness_agent/
+├── src/               # React 前端
+├── src-tauri/         # Rust 后端（薄 command 层，零业务逻辑）
+│   ├── src/main.rs    # 入口
+│   ├── src/lib.rs     # Tauri 应用构建
+│   └── tauri.conf.json
+└── package.json       # 前端依赖与脚本
+```
+
+## 开发命令
+
+```bash
+npm install          # 装前端依赖
+npm run tauri dev    # 开发模式（需 tauri-cli）
+npm run tauri build  # 构建发布版
+```
+
 ## 目录约定
 
-- `src/`：React 前端
-- `src-tauri/`：Rust 后端（薄 command 层，零业务逻辑）
 - Rust 工具链位于 `F:\develop_soft\IDE\AI_tools\Rust_env`（不占 C 盘）
+- 首版范围：Windows 内部版（macOS 列阶段 4）
