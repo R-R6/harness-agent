@@ -16,6 +16,12 @@ dist-ssr
 /src-tauri/target/
 *.rs.bk
 
+# 演示/临时产物（监督闭环演示目录）
+/.demo-mock/
+/.demo-real/
+__pycache__/
+*.pyc
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
