@@ -26,6 +26,9 @@ pub struct SessionInfo {
     #[serde(rename = "agentLabel")]
     pub agent_label: String,
     pub file: String,
+    /// 会话标题（ai-title/custom-title/session_meta.title），空则前端回退文件名
+    #[serde(default)]
+    pub title: String,
     pub updated: String,
 }
 

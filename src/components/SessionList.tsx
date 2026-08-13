@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { formatShort } from "../lib/formatTime";
 import type { SessionInfo } from "../types";
 
 interface Props {
@@ -7,9 +8,14 @@ interface Props {
   onSelect: (s: SessionInfo) => void;
 }
 
+/** 文件名（无标题时的回退显示） */
+function fileName(file: string): string {
+  return file.split(/[\\/]/).pop() ?? file;
+}
+
 /**
- * 会话列表：按 agent 分组（Claude Code / Codex 各一组，组标题带主题色徽章），
- * 组内保持返回顺序（按更新时间倒序），点击加载正文
+ * 会话列表：按 agent 分组（Claude Code / Codex 各一组，组标题带主题色徽章）。
+ * 每项单行紧凑布局：[标题/文件名] …… [北京时间]（时间右对齐）
  */
 export function SessionList({ sessions, selectedFile, onSelect }: Props) {
   const groups = useMemo(() => {
@@ -35,22 +41,21 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
             <span className="count">{list.length}</span>
           </h3>
           <ul className="session-list">
-            {list.map((s) => (
-              <li
-                key={s.file}
-                data-agent={s.agent}
-                className={s.file === selectedFile ? "selected" : ""}
-              >
-                <button
-                  type="button"
-                  onClick={() => onSelect(s)}
-                  title={s.file}
+            {list.map((s) => {
+              const label = s.title?.trim() || fileName(s.file);
+              return (
+                <li
+                  key={s.file}
+                  data-agent={s.agent}
+                  className={s.file === selectedFile ? "selected" : ""}
                 >
-                  <span className="time">{s.updated}</span>
-                  <span className="file">{s.file.split(/[\\/]/).pop()}</span>
-                </button>
-              </li>
-            ))}
+                  <button type="button" onClick={() => onSelect(s)} title={s.file}>
+                    <span className="file">{label}</span>
+                    <span className="time">{formatShort(s.updated)}</span>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         </div>
       ))}

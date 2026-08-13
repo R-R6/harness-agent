@@ -3,6 +3,7 @@ export interface SessionInfo {
   agent: string;
   agentLabel: string;
   file: string;
+  title?: string; // 会话标题，空则回退文件名
   updated: string;
 }
 

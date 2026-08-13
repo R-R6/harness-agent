@@ -262,6 +262,10 @@ body {
   font-weight: normal;
 }
 
+.session-list li {
+  border-bottom: 1px solid var(--border);
+}
+
 .session-list li.selected {
   background: var(--claude-soft);
 }
@@ -270,8 +274,38 @@ body {
   background: var(--codex-soft);
 }
 
+/* 单行紧凑：标题/文件名左对齐省略，时间右对齐 */
+.session-list button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font-size: 12.5px;
+}
+
 .session-list button:hover {
   background: #f0f2f5;
+}
+
+.session-list .file {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.session-list .time {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 /* transcript 消息徽章 */

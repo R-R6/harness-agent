@@ -22,8 +22,9 @@ describe("TranscriptView", () => {
     expect(screen.getByText("无内容")).toBeInTheDocument();
   });
 
-  it("带时间戳时显示 at", () => {
+  it("带时间戳时按北京时间显示", () => {
     render(<TranscriptView entries={entries} />);
-    expect(screen.getByText("2026-08-13T10:00:00+08:00")).toBeInTheDocument();
+    // formatFull 把 ISO 转成北京时间：2026-08-13T10:00:00+08:00 → 2026-08-13 10:00:00
+    expect(screen.getByText("2026-08-13 10:00:00")).toBeInTheDocument();
   });
 });

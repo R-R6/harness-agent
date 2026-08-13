@@ -5,6 +5,7 @@ import { SearchBox } from "./components/SearchBox";
 import { SupervisePanel } from "./components/SupervisePanel";
 import { ReviewBoard } from "./components/ReviewBoard";
 import { fetchSessions, fetchTranscript, searchSessions } from "./lib/api";
+import { formatFull } from "./lib/formatTime";
 import type { SessionInfo, TranscriptEntry } from "./types";
 import "./App.css";
 
@@ -136,7 +137,7 @@ function App() {
             {selected ? (
               <>
                 <h2>
-                  {selected.agentLabel} · {selected.updated}
+                  {selected.agentLabel} · {formatFull(selected.updated)}
                 </h2>
                 <p className="file-path" title={selected.file}>
                   {selected.file}
