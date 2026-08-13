@@ -1,0 +1,9 @@
+[package]
+name = "session_proxy"
+version = "0.1.0"
+description = "会话数据代理：复用 mcp-lab 的 agent-sessions-mcp (server.js) 作为会话数据源"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
