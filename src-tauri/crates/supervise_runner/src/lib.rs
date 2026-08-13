@@ -1,0 +1,355 @@
+//! supervise_runner —— 监督闭环进程桥
+//!
+//! 复用 mcp-lab 方案 A 的 supervise.ps1（真实闭环引擎），本 crate 负责：
+//! 1. spawn pwsh supervise.ps1（参数映射）
+//! 2. 解析 .supervise 产物（review-N.md 逐轮意见 + final-report.json 最终报告）
+//!
+//! 独立 crate 原因同 session_proxy：不依赖 tauri，cargo test 可正常跑
+//! （tauri 依赖链会引入 WebView2Loader.dll 运行时问题）。
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+
+use serde::{Deserialize, Serialize};
+
+// ---------------- 请求/产物数据结构（契约） ----------------
+
+/// 启动监督闭环的请求参数（对应 supervise.ps1 参数）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuperviseRequest {
+    pub task: String,
+    pub work_dir: String,
+    /// L0/L1/L2（默认 L1，映射 MaxRounds 1/3/5 + 模型）
+    #[serde(default)]
+    pub level: Option<String>,
+    /// 显式轮数（>0 时覆盖 Level 推导）
+    #[serde(default)]
+    pub max_rounds: Option<i64>,
+    /// 显式审查模型（非空时覆盖 Level 推导）
+    #[serde(default)]
+    pub model: Option<String>,
+    /// 模拟模式（不真调 claude/codex）
+    #[serde(default)]
+    pub mock: bool,
+}
+
+/// final-report.json 里的单轮审查记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerdictEntry {
+    pub round: i64,
+    /// PASS / REVIEW
+    pub verdict: String,
+    pub reason: String,
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub file: String,
+}
+
+/// final-report.json 最终报告
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuperviseSummary {
+    /// accepted（通过）/ rejected（轮数用完未过）
+    pub status: String,
+    pub task: String,
+    pub rounds: i64,
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    #[serde(rename = "sessionFile", default)]
+    pub session_file: String,
+    pub verdicts: Vec<VerdictEntry>,
+}
+
+/// 单轮审查意见（review-N.md 解析结果）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewArtifact {
+    pub round: i64,
+    pub verdict: String,
+    pub reason: String,
+    pub model: String,
+    pub session_id: String,
+}
+
+// ---------------- 路径定位 ----------------
+
+/// PowerShell 可执行文件：优先环境变量 HARNESS_PWSH，否则 powershell（Windows 自带 5.1）
+fn pwsh_path() -> String {
+    std::env::var("HARNESS_PWSH").unwrap_or_else(|_| "powershell".to_string())
+}
+
+/// supervise.ps1 路径：优先 HARNESS_SUPERVISE_SCRIPT，否则 mcp-lab 方案 A 脚本
+fn supervise_script_path() -> String {
+    std::env::var("HARNESS_SUPERVISE_SCRIPT").unwrap_or_else(|_| {
+        "F:\\project\\workspace-side\\mcp-lab\\supervise-loop-script\\supervise.ps1".to_string()
+    })
+}
+
+// ---------------- 进程桥 ----------------
+
+/// spawn pwsh supervise.ps1（stdout/stderr 用管道，由调用方异步读取；stdin 关闭）
+pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
+    let mut cmd = Command::new(pwsh_path());
+    cmd.arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(supervise_script_path())
+        .arg("-Task")
+        .arg(&req.task)
+        .arg("-WorkDir")
+        .arg(&req.work_dir);
+
+    if req.mock {
+        cmd.arg("-Mock");
+    }
+    if let Some(l) = &req.level {
+        cmd.arg("-Level").arg(l);
+    }
+    if let Some(m) = req.max_rounds {
+        if m > 0 {
+            cmd.arg("-MaxRounds").arg(m.to_string());
+        }
+    }
+    if let Some(m) = &req.model {
+        if !m.is_empty() {
+            cmd.arg("-Model").arg(m);
+        }
+    }
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    cmd.spawn()
+        .map_err(|e| format!("spawn pwsh 失败（请确认 PowerShell 可用）: {e}"))
+}
+
+// ---------------- 产物解析 ----------------
+
+/// 读 .supervise 目录产物：
+/// 1. final-report.json（如果有）→ 结构化摘要
+/// 2. review-N.md 系列 → 逐轮意见
+pub fn read_artifacts(work_dir: &str) -> Result<Vec<ReviewArtifact>, String> {
+    let dir = Path::new(work_dir).join(".supervise");
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+
+    // 优先 final-report.json 的 verdicts（结构化、完整）
+    let report_path = dir.join("final-report.json");
+    if report_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&report_path) {
+            if let Ok(summary) = serde_json::from_str::<SuperviseSummary>(&text) {
+                let artifacts: Vec<ReviewArtifact> = summary
+                    .verdicts
+                    .iter()
+                    .map(|v| ReviewArtifact {
+                        round: v.round,
+                        verdict: v.verdict.clone(),
+                        reason: v.reason.clone(),
+                        model: String::new(),
+                        session_id: v.session_id.clone(),
+                    })
+                    .collect();
+                if !artifacts.is_empty() {
+                    return Ok(artifacts);
+                }
+            }
+        }
+    }
+
+    // fallback：逐轮解析 review-N.md
+    let mut out = vec![];
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("读 .supervise 失败: {e}"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("review-") && n.ends_with(".md"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+
+    for f in files {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            if let Some(a) = parse_review_md(&text) {
+                out.push(a);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 解析 review-N.md 文本 → ReviewArtifact（容错：解析失败返回 None）
+fn parse_review_md(text: &str) -> Option<ReviewArtifact> {
+    let round = text
+        .lines()
+        .find(|l| l.starts_with("# 第"))
+        .and_then(|l| {
+            l.split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+        })
+        .and_then(|s| s.parse::<i64>().ok())?;
+
+    let verdict = text
+        .lines()
+        .find(|l| l.contains("判定"))
+        .and_then(|l| l.split(['：', ':']).nth(1))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let model = text
+        .lines()
+        .find(|l| l.contains("模型"))
+        .and_then(|l| l.split(['：', ':']).nth(1))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let session_id = text
+        .lines()
+        .find(|l| l.contains("会话"))
+        .and_then(|l| l.split(['：', ':']).nth(1))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // reason：## 意见 之后的所有行
+    let reason = text
+        .split("## 意见")
+        .nth(1)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    Some(ReviewArtifact {
+        round,
+        verdict,
+        reason,
+        model,
+        session_id,
+    })
+}
+
+// ---------------- 测试 ----------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- 产物解析 ----
+
+    #[test]
+    fn parse_review_md_extracts_fields() {
+        let md = "# 第 3 轮审查意见\n\n- 判定：REVIEW\n- 审查模型：gpt-5.6-luna\n- 会话：mock-0001\n\n## 意见\n\n缺少输入校验，请补充。\n";
+        let a = parse_review_md(md).expect("应解析成功");
+        assert_eq!(a.round, 3);
+        assert_eq!(a.verdict, "REVIEW");
+        assert_eq!(a.model, "gpt-5.6-luna");
+        assert_eq!(a.session_id, "mock-0001");
+        assert!(a.reason.contains("缺少输入校验"));
+    }
+
+    #[test]
+    fn read_artifacts_returns_empty_when_no_dir() {
+        let tmp = std::env::temp_dir().join(format!("sv-nodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(read_artifacts(&tmp.to_string_lossy()).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_artifacts_parses_final_report_json() {
+        let tmp = std::env::temp_dir().join(format!("sv-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sup = tmp.join(".supervise");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("final-report.json"),
+            r#"{"status":"accepted","task":"写计算器","rounds":2,"sessionId":"s1","sessionFile":"f1","verdicts":[{"round":1,"verdict":"REVIEW","reason":"缺校验","sessionId":"s1","file":"f1"},{"round":2,"verdict":"PASS","reason":"已补","sessionId":"s1","file":"f1"}]}"#,
+        )
+        .unwrap();
+        let arts = read_artifacts(&tmp.to_string_lossy()).expect("解析成功");
+        assert_eq!(arts.len(), 2);
+        assert_eq!(arts[0].verdict, "REVIEW");
+        assert_eq!(arts[1].verdict, "PASS");
+        assert_eq!(arts[1].round, 2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_artifacts_falls_back_to_review_md() {
+        let tmp = std::env::temp_dir().join(format!("sv-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sup = tmp.join(".supervise");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("review-1.md"),
+            "# 第 1 轮审查意见\n\n- 判定：PASS\n- 审查模型：gpt-5.6-luna\n- 会话：mock-9\n\n## 意见\n\n一次通过。\n",
+        )
+        .unwrap();
+        let arts = read_artifacts(&tmp.to_string_lossy()).expect("解析成功");
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].verdict, "PASS");
+        assert_eq!(arts[0].session_id, "mock-9");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- 进程桥（fake ps1 fixture） ----
+
+    #[test]
+    fn spawn_supervise_passes_args_and_captures_stdout() {
+        // 用假的 ps1 充当 supervise 脚本：打印收到的参数 + 输出模拟日志
+        let tmp = std::env::temp_dir().join(format!("sv-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fake_script = tmp.join("fake-supervise.ps1");
+        std::fs::write(
+            &fake_script,
+            "param([string]$Task,[string]$WorkDir,[switch]$Mock,[string]$Level)\n\
+             Write-Output \"TASK=$Task\"\n\
+             Write-Output \"WORKDIR=$WorkDir\"\n\
+             Write-Output \"MOCK=$Mock\"\n\
+             Write-Output \"LEVEL=$Level\"\n",
+        )
+        .unwrap();
+
+        // 环境变量指向 fake 脚本；HARNESS_PWSH 用 powershell.exe
+        let old_script = std::env::var("HARNESS_SUPERVISE_SCRIPT").ok();
+        std::env::set_var("HARNESS_SUPERVISE_SCRIPT", &fake_script);
+        std::env::set_var("HARNESS_PWSH", "powershell");
+
+        let req = SuperviseRequest {
+            task: "写计算器".into(),
+            work_dir: "D:\\work".into(),
+            level: Some("L2".into()),
+            max_rounds: None,
+            model: None,
+            mock: true,
+        };
+        let mut child = spawn_supervise(&req).expect("spawn 成功");
+
+        // 读 stdout（子进程退出后读完）
+        use std::io::{BufRead, BufReader};
+        let stdout = child.stdout.take().expect("stdout 管道");
+        let out: String = BufReader::new(stdout)
+            .lines()
+            .map(|l| l.unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = child.wait();
+
+        assert!(out.contains("TASK=写计算器"), "含 Task: {out}");
+        assert!(out.contains("WORKDIR=D:\\work"), "含 WorkDir: {out}");
+        assert!(out.contains("LEVEL=L2"), "含 Level: {out}");
+        // Mock 是 switch：传了 -Mock 时输出 "MOCK=True"
+        assert!(out.contains("MOCK=True"), "含 Mock: {out}");
+
+        match old_script {
+            Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),
+            None => std::env::remove_var("HARNESS_SUPERVISE_SCRIPT"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}

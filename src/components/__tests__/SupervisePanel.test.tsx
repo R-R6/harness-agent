@@ -1,0 +1,81 @@
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { SupervisePanel } from "../SupervisePanel";
+
+const mocks = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  listen: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
+
+describe("SupervisePanel", () => {
+  beforeEach(() => {
+    mocks.invoke.mockReset();
+    mocks.listen.mockReset();
+    // listen 返回取消函数
+    mocks.listen.mockResolvedValue(() => {});
+  });
+
+  it("渲染任务表单（任务/目录/分级/模拟开关）", () => {
+    render(<SupervisePanel onStarted={() => {}} />);
+    expect(screen.getByText("任务描述")).toBeInTheDocument();
+    expect(screen.getByText("工作目录")).toBeInTheDocument();
+    expect(screen.getByText("分级")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "启动监督闭环" })).toBeInTheDocument();
+  });
+
+  it("空任务点击启动 → 显示错误，不调用 invoke", async () => {
+    render(<SupervisePanel onStarted={() => {}} />);
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    expect(screen.getByText("任务描述不能为空")).toBeInTheDocument();
+    expect(mocks.invoke).not.toHaveBeenCalled();
+  });
+
+  it("填写任务 + 工作目录 → 启动调用 run_supervise", async () => {
+    mocks.invoke.mockResolvedValue("task-123");
+    render(<SupervisePanel onStarted={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "写个猜数字游戏");
+    const dirInput = screen.getByPlaceholderText("Claude 干活的项目目录");
+    await userEvent.clear(dirInput);
+    await userEvent.type(dirInput, "D:\\work");
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    expect(mocks.invoke).toHaveBeenCalledWith("run_supervise", {
+      request: {
+        task: "写个猜数字游戏",
+        work_dir: "D:\\work",
+        level: "L1",
+        mock: true,
+      },
+    });
+  });
+
+  it("mock 关闭时 request.mock=false", async () => {
+    mocks.invoke.mockResolvedValue("task-1");
+    render(<SupervisePanel onStarted={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "t");
+    await userEvent.click(screen.getByLabelText("模拟模式（不花钱）"));
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    const req = mocks.invoke.mock.calls[0][1].request;
+    expect(req.mock).toBe(false);
+  });
+
+  it("收到 supervise-log 事件 → 渲染日志行", async () => {
+    // 捕获 listen 注册的回调
+    let logHandler: ((e: { payload: { taskId: string; line: string } }) => void) | undefined;
+    mocks.listen.mockImplementation((event: string, cb: (e: never) => void) => {
+      if (event === "supervise-log") logHandler = cb as never;
+      return Promise.resolve(() => {});
+    });
+    mocks.invoke.mockResolvedValue("task-1");
+
+    render(<SupervisePanel onStarted={() => {}} />);
+    // 等 useEffect 异步注册 listener 完成
+    await waitFor(() => expect(logHandler).toBeDefined());
+    // 触发一次日志事件
+    logHandler?.({ payload: { taskId: "task-1", line: "[PASS] 验收通过" } });
+    expect(await screen.findByText("[PASS] 验收通过")).toBeInTheDocument();
+  });
+});
