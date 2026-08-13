@@ -6,8 +6,18 @@
   --text: #1c1e21;
   --muted: #6b7280;
   --accent: #2563eb;
-  --claude: #d97706;
-  --codex: #059669;
+
+  /* ===== Agent 主题色（全局统一）=====
+     Claude Code 主色：rgb(217, 119, 87)  #D97757（暖橙）
+     Codex 主色：      rgb(50, 41, 245)   #3229F5（蓝紫）
+     所有 Claude/Codex 相关 UI（徽章/强调/hover）一律用这两个色系 */
+  --claude: rgb(217, 119, 87);
+  --claude-strong: rgb(186, 96, 64); /* 深一档，hover/边框 */
+  --claude-soft: rgb(248, 232, 224); /* 浅一档，背景/选中 */
+  --codex: rgb(50, 41, 245);
+  --codex-strong: rgb(35, 27, 196); /* 深一档，hover/边框 */
+  --codex-soft: rgb(228, 226, 252); /* 浅一档，背景/选中 */
+
   --user: #1f2937;
   --assistant: #2563eb;
   --title: #9333ea;
@@ -155,6 +165,41 @@ body {
   background: var(--codex);
 }
 
+/* 会话列表按 agent 分组 */
+.session-group {
+  margin-bottom: 8px;
+}
+
+.group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.group-title .count {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.session-list li.selected {
+  background: var(--claude-soft);
+}
+
+.session-list li[data-agent="codex"].selected {
+  background: var(--codex-soft);
+}
+
+.session-list button:hover {
+  background: #f0f2f5;
+}
+
+/* transcript 消息徽章 */
 .badge-user {
   background: var(--user);
 }
