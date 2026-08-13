@@ -12,7 +12,10 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "harness_agent_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 桌面端只需 rlib（main.exe 直接链接）。cdylib/staticlib 是移动端所需，
+# 且 cdylib 在 Windows GNU 目标下会导出 windows crate 全部符号，
+# 超过 PE 导出表 65535 上限（ld/lld: too many exported symbols）。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
