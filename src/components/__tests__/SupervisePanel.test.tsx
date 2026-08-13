@@ -6,15 +6,18 @@ import { SupervisePanel } from "../SupervisePanel";
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   listen: vi.fn(),
+  dialogOpen: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.dialogOpen }));
 
 describe("SupervisePanel", () => {
   beforeEach(() => {
     mocks.invoke.mockReset();
     mocks.listen.mockReset();
+    mocks.dialogOpen.mockReset();
     // listen 返回取消函数
     mocks.listen.mockResolvedValue(() => {});
   });
@@ -38,7 +41,7 @@ describe("SupervisePanel", () => {
     mocks.invoke.mockResolvedValue("task-123");
     render(<SupervisePanel onStarted={() => {}} />);
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "写个猜数字游戏");
-    const dirInput = screen.getByPlaceholderText("Claude 干活的项目目录");
+    const dirInput = screen.getByPlaceholderText(/浏览选择/);
     await userEvent.clear(dirInput);
     await userEvent.type(dirInput, "D:\\work");
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
@@ -50,6 +53,26 @@ describe("SupervisePanel", () => {
         mock: true,
       },
     });
+  });
+
+  it("点📁浏览 → 打开目录选择器并填入选中的目录", async () => {
+    mocks.dialogOpen.mockResolvedValue("D:\\my-project");
+    render(<SupervisePanel onStarted={() => {}} />);
+    await userEvent.click(screen.getByRole("button", { name: /浏览/ }));
+    expect(mocks.dialogOpen).toHaveBeenCalledWith(
+      expect.objectContaining({ directory: true }),
+    );
+    const dirInput = screen.getByPlaceholderText(/浏览选择/);
+    expect(dirInput).toHaveValue("D:\\my-project");
+  });
+
+  it("目录选择器取消（返回 null）→ 不改变当前目录", async () => {
+    mocks.dialogOpen.mockResolvedValue(null);
+    render(<SupervisePanel onStarted={() => {}} />);
+    const dirInput = screen.getByPlaceholderText(/浏览选择/);
+    const before = (dirInput as HTMLInputElement).value;
+    await userEvent.click(screen.getByRole("button", { name: /浏览/ }));
+    expect(dirInput).toHaveValue(before);
   });
 
   it("mock 关闭时 request.mock=false", async () => {

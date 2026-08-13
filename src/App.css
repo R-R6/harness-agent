@@ -436,6 +436,31 @@ body {
   gap: 12px;
 }
 
+/* 工作目录行：输入框 + 浏览按钮横排 */
+.dir-row {
+  display: flex;
+  gap: 6px;
+}
+
+.dir-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.dir-row .browse {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #f0f2f5;
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.dir-row .browse:hover {
+  background: #e5e7eb;
+}
+
 .form-row .checkbox {
   flex-direction: row;
   align-items: center;

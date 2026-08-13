@@ -25,6 +25,7 @@ session_proxy = { path = "crates/session_proxy" }
 supervise_runner = { path = "crates/supervise_runner" }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

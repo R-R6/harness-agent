@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { cancelSupervise, runSupervise } from "../lib/api";
 
 interface Props {
@@ -75,6 +76,21 @@ export function SupervisePanel({ onStarted }: Props) {
     }
   };
 
+  // 打开系统目录选择器选工作目录
+  const browseDir = async () => {
+    setError("");
+    try {
+      const dir = await open({
+        directory: true,
+        multiple: false,
+        title: "选择项目工作目录",
+      });
+      if (typeof dir === "string") setWorkDir(dir);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <div className="supervise-panel">
       <div className="form">
@@ -89,11 +105,16 @@ export function SupervisePanel({ onStarted }: Props) {
         </label>
         <label>
           工作目录
-          <input
-            value={workDir}
-            onChange={(e) => setWorkDir(e.currentTarget.value)}
-            placeholder="Claude 干活的项目目录"
-          />
+          <div className="dir-row">
+            <input
+              value={workDir}
+              onChange={(e) => setWorkDir(e.currentTarget.value)}
+              placeholder="Claude 干活的项目目录（可点击浏览选择）"
+            />
+            <button type="button" className="browse" onClick={browseDir} title="打开资源管理器选择目录">
+              📁 浏览
+            </button>
+          </div>
         </label>
         <div className="form-row">
           <label>

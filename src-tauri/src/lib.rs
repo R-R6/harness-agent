@@ -131,6 +131,7 @@ async fn read_review_artifacts(work_dir: String) -> Result<Vec<ReviewArtifact>, 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(SuperviseState {
             running: Mutex::new(HashMap::new()),
             busy_workdirs: Mutex::new(vec![]),
