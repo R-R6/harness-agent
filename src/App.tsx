@@ -57,6 +57,32 @@ function App() {
     "F:\\project\\workspace-side\\Harness_agent",
   );
 
+  // ---- 可调面板宽度（可拖动分割线）----
+  const [sidebarWidth, setSidebarWidth] = useState(300);
+  const [panelWidth, setPanelWidth] = useState(400);
+
+  /** 拖动分割线调整宽度（min 200 / max 560） */
+  const startResize = (
+    e: React.MouseEvent,
+    setter: (w: number) => void,
+    initial: number,
+  ) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const onMove = (ev: MouseEvent) => {
+      const w = Math.min(Math.max(initial + (ev.clientX - startX), 200), 560);
+      setter(w);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+    };
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   // 键盘快捷键：Ctrl+1 会话浏览 / Ctrl+2 监督闭环
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -175,7 +201,7 @@ function App() {
         {/* 双视图常驻（CSS 显隐切换，组件不卸载 → 状态不丢失） */}
         <section className={`view ${tab === "sessions" ? "active" : ""}`}>
           <div className="layout">
-            <aside className="sidebar">
+            <aside className="sidebar" style={{ width: sidebarWidth }}>
               {searchKeyword && (
                 <div className="search-banner">
                   <span>
@@ -196,6 +222,10 @@ function App() {
                 />
               )}
             </aside>
+            <div
+              className="resizer"
+              onMouseDown={(e) => startResize(e, setSidebarWidth, sidebarWidth)}
+            />
             <section className="detail">
               {selected ? (
                 <>
@@ -223,7 +253,13 @@ function App() {
 
         <section className={`view ${tab === "supervise" ? "active" : ""}`}>
           <div className="supervise-layout">
-            <SupervisePanel onStarted={handleSuperviseStarted} />
+            <div className="panel-container" style={{ width: panelWidth }}>
+              <SupervisePanel onStarted={handleSuperviseStarted} />
+            </div>
+            <div
+              className="resizer"
+              onMouseDown={(e) => startResize(e, setPanelWidth, panelWidth)}
+            />
             <ReviewBoard workDir={superviseWorkDir} />
           </div>
         </section>
