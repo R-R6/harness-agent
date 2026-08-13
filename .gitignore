@@ -1,0 +1,26 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+*.pdb
+
+# Node / 前端
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri 构建产物
+src-tauri/target/
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 系统文件
+.DS_Store
+Thumbs.db
