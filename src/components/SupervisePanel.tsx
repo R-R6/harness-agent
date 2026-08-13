@@ -15,7 +15,7 @@ interface LogLine {
 /** 闭环启动器：任务表单 + 启动/取消 + 实时日志流 */
 export function SupervisePanel({ onStarted }: Props) {
   const [task, setTask] = useState("");
-  const [workDir, setWorkDir] = useState("F:\\project\\workspace-side\\mcp-lab");
+  const [workDir, setWorkDir] = useState("F:\\project\\workspace-side\\Harness_agent");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
   const [runningTask, setRunningTask] = useState<string | null>(null);

@@ -4,14 +4,14 @@ import userEvent from "@testing-library/user-event";
 import App from "../App";
 import type { SessionInfo, TranscriptEntry } from "../types";
 
-// mock tauri invoke：不依赖真实 Rust 后端
+// mock tauri invoke + event：不依赖真实 Rust 后端
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
+  listen: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: mocks.invoke,
-}));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 
 const sessions: SessionInfo[] = [
   {
@@ -36,10 +36,13 @@ const transcript: TranscriptEntry[] = [
 describe("App 集成", () => {
   beforeEach(() => {
     mocks.invoke.mockReset();
+    mocks.listen.mockReset();
+    mocks.listen.mockResolvedValue(() => {});
     mocks.invoke.mockImplementation((cmd: string) => {
       if (cmd === "list_sessions") return Promise.resolve(sessions);
       if (cmd === "get_transcript") return Promise.resolve(transcript);
       if (cmd === "search_sessions") return Promise.resolve([sessions[0]]);
+      if (cmd === "read_review_artifacts") return Promise.resolve([]);
       return Promise.resolve(null);
     });
   });
@@ -67,7 +70,7 @@ describe("App 集成", () => {
     });
   });
 
-  it("搜索关键词 → 列表变为搜索结果", async () => {
+  it("搜索关键词 → 列表变为搜索结果 + 显示搜索提示条", async () => {
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("搜索关键词")).toBeInTheDocument());
     await userEvent.type(screen.getByLabelText("搜索关键词"), "计算器");
@@ -75,6 +78,34 @@ describe("App 集成", () => {
     await waitFor(() => {
       expect(mocks.invoke).toHaveBeenCalledWith("search_sessions", { keyword: "计算器" });
     });
+    // 搜索提示条：显示关键词 + 结果数
+    expect(screen.getByText(/搜索.*计算器.*的结果/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "✕ 清除搜索" })).toBeInTheDocument();
+  });
+
+  it("清除搜索 → 恢复全部会话（重新 list_sessions）", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("搜索关键词")).toBeInTheDocument());
+    await userEvent.type(screen.getByLabelText("搜索关键词"), "计算器");
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "✕ 清除搜索" })).toBeInTheDocument());
+    mocks.invoke.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: "✕ 清除搜索" }));
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", {});
+    });
+    expect(screen.queryByText(/搜索.*计算器.*的结果/)).not.toBeInTheDocument();
+  });
+
+  it("切换 tab 后会话列表状态保留（双视图常驻）", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
+    // 切到监督闭环再切回
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    await userEvent.click(screen.getByRole("button", { name: "会话浏览" }));
+    // 会话列表仍在（组件未卸载）
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.getByText("Codex")).toBeInTheDocument();
   });
 
   it("后端报错时显示错误信息", async () => {
