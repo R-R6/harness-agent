@@ -9,14 +9,14 @@
 
   /* ===== Agent 主题色（全局统一）=====
      Claude Code 主色：rgb(217, 119, 87)  #D97757（暖橙）
-     Codex 主色：      rgb(50, 41, 245)   #3229F5（蓝紫）
+     Codex 主色：      rgb(29, 78, 216)   #1D4ED8（深蓝）
      所有 Claude/Codex 相关 UI（徽章/强调/hover）一律用这两个色系 */
   --claude: rgb(217, 119, 87);
   --claude-strong: rgb(186, 96, 64); /* 深一档，hover/边框 */
   --claude-soft: rgb(248, 232, 224); /* 浅一档，背景/选中 */
-  --codex: rgb(50, 41, 245);
-  --codex-strong: rgb(35, 27, 196); /* 深一档，hover/边框 */
-  --codex-soft: rgb(228, 226, 252); /* 浅一档，背景/选中 */
+  --codex: rgb(29, 78, 216);
+  --codex-strong: rgb(23, 62, 172); /* 深一档，hover/边框 */
+  --codex-soft: rgb(226, 235, 250); /* 浅一档，背景/选中 */
 
   --user: #1f2937;
   --assistant: #2563eb;
