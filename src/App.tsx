@@ -60,19 +60,22 @@ function App() {
   );
 
   // ---- 可调面板宽度（可拖动分割线）----
+  const [navWidth, setNavWidth] = useState(168);
   const [sidebarWidth, setSidebarWidth] = useState(300);
   const [panelWidth, setPanelWidth] = useState(400);
 
-  /** 拖动分割线调整宽度（min 200 / max 560） */
+  /** 拖动分割线调整宽度（min/max 可传） */
   const startResize = (
     e: React.MouseEvent,
     setter: (w: number) => void,
     initial: number,
+    min = 200,
+    max = 560,
   ) => {
     e.preventDefault();
     const startX = e.clientX;
     const onMove = (ev: MouseEvent) => {
-      const w = Math.min(Math.max(initial + (ev.clientX - startX), 200), 560);
+      const w = Math.min(Math.max(initial + (ev.clientX - startX), min), max);
       setter(w);
     };
     const onUp = () => {
@@ -154,8 +157,8 @@ function App() {
 
   return (
     <main className="app">
-      {/* 左侧导航 */}
-      <nav className="sidebar-nav">
+      {/* 左侧导航（宽度可拖） */}
+      <nav className="sidebar-nav" style={{ width: navWidth }}>
         <div className="nav-logo">
           <span className="logo-mark">H</span>
           <span>Harness Agent</span>
@@ -189,6 +192,12 @@ function App() {
           </div>
         </div>
       </nav>
+
+      {/* 导航栏与内容区之间的可拖分割线 */}
+      <div
+        className="resizer"
+        onMouseDown={(e) => startResize(e, setNavWidth, navWidth, 140, 280)}
+      />
 
       {/* 主区域 */}
       <div className="main">

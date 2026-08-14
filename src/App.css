@@ -91,16 +91,17 @@ code {
   overflow: hidden;
 }
 
-/* 左侧导航 */
+/* 左侧导航（宽度由可拖分割线控制） */
 .sidebar-nav {
-  width: 168px;
-  min-width: 168px;
+  min-width: 140px;
   background: var(--panel);
-  border-right: 1px solid var(--border);
+  border-right: none;
   display: flex;
   flex-direction: column;
   padding: 12px 8px;
   gap: 2px;
+  flex-shrink: 0;
+  overflow: hidden;
 }
 
 .nav-logo {
