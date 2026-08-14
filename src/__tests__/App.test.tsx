@@ -140,6 +140,18 @@ describe("App 集成", () => {
     });
   });
 
+  it("切回会话浏览 tab 自动刷新（再次 list_sessions）", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
+    mocks.invoke.mockClear();
+    // 切到监督闭环再切回 → 自动刷新
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    await userEvent.click(screen.getByRole("button", { name: "会话浏览" }));
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 });
+    });
+  });
+
   it("切回已看会话用缓存（不重复调 get_transcript）", async () => {
     render(<App />);
     await waitFor(() => expect(screen.getByText("aaa.jsonl")).toBeInTheDocument());

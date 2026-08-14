@@ -127,9 +127,18 @@ function App() {
     }
   }, [sessionLimit]);
 
+  // 挂载 + 切回会话浏览 tab 时自动刷新；limit 变化也触发
+  // 搜索态下刷新的是搜索结果（handleRefresh 语义）
   useEffect(() => {
-    loadSessions();
-  }, [loadSessions]);
+    if (tab !== "sessions") return;
+    if (searchKeyword) {
+      handleSearch(searchKeyword);
+    } else {
+      loadSessions();
+    }
+    // 故意只依赖 tab/loadSessions：切回视图即刷新，searchKeyword 变化由搜索流程处理
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, loadSessions]);
 
   // 切换会话：缓存命中直接用（切回已看会话零延迟）；未命中才拉取
   const selectSession = useCallback(async (s: SessionInfo) => {
