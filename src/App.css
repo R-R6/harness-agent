@@ -846,6 +846,28 @@ code {
   box-shadow: 0 0 0 3px var(--codex-soft);
 }
 
+/* 刷新按钮 */
+.refresh-btn {
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--panel);
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.refresh-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .search-box input {
   flex: 1;
   padding: 6px 10px;

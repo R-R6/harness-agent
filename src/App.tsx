@@ -178,6 +178,15 @@ function App() {
     loadSessions();
   }, [loadSessions]);
 
+  // 刷新：搜索态下刷新搜索结果，否则刷新全部（列表保留显示不闪白）
+  const handleRefresh = useCallback(() => {
+    if (searchKeyword) {
+      handleSearch(searchKeyword);
+    } else {
+      loadSessions();
+    }
+  }, [searchKeyword, handleSearch, loadSessions]);
+
   const handleSuperviseStarted = useCallback((workDir: string) => {
     setSuperviseWorkDir(workDir);
   }, []);
@@ -246,6 +255,16 @@ function App() {
                 <option value={50}>50</option>
                 <option value={100}>100</option>
               </select>
+              <button
+                type="button"
+                className="refresh-btn"
+                onClick={handleRefresh}
+                disabled={loading}
+                title="刷新会话列表"
+                aria-label="刷新会话列表"
+              >
+                {loading ? "⟳" : "🔄"}
+              </button>
               <SearchBox onSearch={handleSearch} onClear={handleClear} />
             </>
           )}

@@ -130,6 +130,16 @@ describe("App 集成", () => {
     ).not.toContain("active");
   });
 
+  it("刷新按钮 → 重新加载会话列表", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新会话列表" })).toBeInTheDocument());
+    mocks.invoke.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: "刷新会话列表" }));
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 });
+    });
+  });
+
   it("切回已看会话用缓存（不重复调 get_transcript）", async () => {
     render(<App />);
     await waitFor(() => expect(screen.getByText("aaa.jsonl")).toBeInTheDocument());
