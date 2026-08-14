@@ -18,10 +18,33 @@ export interface TranscriptEntry {
 export interface SuperviseRequest {
   task: string;
   work_dir: string;
-  level?: string; // L0/L1/L2
-  max_rounds?: number; // >0 覆盖 Level
-  model?: string; // 非空覆盖 Level
+  level?: string;
+  max_rounds?: number;
+  model?: string;
   mock?: boolean;
+}
+
+// ---- MCP 健康检查（阶段 3） ----
+
+export interface McpCheckItem {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface McpStatus {
+  config_path: string;
+  items: McpCheckItem[];
+  server_js_exists: boolean;
+  host_exe_exists: boolean;
+  handshake_ok: boolean;
+}
+
+export interface McpFixResult {
+  backup_path?: string;
+  fixed_items: string[];
+  ok: boolean;
+  message: string;
 }
 
 export interface ReviewArtifact {

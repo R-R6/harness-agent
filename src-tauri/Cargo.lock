@@ -1427,6 +1427,7 @@ dependencies = [
 name = "harness_agent"
 version = "0.1.0"
 dependencies = [
+ "mcp_checker",
  "serde",
  "serde_json",
  "session_proxy",
@@ -2029,6 +2030,14 @@ dependencies = [
  "log",
  "tendril",
  "web_atoms",
+]
+
+[[package]]
+name = "mcp_checker"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml 0.8.2",
 ]
 
 [[package]]

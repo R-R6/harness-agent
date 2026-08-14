@@ -4,16 +4,18 @@ import { TranscriptView } from "./components/TranscriptView";
 import { SearchBox } from "./components/SearchBox";
 import { SupervisePanel } from "./components/SupervisePanel";
 import { ReviewBoard } from "./components/ReviewBoard";
+import { MCPStatusPanel } from "./components/MCPStatusPanel";
 import { fetchSessions, fetchTranscript, searchSessions } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
 import type { SessionInfo, TranscriptEntry } from "./types";
 import "./App.css";
 
-type Tab = "sessions" | "supervise";
+type Tab = "sessions" | "supervise" | "mcp";
 
-const NAV_ITEMS: { id: Tab; label: string; icon: string }[] = [
-  { id: "sessions", label: "会话浏览", icon: "💬" },
-  { id: "supervise", label: "监督闭环", icon: "🛡️" },
+const NAV_ITEMS: { id: Tab; label: string; icon: string; key: string }[] = [
+  { id: "sessions", label: "会话浏览", icon: "💬", key: "1" },
+  { id: "supervise", label: "监督闭环", icon: "🛡️", key: "2" },
+  { id: "mcp", label: "MCP 状态", icon: "🔌", key: "3" },
 ];
 
 /** 空态（带图标） */
@@ -89,6 +91,7 @@ function App() {
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
         if (e.key === "1") setTab("sessions");
         if (e.key === "2") setTab("supervise");
+        if (e.key === "3") setTab("mcp");
       }
     };
     window.addEventListener("keydown", onKey);
@@ -164,7 +167,7 @@ function App() {
             className={`nav-item ${tab === item.id ? "active" : ""}`}
             onClick={() => setTab(item.id)}
             aria-label={item.label}
-            title={`${item.label}（Ctrl+${item.id === "sessions" ? 1 : 2}）`}
+            title={`${item.label}（Ctrl+${item.key}）`}
           >
             <span className="nav-icon">{item.icon}</span>
             <span>{item.label}</span>
@@ -262,6 +265,10 @@ function App() {
             />
             <ReviewBoard workDir={superviseWorkDir} />
           </div>
+        </section>
+
+        <section className={`view ${tab === "mcp" ? "active" : ""}`}>
+          <MCPStatusPanel />
         </section>
       </div>
     </main>

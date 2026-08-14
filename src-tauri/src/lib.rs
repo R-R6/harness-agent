@@ -119,10 +119,22 @@ async fn cancel_supervise(app: AppHandle, task_id: String) -> Result<(), String>
     Err("任务不存在或已结束".into())
 }
 
-/// 读 .supervise 产物（review-N.md / final-report.json）→ 审查看板数据
+/// 读取监督闭环产物（.supervise 目录）
 #[tauri::command]
 async fn read_review_artifacts(work_dir: String) -> Result<Vec<ReviewArtifact>, String> {
     supervise_runner::read_artifacts(&work_dir)
+}
+
+/// MCP 注册健康检查（toml 结构化解析 + 真实握手）
+#[tauri::command]
+async fn check_mcp() -> Result<mcp_checker::McpStatus, String> {
+    Ok(mcp_checker::check_mcp(mcp_checker::DEFAULT_CONFIG))
+}
+
+/// MCP 一键修复（备份 + 最小侵入插入缺失项 + 原子写）
+#[tauri::command]
+async fn fix_mcp() -> Result<mcp_checker::FixResult, String> {
+    Ok(mcp_checker::fix_mcp(mcp_checker::DEFAULT_CONFIG))
 }
 
 // ---------------- 入口 ----------------
@@ -142,7 +154,9 @@ pub fn run() {
             search_sessions,
             run_supervise,
             cancel_supervise,
-            read_review_artifacts
+            read_review_artifacts,
+            check_mcp,
+            fix_mcp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

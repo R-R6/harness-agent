@@ -1,0 +1,9 @@
+[package]
+name = "mcp_checker"
+version = "0.1.0"
+description = "Codex MCP 注册健康检查：toml 结构化检查 + 最小侵入修复 + 真实握手验证"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

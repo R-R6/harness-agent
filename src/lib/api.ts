@@ -1,6 +1,8 @@
 // 调用 Rust 侧 tauri commands（对应 lib.rs 的 list_sessions / get_transcript / search_sessions）
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  McpFixResult,
+  McpStatus,
   ReviewArtifact,
   SessionInfo,
   SuperviseRequest,
@@ -35,8 +37,16 @@ export async function cancelSupervise(taskId: string): Promise<void> {
 }
 
 /** 读 .supervise 产物（审查看板数据） */
-export async function fetchReviewArtifacts(
-  workDir: string,
-): Promise<ReviewArtifact[]> {
-  return invoke<ReviewArtifact[]>("read_review_artifacts", { workDir });
+export async function fetchReviewArtifacts(workDir: string): Promise<ReviewArtifact[]> {
+  return invoke("read_review_artifacts", { workDir });
+}
+
+// ---- MCP 健康检查 ----
+
+export async function checkMcp(): Promise<McpStatus> {
+  return invoke("check_mcp");
+}
+
+export async function fixMcp(): Promise<McpFixResult> {
+  return invoke("fix_mcp");
 }
