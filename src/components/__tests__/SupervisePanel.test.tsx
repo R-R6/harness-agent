@@ -75,6 +75,37 @@ describe("SupervisePanel", () => {
     expect(dirInput).toHaveValue(before);
   });
 
+  it("工作目录为空时提示且不提交", async () => {
+    render(<SupervisePanel onStarted={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "测试任务");
+    const dirInput = screen.getByPlaceholderText(/浏览选择/);
+    await userEvent.clear(dirInput);
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    expect(screen.getByText(/工作目录不能为空/)).toBeInTheDocument();
+    expect(mocks.invoke).not.toHaveBeenCalled();
+  });
+
+  it("done 事件带非 0 退出码 → 显示任务失败", async () => {
+    mocks.invoke.mockResolvedValue("task-9");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let doneHandler: any = null;
+    mocks.listen.mockImplementation((ev: string, cb: (e: never) => void) => {
+      if (ev === "supervise-done") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        doneHandler = cb as any;
+      }
+      return Promise.resolve(() => {});
+    });
+    render(<SupervisePanel onStarted={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith("run_supervise", expect.anything()),
+    );
+    doneHandler?.({ payload: { taskId: "task-9", exitCode: 1 } });
+    expect(await screen.findByText(/任务失败（退出码 1）/)).toBeInTheDocument();
+  });
+
   it("mock 关闭时 request.mock=false", async () => {
     mocks.invoke.mockResolvedValue("task-1");
     render(<SupervisePanel onStarted={() => {}} />);

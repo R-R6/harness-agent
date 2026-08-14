@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { SessionList } from "./components/SessionList";
 import { TranscriptView } from "./components/TranscriptView";
 import { SearchBox } from "./components/SearchBox";
@@ -54,6 +54,8 @@ function App() {
   const [error, setError] = useState("");
   const [searchKeyword, setSearchKeyword] = useState("");
   const [sessionLimit, setSessionLimit] = useState(50);
+  // 正文缓存（file → entries），切回已看会话不重复拉取；上限 50 个防内存膨胀
+  const transcriptCache = useRef(new Map<string, TranscriptEntry[]>());
 
   // ---- 监督闭环状态（常驻 App）----
   const [superviseWorkDir, setSuperviseWorkDir] = useState(
@@ -89,10 +91,21 @@ function App() {
     window.addEventListener("mouseup", onUp);
   };
 
-  // 键盘快捷键：Ctrl+1 会话浏览 / Ctrl+2 监督闭环
+  // 键盘快捷键：Ctrl+1 会话浏览 / Ctrl+2 监督闭环 / Ctrl+3 MCP 状态
+  // 边界：输入控件（输入框/文本域/下拉/可编辑区）聚焦时不响应，防误切
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+        const t = e.target as HTMLElement | null;
+        const tag = t?.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          t?.isContentEditable
+        ) {
+          return;
+        }
         if (e.key === "1") setTab("sessions");
         if (e.key === "2") setTab("supervise");
         if (e.key === "3") setTab("mcp");
@@ -118,12 +131,25 @@ function App() {
     loadSessions();
   }, [loadSessions]);
 
+  // 切换会话：缓存命中直接用（切回已看会话零延迟）；未命中才拉取
   const selectSession = useCallback(async (s: SessionInfo) => {
     setSelected(s);
-    setLoadingTrans(true);
     setError("");
+    const cached = transcriptCache.current.get(s.file);
+    if (cached) {
+      setTranscript(cached);
+      return;
+    }
+    setLoadingTrans(true);
     try {
-      setTranscript(await fetchTranscript(s.file));
+      const entries = await fetchTranscript(s.file);
+      transcriptCache.current.set(s.file, entries);
+      // 上限 50 个，超出删最早（FIFO）
+      if (transcriptCache.current.size > 50) {
+        const first = transcriptCache.current.keys().next().value;
+        if (first) transcriptCache.current.delete(first);
+      }
+      setTranscript(entries);
     } catch (e) {
       setError(String(e));
     } finally {

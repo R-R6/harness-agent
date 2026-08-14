@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "../App";
 import type { SessionInfo, TranscriptEntry } from "../types";
@@ -114,5 +114,35 @@ describe("App 集成", () => {
     await waitFor(() => {
       expect(screen.getByText(/spawn node 失败/)).toBeInTheDocument();
     });
+  });
+
+  it("输入框聚焦时 Ctrl+1 不切换 tab（快捷键边界）", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("搜索关键词")).toBeInTheDocument());
+    // 聚焦搜索输入框
+    const input = screen.getByLabelText("搜索关键词");
+    input.focus();
+    fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+    // tab 未切换：监督闭环按钮不是 active，搜索框仍在
+    expect(screen.getByLabelText("搜索关键词")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "监督闭环" }).className,
+    ).not.toContain("active");
+  });
+
+  it("切回已看会话用缓存（不重复调 get_transcript）", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("aaa.jsonl")).toBeInTheDocument());
+    await userEvent.click(screen.getByText("aaa.jsonl"));
+    await waitFor(() => expect(screen.getByText("写个计算器")).toBeInTheDocument());
+    // 切到另一个会话
+    await userEvent.click(screen.getByText("rollout-x.jsonl"));
+    await waitFor(() => expect(screen.getByText("好的，我写一个")).toBeInTheDocument());
+    // 切回 aaa：缓存命中，不再调 get_transcript
+    mocks.invoke.mockClear();
+    await userEvent.click(screen.getByText("aaa.jsonl"));
+    await waitFor(() => expect(screen.getByText("写个计算器")).toBeInTheDocument());
+    const calls = mocks.invoke.mock.calls.filter((c) => c[0] === "get_transcript");
+    expect(calls.length).toBe(0);
   });
 });

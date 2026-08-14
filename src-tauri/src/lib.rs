@@ -4,8 +4,13 @@ use supervise_runner::{ReviewArtifact, SuperviseRequest};
 
 use std::collections::HashMap;
 use std::io::BufRead;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// 监督任务 id 自增计数器（避免毫秒时间戳碰撞）
+static TASK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ---------------- 监督进程状态（并发锁 + 进程表） ----------------
 
@@ -16,9 +21,23 @@ struct SuperviseState {
     busy_workdirs: Mutex<Vec<String>>,
 }
 
+/// 规范化路径用于并发锁比较：解析 `.`/`..` + 去尾部斜杠 + 小写（Windows 大小写不敏感）
 fn normalize_path(p: &str) -> String {
-    // 去尾部斜杠 + 小写（Windows 路径大小写不敏感）
-    p.trim_end_matches(['\\', '/']).to_lowercase()
+    let p = p.trim_end_matches(['\\', '/']);
+    if p.is_empty() {
+        return String::new();
+    }
+    let mut out = std::path::PathBuf::new();
+    for comp in std::path::Path::new(p).components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().to_lowercase()
 }
 
 // ---------------- 会话 commands（阶段 1） ----------------
@@ -52,6 +71,12 @@ async fn run_supervise(
     request: SuperviseRequest,
 ) -> Result<String, String> {
     let work_dir = normalize_path(&request.work_dir);
+    if work_dir.is_empty() {
+        return Err("工作目录不能为空".into());
+    }
+    if !std::path::Path::new(&request.work_dir).is_dir() {
+        return Err(format!("工作目录不存在: {}", request.work_dir));
+    }
     {
         let busy = state.busy_workdirs.lock().unwrap();
         if busy.contains(&work_dir) {
@@ -60,13 +85,7 @@ async fn run_supervise(
     }
 
     let mut child = supervise_runner::spawn_supervise(&request)?;
-    let task_id = format!(
-        "task-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    );
+    let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
     let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
     {
         state.running.lock().unwrap().insert(task_id.clone(), child);
@@ -87,33 +106,45 @@ async fn run_supervise(
                 );
             }
         }
-        // stdout EOF（进程退出）→ 收尾
+        // stdout EOF（进程退出）→ 收尾：wait 拿退出码，清理 State
         let running = app2.state::<SuperviseState>();
-        {
+        let exit_code: Option<i64> = {
             let mut running_map = running.running.lock().unwrap();
             if let Some(mut c) = running_map.remove(&task_id2) {
-                let _ = c.wait();
+                c.wait().ok().and_then(|s| s.code()).map(|c| c as i64)
+            } else {
+                None // 已被 cancel 提前移除（进程是 kill 掉的）
             }
-        }
+        };
         running
             .busy_workdirs
             .lock()
             .unwrap()
             .retain(|w| w != &work_dir2);
-        let _ = app2.emit("supervise-done", serde_json::json!({ "taskId": task_id2 }));
+        let _ = app2.emit(
+            "supervise-done",
+            serde_json::json!({ "taskId": task_id2, "exitCode": exit_code }),
+        );
     });
 
     Ok(task_id)
 }
 
-/// 取消运行中的监督任务（kill 子进程）
+/// 取消运行中的监督任务（kill 整个进程树：pwsh + claude/codex/node 子进程）
 #[tauri::command]
 async fn cancel_supervise(app: AppHandle, task_id: String) -> Result<(), String> {
     let state = app.state::<SuperviseState>();
     let mut running = state.running.lock().unwrap();
     if let Some(mut c) = running.remove(&task_id) {
+        let pid = c.id();
         let _ = c.kill();
         let _ = c.wait();
+        // 级联清理子进程：taskkill /T（失败无妨——主进程已杀，且某些环境无 taskkill）
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         return Ok(());
     }
     Err("任务不存在或已结束".into())
@@ -140,6 +171,19 @@ async fn fix_mcp() -> Result<mcp_checker::FixResult, String> {
 /// 导出会话正文为 Markdown 文件（右键菜单功能）
 #[tauri::command]
 async fn export_transcript_md(file: String, dest: String) -> Result<String, String> {
+    // 边界校验：dest 必须是绝对路径 + .md/.markdown 后缀（防任意路径写入）
+    let dest_path = std::path::Path::new(&dest);
+    if !dest_path.is_absolute() {
+        return Err("导出路径必须是绝对路径".into());
+    }
+    let ext = dest_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !matches!(ext.as_str(), "md" | "markdown") {
+        return Err("导出文件必须是 .md 或 .markdown 后缀".into());
+    }
     let entries = session_proxy::get_transcript(&file, None).map_err(|e| e.to_string())?;
     let mut md = String::from("# 会话导出\n\n");
     for e in &entries {

@@ -80,19 +80,28 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
     toastTimer.current = window.setTimeout(() => setToast(""), 1800);
   }, []);
 
-  // 全局点击/右键/滚动关闭菜单
+  // 全局点击/右键/滚动/窗口缩放关闭菜单
   useEffect(() => {
     if (!menu) return;
     const close = () => setMenu(null);
     window.addEventListener("click", close);
     window.addEventListener("contextmenu", close);
     window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
     return () => {
       window.removeEventListener("click", close);
       window.removeEventListener("contextmenu", close);
       window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
     };
   }, [menu]);
+
+  // 组件卸载时清理 toast 定时器（防泄漏）
+  useEffect(() => {
+    return () => {
+      if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    };
+  }, []);
 
   // 收藏切换（localStorage 持久化）
   const toggleStar = useCallback((file: string) => {

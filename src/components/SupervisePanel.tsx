@@ -31,10 +31,18 @@ export function SupervisePanel({ onStarted }: Props) {
       unLog = await listen<LogLine>("supervise-log", (e) => {
         setLogs((prev) => [...prev.slice(-499), e.payload]); // 最多 500 行
       });
-      unDone = await listen<{ taskId: string }>("supervise-done", (e) => {
-        setRunningTask((cur) => (cur === e.payload.taskId ? null : cur));
-        onStarted(workDir);
-      });
+      unDone = await listen<{ taskId: string; exitCode?: number | null }>(
+        "supervise-done",
+        (e) => {
+          setRunningTask((cur) => (cur === e.payload.taskId ? null : cur));
+          // 退出码非 0 = 任务失败（cancel 时 exitCode 为 null，不提示）
+          const code = e.payload.exitCode;
+          if (code != null && code !== 0) {
+            setError(`任务失败（退出码 ${code}），详见下方日志`);
+          }
+          onStarted(workDir);
+        },
+      );
     })();
     return () => {
       unLog?.();
@@ -51,6 +59,10 @@ export function SupervisePanel({ onStarted }: Props) {
     setError("");
     if (!task.trim()) {
       setError("任务描述不能为空");
+      return;
+    }
+    if (!workDir.trim()) {
+      setError("工作目录不能为空（可点 📁 浏览选择）");
       return;
     }
     try {
