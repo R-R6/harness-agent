@@ -7,7 +7,7 @@ import type {
   SessionInfo,
   SuperviseRequest,
   TranscriptEntry,
-} from "./types";
+} from "../types";
 
 export async function fetchSessions(agent?: string): Promise<SessionInfo[]> {
   return invoke<SessionInfo[]>("list_sessions", agent ? { agent } : {});

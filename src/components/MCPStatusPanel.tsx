@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { checkMcp, fixMcp } from "../lib/api";
-import type { McpStatus } from "../types";
+import type { McpFixResult, McpStatus } from "../types";
 
 /**
  * MCP 状态面板：agent-sessions MCP 注册健康检查 + 一键修复。
