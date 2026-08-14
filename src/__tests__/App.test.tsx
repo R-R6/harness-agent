@@ -53,7 +53,7 @@ describe("App 集成", () => {
       expect(screen.getByText("Claude Code")).toBeInTheDocument();
       expect(screen.getByText("Codex")).toBeInTheDocument();
     });
-    expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", {});
+    expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 });
   });
 
   it("点击会话加载正文", async () => {
@@ -92,7 +92,7 @@ describe("App 集成", () => {
     mocks.invoke.mockClear();
     await userEvent.click(screen.getByRole("button", { name: "✕ 清除" }));
     await waitFor(() => {
-      expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", {});
+      expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 });
     });
     expect(screen.queryByText(/搜索.*计算器.*条/)).not.toBeInTheDocument();
   });

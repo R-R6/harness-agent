@@ -123,14 +123,17 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
 
 // ---------------- 公开工具函数（供 tauri commands 调用） ----------------
 
-/// 列出会话（agent 可选：claude / codex，不传则两者）
-pub fn list_sessions(agent: Option<String>) -> Result<Vec<SessionInfo>, String> {
-    let args = match agent {
-        Some(a) => json!({ "agent": a }),
-        None => json!({}),
-    };
-    let v = call_tool("list_sessions", &args)?;
-    serde_json::from_value(v).map_err(|e| format!("解析 list_sessions 结果失败: {e}"))
+/// 列出会话（agent 可选：claude / codex；limit 可选：每 agent 条数，默认 20 上限 200）
+pub fn list_sessions(agent: Option<String>, limit: Option<usize>) -> Result<Vec<SessionInfo>, String> {
+    let mut args = serde_json::Map::new();
+    if let Some(a) = agent {
+        args.insert("agent".into(), json!(a));
+    }
+    if let Some(l) = limit {
+        args.insert("limit".into(), json!(l));
+    }
+    let body = call_tool("list_sessions", &json!(args))?;
+    serde_json::from_value(body).map_err(|e| format!("解析 list_sessions 结果失败: {e}"))
 }
 
 /// 读取某会话正文（tail：只取末尾 N 条，默认 200）
@@ -226,7 +229,7 @@ mod tests {
     #[test]
     fn list_sessions_returns_both_agents() {
         with_fake_sessions(|| {
-            let rows = list_sessions(None).expect("list_sessions 应成功");
+            let rows = list_sessions(None, None).expect("list_sessions 应成功");
             let agents: Vec<&str> = rows.iter().map(|r| r.agent.as_str()).collect();
             assert!(agents.contains(&"claude"), "应包含 claude: {rows:?}");
             assert!(agents.contains(&"codex"), "应包含 codex: {rows:?}");
@@ -238,7 +241,7 @@ mod tests {
     #[test]
     fn list_sessions_filters_by_agent() {
         with_fake_sessions(|| {
-            let rows = list_sessions(Some("claude".into())).expect("应成功");
+            let rows = list_sessions(Some("claude".into()), None).expect("应成功");
             assert!(!rows.is_empty());
             assert!(rows.iter().all(|r| r.agent == "claude"));
         });
@@ -247,7 +250,7 @@ mod tests {
     #[test]
     fn get_transcript_parses_both_formats() {
         with_fake_sessions(|| {
-            let rows = list_sessions(None).unwrap();
+            let rows = list_sessions(None, None).unwrap();
             let claude = rows
                 .iter()
                 .find(|r| r.file.ends_with("session-abc.jsonl"))
@@ -270,7 +273,7 @@ mod tests {
     #[test]
     fn get_transcript_respects_tail() {
         with_fake_sessions(|| {
-            let rows = list_sessions(Some("claude".into())).unwrap();
+            let rows = list_sessions(Some("claude".into()), None).unwrap();
             let t_all = get_transcript(&rows[0].file, None).unwrap();
             let t_1 = get_transcript(&rows[0].file, Some(1)).unwrap();
             assert!(t_1.len() <= 1, "tail=1 应只返回 1 条，实际 {}", t_1.len());
@@ -301,7 +304,7 @@ mod tests {
     #[test]
     fn get_transcript_rejects_nonexistent_file() {
         with_fake_sessions(|| {
-            let rows = list_sessions(Some("claude".into())).unwrap();
+            let rows = list_sessions(Some("claude".into()), None).unwrap();
             let fake = format!("{}__nope.jsonl", rows[0].file);
             let err = get_transcript(&fake, None).expect_err("不存在必须报错");
             assert!(err.contains("不存在"), "错误信息: {err}");

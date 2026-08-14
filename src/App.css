@@ -829,6 +829,23 @@ code {
   max-width: 420px;
 }
 
+/* 会话数量选择器（顶部栏） */
+.limit-select {
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+}
+
+.limit-select:focus {
+  border-color: var(--codex);
+  box-shadow: 0 0 0 3px var(--codex-soft);
+}
+
 .search-box input {
   flex: 1;
   padding: 6px 10px;

@@ -9,8 +9,11 @@ import type {
   TranscriptEntry,
 } from "../types";
 
-export async function fetchSessions(agent?: string): Promise<SessionInfo[]> {
-  return invoke<SessionInfo[]>("list_sessions", agent ? { agent } : {});
+export async function fetchSessions(agent?: string, limit?: number): Promise<SessionInfo[]> {
+  const args: Record<string, string | number> = {};
+  if (agent) args.agent = agent;
+  if (limit) args.limit = limit;
+  return invoke<SessionInfo[]>("list_sessions", args);
 }
 
 export async function fetchTranscript(

@@ -53,6 +53,7 @@ function App() {
   const [loadingTrans, setLoadingTrans] = useState(false);
   const [error, setError] = useState("");
   const [searchKeyword, setSearchKeyword] = useState("");
+  const [sessionLimit, setSessionLimit] = useState(50);
 
   // ---- 监督闭环状态（常驻 App）----
   const [superviseWorkDir, setSuperviseWorkDir] = useState(
@@ -105,13 +106,13 @@ function App() {
     setLoading(true);
     setError("");
     try {
-      setSessions(await fetchSessions());
+      setSessions(await fetchSessions(undefined, sessionLimit));
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [sessionLimit]);
 
   useEffect(() => {
     loadSessions();
@@ -130,18 +131,21 @@ function App() {
     }
   }, []);
 
-  const handleSearch = useCallback(async (kw: string) => {
-    setSearchKeyword(kw);
-    setLoading(true);
-    setError("");
-    try {
-      setSessions(await searchSessions(kw));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const handleSearch = useCallback(
+    async (kw: string) => {
+      setSearchKeyword(kw);
+      setLoading(true);
+      setError("");
+      try {
+        setSessions(await searchSessions(kw));
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
 
   const handleClear = useCallback(() => {
     setSearchKeyword("");
@@ -204,7 +208,20 @@ function App() {
         <header className="topbar">
           <h2>{NAV_ITEMS.find((n) => n.id === tab)?.label}</h2>
           {tab === "sessions" && (
-            <SearchBox onSearch={handleSearch} onClear={handleClear} />
+            <>
+              <select
+                className="limit-select"
+                value={sessionLimit}
+                onChange={(e) => setSessionLimit(Number(e.currentTarget.value))}
+                aria-label="会话数量"
+                title="每类 Agent 显示的会话数"
+              >
+                <option value={20}>20</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+              <SearchBox onSearch={handleSearch} onClear={handleClear} />
+            </>
           )}
         </header>
 

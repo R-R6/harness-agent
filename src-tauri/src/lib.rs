@@ -23,10 +23,10 @@ fn normalize_path(p: &str) -> String {
 
 // ---------------- 会话 commands（阶段 1） ----------------
 
-/// 列出会话（agent 可选：claude / codex，不传则两者）
+/// 列出会话（agent 可选：claude / codex；limit 可选：每 agent 条数，默认 20 上限 200）
 #[tauri::command]
-fn list_sessions(agent: Option<String>) -> Result<Vec<SessionInfo>, String> {
-    session_proxy::list_sessions(agent)
+fn list_sessions(agent: Option<String>, limit: Option<usize>) -> Result<Vec<SessionInfo>, String> {
+    session_proxy::list_sessions(agent, limit)
 }
 
 /// 读取某会话正文（tail：只取末尾 N 条，默认 200）
