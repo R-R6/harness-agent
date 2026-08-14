@@ -145,14 +145,6 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
           if (await copyText(sessionId(s.file))) showToast("✅ 已复制会话 ID");
           else showToast("❌ 复制失败");
           break;
-        case "copy-title":
-          if (await copyText(label)) showToast("✅ 已复制会话标题");
-          else showToast("❌ 复制失败");
-          break;
-        case "copy-time":
-          if (await copyText(s.updated)) showToast("✅ 已复制发起时间");
-          else showToast("❌ 复制失败");
-          break;
         case "copy-resume":
           if (await copyText(resumeCommand(s))) showToast("✅ 已复制续聊命令");
           else showToast("❌ 复制失败");
@@ -208,8 +200,6 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
   const menuItems: { action: string; label: string; danger?: boolean }[] = [
     { action: "copy-path", label: "📋 复制文件路径" },
     { action: "copy-id", label: "🆔 复制会话 ID" },
-    { action: "copy-title", label: "📝 复制会话标题" },
-    { action: "copy-time", label: "⏱️ 复制发起时间" },
     { action: "copy-resume", label: "💻 复制续聊命令" },
     { action: "reveal", label: "📁 在文件夹中显示" },
     { action: "star", label: starred.has(menu?.session.file ?? "") ? "⭐ 取消收藏" : "⭐ 收藏（置顶）" },
