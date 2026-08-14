@@ -245,7 +245,7 @@ code {
   overflow: hidden;
 }
 
-/* 可拖动分割线（调整列表宽度） */
+/* 可拖动分割线（调整宽度，无蓝色指示线） */
 .resizer {
   width: 4px;
   margin-left: -2px;
@@ -259,18 +259,6 @@ code {
 .resizer:hover,
 .resizer.resizing {
   background: var(--codex-soft);
-}
-
-.resizer:hover::after,
-.resizer.resizing::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  background: var(--codex);
-  opacity: 0.5;
 }
 
 .sidebar {
