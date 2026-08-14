@@ -193,6 +193,9 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
 
   const openMenu = (e: React.MouseEvent, s: SessionInfo) => {
     e.preventDefault();
+    // 关键：阻止事件冒泡到 window 的原生 contextmenu 关闭监听，
+    // 否则菜单刚打开就被同一个右键事件立即关闭（真实 WebView2 必现）
+    e.stopPropagation();
     const x = Math.min(e.clientX, window.innerWidth - 220);
     const y = Math.min(e.clientY, window.innerHeight - 320);
     setMenu({ x, y, session: s });
