@@ -143,7 +143,7 @@ async fn export_transcript_md(file: String, dest: String) -> Result<String, Stri
     let entries = session_proxy::get_transcript(&file, None).map_err(|e| e.to_string())?;
     let mut md = String::from("# 会话导出\n\n");
     for e in &entries {
-        let t = match e.entry_type.as_str() {
+        let t = match e.msg_type.as_str() {
             "user" => "🧑 用户",
             "assistant" => "🤖 助手",
             "title" => "📌 标题",
