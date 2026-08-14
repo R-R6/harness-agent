@@ -15,9 +15,11 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
-    port: 1420,
+    // 1420 落在 Windows Hyper-V 保留端口段（1394-1893）→ EACCES，改用 14200
+    port: 14200,
     strictPort: true,
-    host: host || false,
+    // 强制 IPv4（Windows 上 ::1 绑定偶发 EACCES，2026-08-13 实测）
+    host: "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",

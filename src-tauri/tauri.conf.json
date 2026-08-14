@@ -5,7 +5,7 @@
   "identifier": "com.mgzxtech.harness-agent",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://127.0.0.1:14200",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
