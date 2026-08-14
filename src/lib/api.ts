@@ -50,3 +50,8 @@ export async function checkMcp(): Promise<McpStatus> {
 export async function fixMcp(): Promise<McpFixResult> {
   return invoke("fix_mcp");
 }
+
+/** 导出会话正文为 Markdown（右键菜单） */
+export async function exportTranscriptMd(file: string, dest: string): Promise<string> {
+  return invoke("export_transcript_md", { file, dest });
+}

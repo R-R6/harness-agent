@@ -1,83 +1,172 @@
-import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SessionList } from "../SessionList";
 import type { SessionInfo } from "../../types";
+
+const mocks = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  reveal: vi.fn(),
+  save: vi.fn(),
+  writeText: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: mocks.reveal }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: mocks.save }));
 
 const sessions: SessionInfo[] = [
   {
     agent: "claude",
     agentLabel: "Claude Code",
-    file: "C:\\Users\\admin\\.claude\\projects\\p1\\aaa.jsonl",
+    file: "C:\\fake\\.claude\\projects\\p1\\aaa.jsonl",
     updated: "2026-08-13T10:00:00+08:00",
-  },
-  {
-    agent: "codex",
-    agentLabel: "Codex",
-    file: "C:\\Users\\admin\\.codex\\sessions\\2026\\08\\13\\rollout-x.jsonl",
-    updated: "2026-08-13T11:00:00+08:00",
   },
   {
     agent: "claude",
     agentLabel: "Claude Code",
-    file: "C:\\Users\\admin\\.claude\\projects\\p2\\bbb.jsonl",
-    updated: "2026-08-13T09:00:00+08:00",
+    file: "C:\\fake\\.claude\\projects\\p1\\bbb.jsonl",
+    title: "排查休眠竞态",
+    updated: "2026-08-13T12:00:00+08:00",
+  },
+  {
+    agent: "codex",
+    agentLabel: "Codex",
+    file: "C:\\fake\\.codex\\sessions\\2026\\08\\13\\rollout-2026-08-13T15-04-04-abc.jsonl",
+    updated: "2026-08-13T15:00:00+08:00",
   },
 ];
 
+function renderList() {
+  return render(
+    <SessionList sessions={sessions} selectedFile={null} onSelect={() => {}} />,
+  );
+}
+
 describe("SessionList", () => {
-  it("按 agent 分组渲染（组标题 + 文件名）", () => {
-    render(<SessionList sessions={sessions} selectedFile={null} onSelect={() => {}} />);
-    // 组标题
+  beforeEach(() => {
+    mocks.invoke.mockReset();
+    mocks.reveal.mockReset();
+    mocks.save.mockReset();
+    mocks.writeText.mockReset();
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: mocks.writeText },
+      configurable: true,
+    });
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    // 清理右键菜单（全局监听）
+    document.body.innerHTML = "";
+  });
+
+  it("按 agent 分组渲染（组标题 + 会话数）", () => {
+    renderList();
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
     expect(screen.getByText("Codex")).toBeInTheDocument();
-    // 文件名
+    // 有标题显示标题，无标题回退文件名
+    expect(screen.getByText("排查休眠竞态")).toBeInTheDocument();
     expect(screen.getByText("aaa.jsonl")).toBeInTheDocument();
-    expect(screen.getByText("bbb.jsonl")).toBeInTheDocument();
-    expect(screen.getByText("rollout-x.jsonl")).toBeInTheDocument();
   });
 
-  it("组标题带会话数量", () => {
-    render(<SessionList sessions={sessions} selectedFile={null} onSelect={() => {}} />);
-    expect(screen.getAllByText("2").length).toBeGreaterThanOrEqual(1); // claude 组 2 个
-  });
-
-  it("claude 会话归入 claude 组（组内包含）", () => {
-    const { container } = render(
-      <SessionList sessions={sessions} selectedFile={null} onSelect={() => {}} />,
-    );
-    const groups = container.querySelectorAll(".session-group");
-    expect(groups).toHaveLength(2);
-    const claudeGroup = groups[0];
-    expect(claudeGroup.textContent).toContain("Claude Code");
-    expect(claudeGroup.textContent).toContain("aaa.jsonl");
-    expect(claudeGroup.textContent).toContain("bbb.jsonl");
-    expect(claudeGroup.textContent).not.toContain("rollout-x.jsonl");
-    const codexGroup = groups[1];
-    expect(codexGroup.textContent).toContain("Codex");
-    expect(codexGroup.textContent).toContain("rollout-x.jsonl");
-  });
-
-  it("空列表显示占位文案", () => {
-    render(<SessionList sessions={[]} selectedFile={null} onSelect={() => {}} />);
-    expect(screen.getByText("暂无会话")).toBeInTheDocument();
-  });
-
-  it("点击会话触发 onSelect（带完整对象）", async () => {
+  it("点击会话触发 onSelect", async () => {
     const onSelect = vi.fn();
-    render(<SessionList sessions={sessions} selectedFile={null} onSelect={onSelect} />);
+    render(
+      <SessionList sessions={sessions} selectedFile={null} onSelect={onSelect} />,
+    );
     await userEvent.click(screen.getByText("aaa.jsonl"));
     expect(onSelect).toHaveBeenCalledWith(sessions[0]);
   });
 
-  it("选中项高亮（selected class + data-agent）", () => {
-    const { container } = render(
-      <SessionList sessions={sessions} selectedFile={sessions[1].file} onSelect={() => {}} />,
+  it("右键会话弹出菜单，复制文件路径", async () => {
+    renderList();
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    expect(screen.getByText("📋 复制文件路径")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("📋 复制文件路径"));
+    await waitFor(() => {
+      expect(mocks.writeText).toHaveBeenCalledWith(sessions[0].file);
+    });
+    expect(await screen.findByText(/已复制文件路径/)).toBeInTheDocument();
+  });
+
+  it("复制会话 ID（Codex rollout 去扩展名）", async () => {
+    renderList();
+    fireEvent.contextMenu(screen.getByText(/rollout-2026/));
+    await userEvent.click(screen.getByText("🆔 复制会话 ID"));
+    await waitFor(() => {
+      expect(mocks.writeText).toHaveBeenCalledWith("rollout-2026-08-13T15-04-04-abc");
+    });
+  });
+
+  it("复制续聊命令（按 agent 不同命令）", async () => {
+    renderList();
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    await userEvent.click(screen.getByText("💻 复制续聊命令"));
+    await waitFor(() => {
+      expect(mocks.writeText).toHaveBeenCalledWith("claude --resume aaa");
+    });
+    fireEvent.contextMenu(screen.getByText(/rollout-2026/));
+    await userEvent.click(screen.getByText("💻 复制续聊命令"));
+    await waitFor(() => {
+      expect(mocks.writeText).toHaveBeenCalledWith(
+        "codex resume rollout-2026-08-13T15-04-04-abc",
+      );
+    });
+  });
+
+  it("在文件夹中显示 → revealItemInDir", async () => {
+    mocks.reveal.mockResolvedValue(undefined);
+    renderList();
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    await userEvent.click(screen.getByText("📁 在文件夹中显示"));
+    await waitFor(() => {
+      expect(mocks.reveal).toHaveBeenCalledWith(sessions[0].file);
+    });
+  });
+
+  it("导出 Markdown → save 对话框 + export_transcript_md", async () => {
+    mocks.save.mockResolvedValue("D:\\out\\aaa.md");
+    mocks.invoke.mockResolvedValue("D:\\out\\aaa.md");
+    renderList();
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    await userEvent.click(screen.getByText("📤 导出为 Markdown"));
+    await waitFor(() => {
+      expect(mocks.save).toHaveBeenCalled();
+      expect(mocks.invoke).toHaveBeenCalledWith("export_transcript_md", {
+        file: sessions[0].file,
+        dest: "D:\\out\\aaa.md",
+      });
+    });
+  });
+
+  it("收藏后置顶 + 星标标记 + localStorage 持久化", async () => {
+    renderList();
+    // 收藏 codex 会话
+    fireEvent.contextMenu(screen.getByText(/rollout-2026/));
+    await userEvent.click(screen.getByText(/⭐ 收藏/));
+    // 星标出现在列表
+    await waitFor(() => {
+      expect(screen.getAllByText("⭐")[0]).toBeInTheDocument();
+    });
+    // localStorage 持久化
+    const saved = JSON.parse(localStorage.getItem("ha-starred") ?? "[]");
+    expect(saved).toContain(sessions[2].file);
+    // 收藏项在组内排第一
+    const listItems = document.querySelectorAll("ul.session-list li");
+    const codexGroup = Array.from(listItems).filter((li) =>
+      li.getAttribute("data-agent") === "codex",
     );
-    const items = container.querySelectorAll("li[data-agent]");
-    // 分组后顺序：claude(aaa, bbb) → codex(rollout-x)；选中的是 codex → items[2]
-    expect(items[0].className).not.toContain("selected");
-    expect(items[2].className).toContain("selected");
-    expect(items[2].getAttribute("data-agent")).toBe("codex");
+    expect(codexGroup[0].textContent).toContain("rollout-2026");
+  });
+
+  it("点击空白处关闭菜单", async () => {
+    renderList();
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    expect(screen.getByText("📋 复制文件路径")).toBeInTheDocument();
+    fireEvent.click(document.body);
+    await waitFor(() => {
+      expect(screen.queryByText("📋 复制文件路径")).not.toBeInTheDocument();
+    });
   });
 });

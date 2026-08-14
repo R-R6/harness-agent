@@ -137,6 +137,24 @@ async fn fix_mcp() -> Result<mcp_checker::FixResult, String> {
     Ok(mcp_checker::fix_mcp(mcp_checker::DEFAULT_CONFIG))
 }
 
+/// 导出会话正文为 Markdown 文件（右键菜单功能）
+#[tauri::command]
+async fn export_transcript_md(file: String, dest: String) -> Result<String, String> {
+    let entries = session_proxy::get_transcript(&file, None).map_err(|e| e.to_string())?;
+    let mut md = String::from("# 会话导出\n\n");
+    for e in &entries {
+        let t = match e.entry_type.as_str() {
+            "user" => "🧑 用户",
+            "assistant" => "🤖 助手",
+            "title" => "📌 标题",
+            other => other,
+        };
+        md.push_str(&format!("## {t}\n\n{}\n\n", e.text));
+    }
+    std::fs::write(&dest, md).map_err(|e| format!("写入失败: {e}"))?;
+    Ok(dest)
+}
+
 // ---------------- 入口 ----------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -157,6 +175,7 @@ pub fn run() {
             read_review_artifacts,
             check_mcp,
             fix_mcp,
+            export_transcript_md,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

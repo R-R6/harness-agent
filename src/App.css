@@ -1013,3 +1013,96 @@ code {
   word-break: break-all;
   max-width: 55%;
 }
+
+/* ================= 右键菜单 / 星标 / toast ================= */
+
+.session-list .star {
+  margin-right: 4px;
+  font-size: 11px;
+}
+
+.ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 200px;
+  max-width: 260px;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-pop);
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+}
+
+.ctx-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.ctx-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.ctx-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.ctx-menu button:hover {
+  background: var(--hover);
+}
+
+.ctx-menu button.danger {
+  color: var(--danger);
+}
+
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2000;
+  background: #1f2937;
+  color: #fff;
+  padding: 8px 18px;
+  border-radius: 9999px;
+  font-size: 12.5px;
+  box-shadow: var(--shadow-pop);
+  animation: toast-in 0.2s ease-out;
+  max-width: 70vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
