@@ -70,6 +70,69 @@ describe("SessionList", () => {
     expect(screen.getByText("aaa.jsonl")).toBeInTheDocument();
   });
 
+  it("双栏并列：Claude 左栏 / Codex 右栏，各自独立滚动", () => {
+    renderList();
+    const columns = document.querySelectorAll(".session-column");
+    expect(columns.length).toBe(2);
+    const claudeCol = columns[0];
+    const codexCol = columns[1];
+    // 左栏是 Claude（含 claude 会话），右栏是 Codex
+    expect(claudeCol.querySelector(".badge-claude")).toBeTruthy();
+    expect(claudeCol.textContent).toContain("排查休眠竞态");
+    expect(codexCol.querySelector(".badge-codex")).toBeTruthy();
+    expect(codexCol.textContent).toContain("rollout-2026");
+    // 各自滚动容器
+    expect(claudeCol.querySelector(".column-scroll")).toBeTruthy();
+    expect(codexCol.querySelector(".column-scroll")).toBeTruthy();
+    // 中间有可拖分割线
+    expect(document.querySelector(".column-resizer")).toBeTruthy();
+  });
+
+  it("某组无会话时显示空态（普通态/搜索态文案不同）", () => {
+    const onlyClaude = sessions.filter((s) => s.agent === "claude");
+    render(
+      <SessionList sessions={onlyClaude} selectedFile={null} onSelect={() => {}} />,
+    );
+    // Codex 栏空态
+    expect(screen.getByText("暂无会话")).toBeInTheDocument();
+  });
+
+  it("搜索态下空组提示无匹配结果", () => {
+    const onlyClaude = sessions.filter((s) => s.agent === "claude");
+    render(
+      <SessionList
+        sessions={onlyClaude}
+        selectedFile={null}
+        onSelect={() => {}}
+        searching
+      />,
+    );
+    expect(screen.getByText("无匹配结果")).toBeInTheDocument();
+  });
+
+  it("拖动双栏分割线调整左栏宽度（边界 30%-70%）", () => {
+    renderList();
+    const columns = document.querySelector(".session-columns") as HTMLElement;
+    // jsdom 无布局，mock 容器宽度使百分比计算有效
+    vi.spyOn(columns, "getBoundingClientRect").mockReturnValue({
+      width: 400,
+      height: 600,
+      left: 0,
+      top: 0,
+      right: 400,
+      bottom: 600,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    const resizer = document.querySelector(".column-resizer") as HTMLElement;
+    fireEvent.mouseDown(resizer, { clientX: 200 });
+    fireEvent.mouseMove(window, { clientX: 120 }); // 向左拖 80px → 50% - 20% = 30%
+    fireEvent.mouseUp(window);
+    const claudeCol = document.querySelectorAll(".session-column")[0] as HTMLElement;
+    expect(claudeCol.style.width).toBe("30%");
+  });
+
   it("点击会话触发 onSelect", async () => {
     const onSelect = vi.fn();
     render(

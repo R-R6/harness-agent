@@ -302,6 +302,7 @@ function App() {
                   sessions={sessions}
                   selectedFile={selected?.file ?? null}
                   onSelect={selectSession}
+                  searching={Boolean(searchKeyword)}
                 />
               )}
             </aside>

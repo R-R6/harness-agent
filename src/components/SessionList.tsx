@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatShort } from "../lib/formatTime";
 import { exportTranscriptMd } from "../lib/api";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -9,7 +9,15 @@ interface Props {
   sessions: SessionInfo[];
   selectedFile: string | null;
   onSelect: (s: SessionInfo) => void;
+  /** 是否处于搜索态（空组时提示"无匹配结果"） */
+  searching?: boolean;
 }
+
+/** 固定双栏顺序：Claude 左 / Codex 右（不依赖数据顺序） */
+const AGENT_ORDER: { agent: string; label: string }[] = [
+  { agent: "claude", label: "Claude Code" },
+  { agent: "codex", label: "Codex" },
+];
 
 /** 文件名（无标题时的回退显示） */
 function fileName(file: string): string {
@@ -58,10 +66,10 @@ interface MenuState {
 }
 
 /**
- * 会话列表：按 agent 分组 + 右键菜单
- * （复制路径/ID/标题/时间、在文件夹中显示、复制续聊命令、导出 Markdown、收藏）
+ * 会话列表：Claude / Codex 双栏并列（各自独立滚动，中间分割线可拖）
+ * 右键菜单：复制路径/ID/续聊命令、在文件夹中显示、收藏置顶、导出 Markdown
  */
-export function SessionList({ sessions, selectedFile, onSelect }: Props) {
+export function SessionList({ sessions, selectedFile, onSelect, searching = false }: Props) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [toast, setToast] = useState("");
   const [starred, setStarred] = useState<Set<string>>(() => {
@@ -73,6 +81,34 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
     }
   });
   const toastTimer = useRef<number | null>(null);
+
+  // ---- 双栏分割线：左栏宽度百分比（30%–70%）----
+  const columnsRef = useRef<HTMLDivElement>(null);
+  const [leftPct, setLeftPct] = useState(50);
+
+  const startColumnResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startPct = leftPct;
+      const onMove = (ev: MouseEvent) => {
+        const rect = columnsRef.current?.getBoundingClientRect();
+        if (!rect || rect.width <= 0) return;
+        const pct =
+          ((startPct * rect.width) / 100 + (ev.clientX - startX)) / rect.width * 100;
+        setLeftPct(Math.min(Math.max(pct, 30), 70));
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = "";
+      };
+      document.body.style.cursor = "col-resize";
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [leftPct],
+  );
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -137,7 +173,7 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
         return b.updated.localeCompare(a.updated);
       });
     }
-    return Array.from(map.entries());
+    return map;
   }, [sessions, starred]);
 
   // 右键菜单动作
@@ -203,7 +239,7 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
   };
 
   if (sessions.length === 0) {
-    return <div className="empty">暂无会话</div>;
+    return <div className="empty">{searching ? "无匹配结果" : "暂无会话"}</div>;
   }
 
   const menuItems: { action: string; label: string; danger?: boolean }[] = [
@@ -216,37 +252,56 @@ export function SessionList({ sessions, selectedFile, onSelect }: Props) {
   ];
 
   return (
-    <div className="session-groups">
-      {groups.map(([agent, list]) => (
-        <div key={agent} className="session-group">
-          <h3 className="group-title">
-            <span className={`badge badge-${agent}`}>{list[0].agentLabel}</span>
-            <span className="count">{list.length}</span>
-          </h3>
-          <ul className="session-list">
-            {list.map((s) => {
-              const label = s.title?.trim() || fileName(s.file);
-              const isStarred = starred.has(s.file);
-              return (
-                <li
-                  key={s.file}
-                  data-agent={s.agent}
-                  className={s.file === selectedFile ? "selected" : ""}
-                  onContextMenu={(e) => openMenu(e, s)}
-                >
-                  <button type="button" onClick={() => onSelect(s)} title={s.file}>
-                    <span className="file">
-                      {isStarred && <span className="star">⭐</span>}
-                      {label}
-                    </span>
-                    <span className="time">{formatShort(s.updated)}</span>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      ))}
+    <div className="session-columns" ref={columnsRef}>
+      {AGENT_ORDER.map(({ agent, label }, idx) => {
+        const list = groups.get(agent) ?? [];
+        return (
+          <Fragment key={agent}>
+            {idx > 0 && (
+              <div className="resizer column-resizer" onMouseDown={startColumnResize} />
+            )}
+            <div
+              className="session-column"
+              style={idx === 0 ? { width: `${leftPct}%` } : undefined}
+            >
+              <h3 className="group-title">
+                <span className={`badge badge-${agent}`}>{label}</span>
+                <span className="count">{list.length}</span>
+              </h3>
+              {list.length === 0 ? (
+                <div className="column-empty">
+                  {searching ? "无匹配结果" : "暂无会话"}
+                </div>
+              ) : (
+                <div className="column-scroll">
+                  <ul className="session-list">
+                    {list.map((s) => {
+                      const itemLabel = s.title?.trim() || fileName(s.file);
+                      const isStarred = starred.has(s.file);
+                      return (
+                        <li
+                          key={s.file}
+                          data-agent={s.agent}
+                          className={s.file === selectedFile ? "selected" : ""}
+                          onContextMenu={(e) => openMenu(e, s)}
+                        >
+                          <button type="button" onClick={() => onSelect(s)} title={s.file}>
+                            <span className="file">
+                              {isStarred && <span className="star">⭐</span>}
+                              {itemLabel}
+                            </span>
+                            <span className="time">{formatShort(s.updated)}</span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </Fragment>
+        );
+      })}
 
       {/* 右键菜单 */}
       {menu && (

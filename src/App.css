@@ -264,8 +264,9 @@ code {
 .sidebar {
   min-width: 200px;
   border-right: none;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   background: var(--panel);
   flex-shrink: 0;
 }
@@ -296,6 +297,38 @@ code {
 
 .search-banner button:hover {
   background: var(--hover);
+}
+
+/* 双栏并列：Claude 左 / Codex 右，各自独立滚动 */
+.session-columns {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.session-column {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.column-resizer {
+  cursor: col-resize;
+  align-self: stretch;
+}
+
+.column-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+}
+
+.column-empty {
+  padding: 24px 12px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 12px;
 }
 
 /* 分组 */
