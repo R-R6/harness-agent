@@ -25,7 +25,7 @@ function fileName(file: string): string {
 }
 
 /** 会话 ID：文件名去扩展名（Claude UUID / Codex rollout-xxx） */
-export function sessionId(file: string): string {
+function sessionId(file: string): string {
   const base = fileName(file);
   return base.endsWith(".jsonl") ? base.slice(0, -6) : base;
 }
