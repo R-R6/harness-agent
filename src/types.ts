@@ -54,3 +54,23 @@ export interface ReviewArtifact {
   model: string;
   session_id: string;
 }
+
+// ---- 本机 CLI 终端工作台 ----
+
+export type TerminalAgent = "claude" | "codex";
+export type TerminalStatus = "idle" | "starting" | "running" | "stopping" | "exited" | "error";
+
+export interface TerminalStartRequest {
+  agent: TerminalAgent;
+  work_dir: string;
+  cols: number;
+  rows: number;
+}
+
+export interface TerminalSessionInfo {
+  id: string;
+  agent: TerminalAgent;
+  work_dir: string;
+  status: TerminalStatus;
+  pid?: number;
+}

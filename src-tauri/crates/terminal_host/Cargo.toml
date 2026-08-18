@@ -1,0 +1,8 @@
+[package]
+name = "terminal_host"
+version = "0.1.0"
+edition = "2021"
+description = "Native PTY host for local Claude/Codex CLI sessions"
+
+[dependencies]
+portable-pty = "0.9"
