@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Icon } from "./Icon";
 
 interface Props {
   onSearch: (keyword: string) => void;
@@ -34,7 +35,7 @@ export function SearchBox({ onSearch, onClear }: Props) {
             onClear();
           }}
         >
-          清除
+          <Icon name="close" size={13} /> 清除
         </button>
       )}
     </form>

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title>Harness Agent</title>
+  <defs>
+    <linearGradient id="frame" x1="72" y1="58" x2="446" y2="470" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#e48261"/>
+      <stop offset="0.46" stop-color="#b277d1"/>
+      <stop offset="1" stop-color="#7197ff"/>
+    </linearGradient>
+    <linearGradient id="face" x1="119" y1="112" x2="390" y2="402" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#182230"/>
+      <stop offset="1" stop-color="#0c1119"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="118" fill="url(#frame)"/>
+  <rect x="21" y="21" width="470" height="470" rx="101" fill="url(#face)"/>
+  <path fill="url(#frame)" d="M126 122h78v88h104v-88h78v268h-78v-102H204v102h-78V122Zm88 143h94v-32h-94v32Z"/>
+  <path d="M117 92h62M333 420h62" fill="none" stroke="#f5f7fc" stroke-linecap="round" stroke-opacity=".78" stroke-width="13"/>
+</svg>

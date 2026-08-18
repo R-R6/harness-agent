@@ -42,12 +42,12 @@ describe("ReviewBoard", () => {
     });
   });
 
-  it("PASS 卡片显示 ✅ 通过，REVIEW 卡片显示 🔄 需返工", async () => {
+  it("PASS 卡片显示通过，REVIEW 卡片显示需返工", async () => {
     mocks.invoke.mockResolvedValue(artifacts);
     render(<ReviewBoard workDir={"D:\\work"} />);
     await waitFor(() => {
-      expect(screen.getByText("✅ 通过")).toBeInTheDocument();
-      expect(screen.getByText("🔄 需返工")).toBeInTheDocument();
+      expect(screen.getByText("通过")).toBeInTheDocument();
+      expect(screen.getByText("需返工")).toBeInTheDocument();
     });
   });
 

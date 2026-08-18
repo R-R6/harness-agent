@@ -136,11 +136,14 @@ pub fn list_sessions(agent: Option<String>, limit: Option<usize>) -> Result<Vec<
     serde_json::from_value(body).map_err(|e| format!("解析 list_sessions 结果失败: {e}"))
 }
 
-/// 读取某会话正文（tail：只取末尾 N 条，默认 200）
-pub fn get_transcript(file: &str, tail: Option<i64>) -> Result<Vec<TranscriptEntry>, String> {
+/// 读取某会话正文（tail：只取末尾 N 条，默认 200；offset：从末尾跳过 N 条，配合 tail 往前翻页到会话开头）
+pub fn get_transcript(file: &str, tail: Option<i64>, offset: Option<i64>) -> Result<Vec<TranscriptEntry>, String> {
     let mut args = json!({ "file": file });
     if let Some(t) = tail {
         args["tail"] = json!(t);
+    }
+    if let Some(o) = offset {
+        args["offset"] = json!(o);
     }
     let v = call_tool("get_transcript", &args)?;
     serde_json::from_value(v).map_err(|e| format!("解析 get_transcript 结果失败: {e}"))
@@ -255,7 +258,7 @@ mod tests {
                 .iter()
                 .find(|r| r.file.ends_with("session-abc.jsonl"))
                 .expect("找到 claude 会话");
-            let t = get_transcript(&claude.file, None).expect("transcript 应成功");
+            let t = get_transcript(&claude.file, None, None).expect("transcript 应成功");
             assert!(t.iter().any(|e| e.text.contains("写个计算器")), "含 user 消息");
             assert!(t.iter().any(|e| e.text.contains("好的，我写一个")), "含 assistant 消息");
             assert!(t.iter().any(|e| e.text.contains("写计算器")), "含标题");
@@ -264,7 +267,7 @@ mod tests {
                 .iter()
                 .find(|r| r.file.ends_with("rollout-test.jsonl"))
                 .expect("找到 codex 会话");
-            let t2 = get_transcript(&codex.file, None).expect("codex transcript 应成功");
+            let t2 = get_transcript(&codex.file, None, None).expect("codex transcript 应成功");
             assert!(t2.iter().any(|e| e.text.contains("猜数字游戏")), "含 codex user 消息");
             assert!(t2.iter().any(|e| e.text.contains("已完成猜数字")), "含 codex agent 消息");
         });
@@ -274,10 +277,31 @@ mod tests {
     fn get_transcript_respects_tail() {
         with_fake_sessions(|| {
             let rows = list_sessions(Some("claude".into()), None).unwrap();
-            let t_all = get_transcript(&rows[0].file, None).unwrap();
-            let t_1 = get_transcript(&rows[0].file, Some(1)).unwrap();
+            let t_all = get_transcript(&rows[0].file, None, None).unwrap();
+            let t_1 = get_transcript(&rows[0].file, Some(1), None).unwrap();
             assert!(t_1.len() <= 1, "tail=1 应只返回 1 条，实际 {}", t_1.len());
             assert!(t_all.len() >= 3, "完整应至少 3 条，实际 {}", t_all.len());
+        });
+    }
+
+    #[test]
+    fn get_transcript_respects_offset() {
+        with_fake_sessions(|| {
+            let rows = list_sessions(Some("claude".into()), None).unwrap();
+            let file = &rows[0].file;
+            // 伪造 claude 会话 3 条：title（写计算器）、user、assistant
+            let t_all = get_transcript(file, None, None).unwrap();
+            assert_eq!(t_all.len(), 3, "伪造 claude 会话应 3 条，实际 {}", t_all.len());
+            // offset=0：与无 offset 一致（向后兼容）
+            let t_last = get_transcript(file, Some(2), None).unwrap();
+            assert_eq!(t_last.len(), 2);
+            // offset=2：跳过末尾 2 条，取更早的 1 条（与末尾不重叠）
+            let t_prev = get_transcript(file, Some(2), Some(2)).unwrap();
+            assert_eq!(t_prev.len(), 1, "offset 后应只剩最早 1 条，实际 {}", t_prev.len());
+            assert!(t_prev[0].text.contains("写计算器"), "最早那条是标题，实际 {}", t_prev[0].text);
+            assert_ne!(t_prev[0].text, t_last[0].text, "offset 后应取更早消息");
+            // offset 超总量 → 空（已到最前）
+            assert!(get_transcript(file, Some(2), Some(999)).unwrap().is_empty());
         });
     }
 
@@ -296,7 +320,7 @@ mod tests {
         // 白名单外文件（即使存在）必须被 server.js 拒绝 —— 这是 S1 安全边界的回归测试
         with_fake_sessions(|| {
             let evil = "C:\\Windows\\system32\\drivers\\etc\\hosts";
-            let err = get_transcript(evil, None).expect_err("白名单外必须拒绝");
+            let err = get_transcript(evil, None, None).expect_err("白名单外必须拒绝");
             assert!(err.contains("拒绝") || err.contains("不在会话根目录"), "错误信息: {err}");
         });
     }
@@ -306,7 +330,7 @@ mod tests {
         with_fake_sessions(|| {
             let rows = list_sessions(Some("claude".into()), None).unwrap();
             let fake = format!("{}__nope.jsonl", rows[0].file);
-            let err = get_transcript(&fake, None).expect_err("不存在必须报错");
+            let err = get_transcript(&fake, None, None).expect_err("不存在必须报错");
             assert!(err.contains("不存在"), "错误信息: {err}");
         });
     }

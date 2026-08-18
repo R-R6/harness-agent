@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { cancelSupervise, runSupervise } from "../lib/api";
+import { Icon } from "./Icon";
 
 interface Props {
   /** 启动后回调（父组件刷新审查看板） */
@@ -62,7 +63,7 @@ export function SupervisePanel({ onStarted }: Props) {
       return;
     }
     if (!workDir.trim()) {
-      setError("工作目录不能为空（可点 📁 浏览选择）");
+      setError("工作目录不能为空（可点浏览选择）");
       return;
     }
     try {
@@ -124,7 +125,7 @@ export function SupervisePanel({ onStarted }: Props) {
               placeholder="Claude 干活的项目目录（可点击浏览选择）"
             />
             <button type="button" className="browse" onClick={browseDir} title="打开资源管理器选择目录">
-              📁 浏览
+              <Icon name="folder-open" size={14} /> 浏览
             </button>
           </div>
         </label>
@@ -150,10 +151,12 @@ export function SupervisePanel({ onStarted }: Props) {
         <div className="form-actions">
           {runningTask ? (
             <button type="button" className="danger" onClick={cancel}>
+              <Icon name="stop" size={14} />
               取消任务
             </button>
           ) : (
             <button type="button" onClick={start}>
+              <Icon name="play" size={14} />
               启动监督闭环
             </button>
           )}

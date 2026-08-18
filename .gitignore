@@ -33,3 +33,7 @@ __pycache__/
 *.njsproj
 *.sln
 *.sw?
+
+# 本地工具配置（Codex 沙箱等，非项目代码）
+.codex/
+

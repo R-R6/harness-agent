@@ -19,8 +19,12 @@ export async function fetchSessions(agent?: string, limit?: number): Promise<Ses
 export async function fetchTranscript(
   file: string,
   tail?: number,
+  offset?: number,
 ): Promise<TranscriptEntry[]> {
-  return invoke<TranscriptEntry[]>("get_transcript", { file, tail });
+  const args: Record<string, string | number> = { file };
+  if (tail !== undefined) args.tail = tail;
+  if (offset !== undefined) args.offset = offset;
+  return invoke<TranscriptEntry[]>("get_transcript", args);
 }
 
 export async function searchSessions(keyword: string): Promise<SessionInfo[]> {

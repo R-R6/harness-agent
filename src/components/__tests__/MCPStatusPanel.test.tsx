@@ -39,12 +39,14 @@ describe("MCPStatusPanel", () => {
 
   it("健康时显示全部通过 + 不显示修复按钮", async () => {
     mocks.invoke.mockResolvedValue(healthy);
-    render(<MCPStatusPanel />);
+    const onHealthChange = vi.fn();
+    render(<MCPStatusPanel onHealthChange={onHealthChange} />);
     await waitFor(() => {
       expect(screen.getByText(/MCP 注册健康（/)).toBeInTheDocument();
     });
     expect(screen.getByText(/已注册/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "一键修复" })).not.toBeInTheDocument();
+    expect(onHealthChange).toHaveBeenLastCalledWith("healthy");
   });
 
   it("异常时显示修复按钮，点击调用 fix_mcp 并重查", async () => {

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.mgzxtech.harness-agent",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "node scripts/ensure-vite-dev.mjs",
     "devUrl": "http://127.0.0.1:14200",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
@@ -16,7 +16,8 @@
         "width": 1280,
         "height": 800,
         "minWidth": 1024,
-        "minHeight": 700
+        "minHeight": 700,
+        "theme": "Dark"
       }
     ],
     "security": {

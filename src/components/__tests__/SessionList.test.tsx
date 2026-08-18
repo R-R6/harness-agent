@@ -76,6 +76,8 @@ describe("SessionList", () => {
     expect(columns.length).toBe(2);
     const claudeCol = columns[0];
     const codexCol = columns[1];
+    expect(claudeCol).toHaveClass("session-column--claude");
+    expect(codexCol).toHaveClass("session-column--codex");
     // 左栏是 Claude（含 claude 会话），右栏是 Codex
     expect(claudeCol.querySelector(".badge-claude")).toBeTruthy();
     expect(claudeCol.textContent).toContain("排查休眠竞态");
@@ -110,27 +112,63 @@ describe("SessionList", () => {
     expect(screen.getByText("无匹配结果")).toBeInTheDocument();
   });
 
-  it("拖动双栏分割线调整左栏宽度（边界 30%-70%）", () => {
+  it("拖动双栏分割线时保留两栏的最小可读宽度", async () => {
     renderList();
     const columns = document.querySelector(".session-columns") as HTMLElement;
     // jsdom 无布局，mock 容器宽度使百分比计算有效
     vi.spyOn(columns, "getBoundingClientRect").mockReturnValue({
-      width: 400,
+      width: 480,
       height: 600,
       left: 0,
       top: 0,
-      right: 400,
+      right: 480,
       bottom: 600,
       x: 0,
       y: 0,
       toJSON: () => ({}),
     });
+    fireEvent(window, new Event("resize"));
+    await waitFor(() => {
+      expect(screen.getByRole("separator", { name: "调整 Claude 与 Codex 会话区域" }))
+        .toHaveAttribute("aria-orientation", "vertical");
+    });
     const resizer = document.querySelector(".column-resizer") as HTMLElement;
-    fireEvent.mouseDown(resizer, { clientX: 200 });
-    fireEvent.mouseMove(window, { clientX: 120 }); // 向左拖 80px → 50% - 20% = 30%
-    fireEvent.mouseUp(window);
-    const claudeCol = document.querySelectorAll(".session-column")[0] as HTMLElement;
-    expect(claudeCol.style.width).toBe("30%");
+    fireEvent.pointerDown(resizer, { button: 0, pointerId: 1, clientX: 240 });
+    fireEvent.pointerMove(resizer, { pointerId: 1, clientX: 40 });
+    fireEvent.pointerUp(resizer, { pointerId: 1 });
+    expect(Number.parseFloat(columns.style.getPropertyValue("--session-primary-size"))).toBeCloseTo(
+      (160 / (480 - 12)) * 100,
+      1,
+    );
+  });
+
+  it("窄侧栏切换为可拖动的横向分隔线", async () => {
+    renderList();
+    const columns = document.querySelector(".session-columns") as HTMLElement;
+    vi.spyOn(columns, "getBoundingClientRect").mockReturnValue({
+      width: 360,
+      height: 600,
+      left: 0,
+      top: 0,
+      right: 360,
+      bottom: 600,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    fireEvent(window, new Event("resize"));
+
+    const resizer = await screen.findByRole("separator", { name: "调整 Claude 与 Codex 会话区域" });
+    await waitFor(() => expect(resizer).toHaveAttribute("aria-orientation", "horizontal"));
+    expect(columns).toHaveClass("session-columns--stacked");
+
+    fireEvent.pointerDown(resizer, { button: 0, pointerId: 2, clientY: 300 });
+    fireEvent.pointerMove(resizer, { pointerId: 2, clientY: 100 });
+    fireEvent.pointerUp(resizer, { pointerId: 2 });
+    expect(Number.parseFloat(columns.style.getPropertyValue("--session-primary-size"))).toBeCloseTo(
+      (120 / (600 - 12)) * 100,
+      1,
+    );
   });
 
   it("点击会话触发 onSelect", async () => {
@@ -142,11 +180,30 @@ describe("SessionList", () => {
     expect(onSelect).toHaveBeenCalledWith(sessions[0]);
   });
 
+  it("方向键在固定双栏顺序中切换会话，Esc 退出搜索", () => {
+    const onSelect = vi.fn();
+    const onEscapeSearch = vi.fn();
+    render(
+      <SessionList
+        sessions={sessions}
+        selectedFile={null}
+        onSelect={onSelect}
+        searching
+        onEscapeSearch={onEscapeSearch}
+      />,
+    );
+    const first = screen.getByRole("button", { name: "打开会话 排查休眠竞态" });
+    fireEvent.keyDown(first, { key: "ArrowDown" });
+    expect(onSelect).toHaveBeenCalledWith(sessions[0]);
+    fireEvent.keyDown(first, { key: "Escape" });
+    expect(onEscapeSearch).toHaveBeenCalledOnce();
+  });
+
   it("右键会话弹出菜单，复制文件路径", async () => {
     renderList();
     fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
-    expect(screen.getByText("📋 复制文件路径")).toBeInTheDocument();
-    await userEvent.click(screen.getByText("📋 复制文件路径"));
+    expect(screen.getByText("复制文件路径")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("复制文件路径"));
     await waitFor(() => {
       expect(mocks.writeText).toHaveBeenCalledWith(sessions[0].file);
     });
@@ -156,7 +213,7 @@ describe("SessionList", () => {
   it("复制会话 ID（Codex rollout 去扩展名）", async () => {
     renderList();
     fireEvent.contextMenu(screen.getByText(/rollout-2026/));
-    await userEvent.click(screen.getByText("🆔 复制会话 ID"));
+    await userEvent.click(screen.getByText("复制会话 ID"));
     await waitFor(() => {
       expect(mocks.writeText).toHaveBeenCalledWith("rollout-2026-08-13T15-04-04-abc");
     });
@@ -165,12 +222,12 @@ describe("SessionList", () => {
   it("复制续聊命令（按 agent 不同命令）", async () => {
     renderList();
     fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
-    await userEvent.click(screen.getByText("💻 复制续聊命令"));
+    await userEvent.click(screen.getByText("复制续聊命令"));
     await waitFor(() => {
       expect(mocks.writeText).toHaveBeenCalledWith("claude --resume aaa");
     });
     fireEvent.contextMenu(screen.getByText(/rollout-2026/));
-    await userEvent.click(screen.getByText("💻 复制续聊命令"));
+    await userEvent.click(screen.getByText("复制续聊命令"));
     await waitFor(() => {
       expect(mocks.writeText).toHaveBeenCalledWith(
         "codex resume rollout-2026-08-13T15-04-04-abc",
@@ -182,7 +239,7 @@ describe("SessionList", () => {
     mocks.reveal.mockResolvedValue(undefined);
     renderList();
     fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
-    await userEvent.click(screen.getByText("📁 在文件夹中显示"));
+    await userEvent.click(screen.getByText("在文件夹中显示"));
     await waitFor(() => {
       expect(mocks.reveal).toHaveBeenCalledWith(sessions[0].file);
     });
@@ -193,7 +250,7 @@ describe("SessionList", () => {
     mocks.invoke.mockResolvedValue("D:\\out\\aaa.md");
     renderList();
     fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
-    await userEvent.click(screen.getByText("📤 导出为 Markdown"));
+    await userEvent.click(screen.getByText("导出为 Markdown"));
     await waitFor(() => {
       expect(mocks.save).toHaveBeenCalled();
       expect(mocks.invoke).toHaveBeenCalledWith("export_transcript_md", {
@@ -207,10 +264,10 @@ describe("SessionList", () => {
     renderList();
     // 收藏 codex 会话
     fireEvent.contextMenu(screen.getByText(/rollout-2026/));
-    await userEvent.click(screen.getByText(/⭐ 收藏/));
+    await userEvent.click(screen.getByText("收藏（置顶）"));
     // 星标出现在列表
     await waitFor(() => {
-      expect(screen.getAllByText("⭐")[0]).toBeInTheDocument();
+      expect(screen.getByTitle("已收藏")).toBeInTheDocument();
     });
     // localStorage 持久化
     const saved = JSON.parse(localStorage.getItem("ha-starred") ?? "[]");
@@ -226,10 +283,10 @@ describe("SessionList", () => {
   it("点击空白处关闭菜单", async () => {
     renderList();
     fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
-    expect(screen.getByText("📋 复制文件路径")).toBeInTheDocument();
+    expect(screen.getByText("复制文件路径")).toBeInTheDocument();
     fireEvent.click(document.body);
     await waitFor(() => {
-      expect(screen.queryByText("📋 复制文件路径")).not.toBeInTheDocument();
+      expect(screen.queryByText("复制文件路径")).not.toBeInTheDocument();
     });
   });
 });

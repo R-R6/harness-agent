@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchReviewArtifacts } from "../lib/api";
 import type { ReviewArtifact } from "../types";
+import { Icon } from "./Icon";
 
 interface Props {
   workDir: string;
@@ -34,7 +35,7 @@ export function ReviewBoard({ workDir }: Props) {
       <div className="board-head">
         <h3>审查看板</h3>
         <button type="button" onClick={load} disabled={loading}>
-          {loading ? "加载中..." : "刷新"}
+          <Icon name="refresh" size={13} className={loading ? "spin" : ""} /> {loading ? "加载中..." : "刷新"}
         </button>
       </div>
       {error && <div className="error">{error}</div>}
@@ -55,7 +56,8 @@ export function ReviewBoard({ workDir }: Props) {
                 <span
                   className={`verdict verdict-${a.verdict.toLowerCase()}`}
                 >
-                  {a.verdict === "PASS" ? "✅ 通过" : "🔄 需返工"}
+                  <Icon name={a.verdict === "PASS" ? "check" : "refresh"} size={12} />
+                  {a.verdict === "PASS" ? "通过" : "需返工"}
                 </span>
                 {a.model && <span className="model">{a.model}</span>}
                 {a.session_id && (
