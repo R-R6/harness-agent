@@ -67,18 +67,25 @@ impl TerminalState {
 
 fn terminal_command(agent: &str) -> Result<(String, Vec<String>), String> {
     #[cfg(windows)]
-    if agent == "claude" {
-        // npm installs Claude Code as a .cmd shim on Windows. Launching through
-        // cmd.exe lets ConPTY resolve that shim reliably while preserving stdin,
-        // stdout, ANSI output, and Ctrl+C for the child CLI.
-        return Ok((
-            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
-            vec!["/d".into(), "/s".into(), "/c".into(), "claude".into()],
-        ));
+    {
+        // Claude/Codex 在 Windows 上都是 npm 装的 .cmd shim。走 cmd.exe 让 PATHEXT
+        // 解析出 .cmd，而不是直接 CreateProcessW 裸名——裸名会先命中 npm 全局目录里
+        // 那个无扩展名的 sh 脚本（#!/bin/sh，不是 Win32 程序），报 ERROR_BAD_EXE_FORMAT
+        // (os error 193)。cmd.exe 同时转发 stdin/stdout/ANSI/Ctrl+C。
+        if matches!(agent, "claude" | "codex") {
+            return Ok((
+                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+                vec!["/d".into(), "/s".into(), "/c".into(), agent.to_string()],
+            ));
+        }
+        return Err(format!("不支持的终端 Agent: {agent}"));
     }
-    match agent {
-        "claude" | "codex" => Ok((agent.to_string(), Vec::new())),
-        other => Err(format!("不支持的终端 Agent: {other}")),
+    #[cfg(not(windows))]
+    {
+        match agent {
+            "claude" | "codex" => Ok((agent.to_string(), Vec::new())),
+            other => Err(format!("不支持的终端 Agent: {other}")),
+        }
     }
 }
 
