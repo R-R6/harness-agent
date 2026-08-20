@@ -57,11 +57,18 @@ export function buildXtermOptions(env?: NavigatorLike): ITerminalOptions {
     convertEol: false,
     cursorBlink: false,
     cursorInactiveStyle: "outline",
-    fontFamily: "Cascadia Mono, Consolas, monospace",
+    // Cascadia/Consolas have no CJK glyphs. Without a monospace CJK fallback,
+    // Windows substitutes Microsoft YaHei (proportional), so 你好 is not two
+    // cells wide and Ink/Claude's cursor jumps a whole row.
+    fontFamily: "Cascadia Mono, Consolas, NSimSun, SimSun, monospace",
     fontSize: 13,
     lineHeight: 1,
-    scrollback: 5000,
-    rescaleOverlappingGlyphs: true,
+    // ConPTY + windowsPty pushes the old viewport into scrollback when rows
+    // grow (maximize/fit). Ink/ratatui then look like two stacked UIs.
+    scrollback: 0,
+    // Overlapping CJK fallback glyphs get squashed into one cell and Ink's
+    // cursor then appears a row away from 你好.
+    rescaleOverlappingGlyphs: false,
     theme: TERMINAL_THEME,
     ...(windowsPty ? { windowsPty } : {}),
   };

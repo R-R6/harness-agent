@@ -7,6 +7,9 @@ describe("buildXtermOptions", () => {
     expect(options.convertEol).toBe(false);
     expect(options.cursorBlink).toBe(false);
     expect(options.lineHeight).toBe(1);
+    expect(options.scrollback).toBe(0);
+    expect(options.rescaleOverlappingGlyphs).toBe(false);
+    expect(options.fontFamily).toContain("NSimSun");
     expect(options.windowsPty).toBeUndefined();
   });
 

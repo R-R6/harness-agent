@@ -376,6 +376,14 @@ function TerminalPane({
 
   useEffect(() => {
     sessionRef.current = pane.session;
+    const terminal = terminalRef.current;
+    // Spawn already used the current cols/rows. A same-size ConPTY resize still
+    // SIGWINCH Ink, which commits the welcome screen to Static and draws it again.
+    if (pane.session && terminal) {
+      lastPtySizeRef.current = `${pane.session.id}:${terminal.cols}x${terminal.rows}`;
+    } else if (!pane.session) {
+      lastPtySizeRef.current = "";
+    }
   }, [pane.session]);
 
   useEffect(() => {
@@ -445,6 +453,11 @@ function TerminalPane({
         terminal.open(hostRef.current);
         fitRef.current = fit;
         terminalRef.current = terminal;
+        try {
+          fit.fit();
+        } catch {
+          // Cell metrics can still be 0; scheduleFitAndResize retries.
+        }
         callbacksRef.current.onMount(terminal);
         mountedRef.current = true;
         setTerminalReady(true);

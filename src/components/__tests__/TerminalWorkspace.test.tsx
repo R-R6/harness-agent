@@ -18,15 +18,20 @@ const mocks = vi.hoisted(() => {
     });
 
     constructor(options?: unknown) {
-      this.options = options;
+      this.options = options ?? { cursorBlink: false };
       terminals.push(this);
     }
+
+    parser = {
+      registerCsiHandler: vi.fn(() => ({ dispose: vi.fn() })),
+    };
 
     loadAddon() {}
     open() {}
     writeln(data: string) { this.writes.push(data); }
     write(data: string) { this.writes.push(data); }
     clear() {}
+    onWriteParsed() { return { dispose: vi.fn() }; }
     onData(handler: (data: string) => void) {
       this.onDataHandler = handler;
       return { dispose: vi.fn() };
@@ -135,6 +140,7 @@ describe("TerminalWorkspace", () => {
       });
       expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
     });
+    expect(mocks.invoke.mock.calls.some((call) => call[0] === "resize_terminal")).toBe(false);
 
     await waitFor(() => {
       expect(mocks.listeners.get("terminal-output")).toHaveLength(1);
@@ -159,6 +165,7 @@ describe("TerminalWorkspace", () => {
     expect(mocks.terminals[0].options).toEqual(expect.objectContaining({
       convertEol: false,
       cursorBlink: false,
+      scrollback: 0,
     }));
   });
 
