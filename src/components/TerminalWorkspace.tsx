@@ -4,7 +4,7 @@ import type { FitAddon } from "@xterm/addon-fit";
 import type { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { resizeTerminal, startTerminal, stopTerminal, writeTerminal } from "../lib/terminalApi";
-import { loadXtermRuntime } from "../lib/xtermRuntime";
+import { buildXtermOptions, loadXtermRuntime } from "../lib/xtermRuntime";
 import type { TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
 import { Icon, IconButton } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
@@ -38,6 +38,40 @@ const AGENTS: { id: TerminalAgent; label: string; description: string }[] = [
   { id: "claude", label: "Claude CLI", description: "本机 Claude Code CLI" },
   { id: "codex", label: "Codex CLI", description: "本机 codex CLI" },
 ];
+
+function writeIdleBanner(terminal: Terminal, agent: { label: string; description: string }) {
+  terminal.writeln(`\x1b[90m${agent.label} · ${agent.description}\x1b[0m`);
+  terminal.writeln("\x1b[90m点击启动后，终端会连接到本机 CLI。\x1b[0m");
+}
+
+/**
+ * `listen()` is async. React StrictMode (and fast remounts) run cleanup before
+ * the unlisten handle exists, which would leak a second PTY subscriber and
+ * paint every chunk twice — Ink/ratatui then looks stacked.
+ */
+function listenWhileMounted<T>(
+  event: string,
+  handler: (event: { payload: T }) => void,
+): () => void {
+  let cancelled = false;
+  let unlisten: UnlistenFn | undefined;
+  void listen<T>(event, handler).then(
+    (fn) => {
+      if (cancelled) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    },
+    () => {
+      // Subscribe failed; the next mount retries.
+    },
+  );
+  return () => {
+    cancelled = true;
+    unlisten?.();
+  };
+}
 
 interface Props {
   active: boolean;
@@ -135,57 +169,50 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
   // PTY output is byte-oriented; never split it by line because ANSI cursor
   // sequences and partial UTF-8 chunks may span multiple events.
   useEffect(() => {
-    let unOutput: UnlistenFn | undefined;
-    let unExit: UnlistenFn | undefined;
-    let unError: UnlistenFn | undefined;
-    (async () => {
-      unOutput = await listen<{ sessionId: string; data: string }>(
-        "terminal-output",
-        (event) => {
-          for (const [agent] of terminals.current.entries()) {
-            if (panesRef.current[agent].session?.id === event.payload.sessionId) {
-              enqueueOutput(agent, event.payload.sessionId, event.payload.data);
-              break;
-            }
+    const stopOutput = listenWhileMounted<{ sessionId: string; data: string }>(
+      "terminal-output",
+      (event) => {
+        for (const [agent] of terminals.current.entries()) {
+          if (panesRef.current[agent].session?.id === event.payload.sessionId) {
+            enqueueOutput(agent, event.payload.sessionId, event.payload.data);
+            break;
           }
-        },
-      );
-      unExit = await listen<{ sessionId: string; code?: number | null }>(
-        "terminal-exit",
-        (event) => {
-          for (const agent of ["claude", "codex"] as TerminalAgent[]) {
-            if (panesRef.current[agent].session?.id === event.payload.sessionId) {
-              const code = event.payload.code;
-              patchPane(agent, {
-                status: "exited",
-                session: null,
-                error: code != null && code !== 0 ? `CLI 异常退出（代码 ${code}）` : "",
-              });
-              break;
-            }
+        }
+      },
+    );
+    const stopExit = listenWhileMounted<{ sessionId: string; code?: number | null }>(
+      "terminal-exit",
+      (event) => {
+        for (const agent of ["claude", "codex"] as TerminalAgent[]) {
+          if (panesRef.current[agent].session?.id === event.payload.sessionId) {
+            const code = event.payload.code;
+            patchPane(agent, {
+              status: "exited",
+              session: null,
+              error: code != null && code !== 0 ? `CLI 异常退出（代码 ${code}）` : "",
+            });
+            break;
           }
-        },
-      );
-      unError = await listen<{ sessionId?: string; message: string }>(
-        "terminal-error",
-        (event) => {
-          for (const agent of ["claude", "codex"] as TerminalAgent[]) {
-            if (!event.payload.sessionId || panesRef.current[agent].session?.id === event.payload.sessionId) {
-              patchPane(agent, { status: "error", error: event.payload.message });
-              if (event.payload.sessionId) break;
-            }
+        }
+      },
+    );
+    const stopError = listenWhileMounted<{ sessionId?: string; message: string }>(
+      "terminal-error",
+      (event) => {
+        for (const agent of ["claude", "codex"] as TerminalAgent[]) {
+          if (!event.payload.sessionId || panesRef.current[agent].session?.id === event.payload.sessionId) {
+            patchPane(agent, { status: "error", error: event.payload.message });
+            if (event.payload.sessionId) break;
           }
-        },
-      );
-    })();
+        }
+      },
+    );
 
     return () => {
-      unOutput?.();
-      unExit?.();
-      unError?.();
+      stopOutput();
+      stopExit();
+      stopError();
     };
-    // The listeners intentionally stay stable for the lifetime of the workspace.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enqueueOutput, patchPane]);
 
   const handleStart = useCallback(
@@ -412,28 +439,7 @@ function TerminalPane({
     void loadXtermRuntime()
       .then(({ Terminal, FitAddon }) => {
         if (unmountedRef.current || !hostRef.current || terminalRef.current) return;
-        const terminal = new Terminal({
-          convertEol: true,
-          cursorBlink: true,
-          fontFamily: "Cascadia Mono, Consolas, monospace",
-          fontSize: 13,
-          scrollback: 5000,
-          theme: {
-            background: "#0b0e13",
-            foreground: "#d7dee8",
-            cursor: "#8fb5ff",
-            selectionBackground: "#27456f",
-            black: "#11161d",
-            red: "#ef8f8f",
-            green: "#8bd5a5",
-            yellow: "#e7c77d",
-            blue: "#8fb5ff",
-            magenta: "#c1a2f2",
-            cyan: "#83d5d5",
-            white: "#f2f4f7",
-            brightBlack: "#566171",
-          },
-        });
+        const terminal = new Terminal(buildXtermOptions());
         const fit = new FitAddon();
         terminal.loadAddon(fit);
         terminal.open(hostRef.current);
@@ -442,10 +448,15 @@ function TerminalPane({
         callbacksRef.current.onMount(terminal);
         mountedRef.current = true;
         setTerminalReady(true);
-        fit.fit();
-        terminal.writeln(`\x1b[90m${agent.label} · ${agent.description}\x1b[0m`);
-        terminal.writeln("\x1b[90m点击启动后，终端会连接到本机 CLI。\x1b[0m");
+        writeIdleBanner(terminal, agent);
         dataListenerRef.current = terminal.onData((data) => callbacksRef.current.onInput(agent.id, data));
+        // FitAddon no-ops while cell metrics are 0; retry after layout.
+        scheduleFitAndResize();
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (!unmountedRef.current) scheduleFitAndResize();
+          });
+        });
 
         if (typeof ResizeObserver !== "undefined") {
           const observer = new ResizeObserver(() => {
@@ -469,6 +480,22 @@ function TerminalPane({
     if (!active || !terminalRef.current) return;
     scheduleFitAndResize();
   }, [active, pane.session, scheduleFitAndResize]);
+
+  // Drop the idle banner before the TUI takes the alternate screen. Leaving
+  // those lines in the buffer makes Ink/ratatui look like a stacked second UI.
+  // If start fails before a session exists, put the banner back so the pane
+  // is not a blank black box. Do not reset on `exited`: the last TUI frame is useful.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    if (pane.status === "starting") {
+      terminal.reset();
+      return;
+    }
+    if (pane.status === "error" && !pane.session) {
+      writeIdleBanner(terminal, agent);
+    }
+  }, [agent, pane.session, pane.status]);
 
   useEffect(() => {
     unmountedRef.current = false;
@@ -531,6 +558,11 @@ function TerminalPane({
             type="button"
             className="button button--primary button--compact"
             onClick={() => {
+              try {
+                fitRef.current?.fit();
+              } catch {
+                // Fit can throw while the pane is still collapsing; start with last known size.
+              }
               const terminal = terminalRef.current;
               onStart(agent.id, terminal?.cols ?? 120, terminal?.rows ?? 30);
             }}

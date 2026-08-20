@@ -10,10 +10,15 @@ const mocks = vi.hoisted(() => {
     cols = 100;
     rows = 30;
     writes: string[] = [];
+    options: unknown;
     onDataHandler: ((data: string) => void) | null = null;
     dispose = vi.fn();
+    reset = vi.fn(function (this: MockTerminal) {
+      this.writes = [];
+    });
 
-    constructor() {
+    constructor(options?: unknown) {
+      this.options = options;
       terminals.push(this);
     }
 
@@ -36,7 +41,7 @@ const mocks = vi.hoisted(() => {
     invoke: vi.fn(),
     listen: vi.fn(),
     loadRuntime: vi.fn(),
-    listeners: new Map<string, (event: { payload: unknown }) => void>(),
+    listeners: new Map<string, Array<(event: { payload: unknown }) => void>>(),
     terminals,
     MockTerminal,
     MockFitAddon,
@@ -45,7 +50,10 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
-vi.mock("../../lib/xtermRuntime", () => ({ loadXtermRuntime: mocks.loadRuntime }));
+vi.mock("../../lib/xtermRuntime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/xtermRuntime")>();
+  return { ...actual, loadXtermRuntime: mocks.loadRuntime };
+});
 
 class MockResizeObserver {
   observe() {}
@@ -58,6 +66,12 @@ function deferred<T>() {
     resolve = resolvePromise;
   });
   return { promise, resolve };
+}
+
+function emitEvent(event: string, payload: unknown) {
+  for (const handler of [...(mocks.listeners.get(event) ?? [])]) {
+    handler({ payload });
+  }
 }
 
 describe("TerminalWorkspace", () => {
@@ -78,8 +92,15 @@ describe("TerminalWorkspace", () => {
       FitAddon: mocks.MockFitAddon,
     });
     mocks.listen.mockImplementation(async (event: string, handler: (payload: { payload: unknown }) => void) => {
-      mocks.listeners.set(event, handler);
-      return () => mocks.listeners.delete(event);
+      const bucket = mocks.listeners.get(event) ?? [];
+      bucket.push(handler);
+      mocks.listeners.set(event, bucket);
+      return () => {
+        mocks.listeners.set(
+          event,
+          (mocks.listeners.get(event) ?? []).filter((current) => current !== handler),
+        );
+      };
     });
     mocks.invoke.mockImplementation((command: string) => {
       if (command === "start_terminal") {
@@ -115,9 +136,13 @@ describe("TerminalWorkspace", () => {
       expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
     });
 
-    const output = mocks.listeners.get("terminal-output");
-    output?.({ payload: { sessionId: "terminal-claude-1", data: "hello from CLI" } });
-    expect(mocks.terminals[0].writes).toContain("hello from CLI");
+    await waitFor(() => {
+      expect(mocks.listeners.get("terminal-output")).toHaveLength(1);
+    });
+    emitEvent("terminal-output", { sessionId: "terminal-claude-1", data: "hello from CLI" });
+    expect(mocks.terminals[0].writes.filter((chunk) => chunk.includes("hello from CLI"))).toEqual([
+      "hello from CLI",
+    ]);
 
     rerender(<TerminalWorkspace active={false} />);
     rerender(<TerminalWorkspace active />);
@@ -125,6 +150,35 @@ describe("TerminalWorkspace", () => {
     expect(mocks.terminals).toHaveLength(2);
     expect(mocks.terminals.every((terminal) => terminal.dispose.mock.calls.length === 0)).toBe(true);
     expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
+    expect(mocks.terminals[0].reset).toHaveBeenCalled();
+  });
+
+  it("为 PTY 托管的 TUI 关闭 convertEol，避免全屏界面叠成两层", async () => {
+    render(<TerminalWorkspace active />);
+    await waitFor(() => expect(mocks.terminals).toHaveLength(2));
+    expect(mocks.terminals[0].options).toEqual(expect.objectContaining({
+      convertEol: false,
+      cursorBlink: false,
+    }));
+  });
+
+  it("启动失败后恢复空闲提示，不留下空白终端", async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "start_terminal") {
+        return Promise.reject(new Error("boom"));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<TerminalWorkspace active />);
+    await waitFor(() => expect(mocks.terminals).toHaveLength(2));
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("alert")[0]).toHaveTextContent("Error: boom");
+    });
+    expect(mocks.terminals[0].reset).toHaveBeenCalled();
+    expect(mocks.terminals[0].writes.some((line) => line.includes("点击启动后"))).toBe(true);
   });
 
   it("Claude 与 Codex 终端之间提供可访问的拖动分隔线", async () => {
@@ -181,5 +235,46 @@ describe("TerminalWorkspace", () => {
       });
     });
     secondWrite.resolve();
+  });
+
+  it("listen 尚未完成就卸载时，迟到的订阅仍会被注销", async () => {
+    const outputReady = deferred<void>();
+    mocks.listen.mockImplementation(async (event: string, handler: (payload: { payload: unknown }) => void) => {
+      if (event === "terminal-output") {
+        await outputReady.promise;
+      }
+      const bucket = mocks.listeners.get(event) ?? [];
+      bucket.push(handler);
+      mocks.listeners.set(event, bucket);
+      return () => {
+        mocks.listeners.set(
+          event,
+          (mocks.listeners.get(event) ?? []).filter((current) => current !== handler),
+        );
+      };
+    });
+
+    const { unmount } = render(<TerminalWorkspace active />);
+    await waitFor(() => expect(mocks.listen).toHaveBeenCalled());
+    expect(mocks.listeners.get("terminal-output") ?? []).toHaveLength(0);
+    unmount();
+    outputReady.resolve();
+
+    await waitFor(() => {
+      expect(mocks.listeners.get("terminal-output") ?? []).toHaveLength(0);
+    });
+  });
+
+  it("每个 PTY 数据块只写入一次，不会因为重复订阅叠成两层", async () => {
+    render(<TerminalWorkspace active />);
+    await waitFor(() => expect(mocks.terminals).toHaveLength(2));
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
+      expect(mocks.listeners.get("terminal-output")).toHaveLength(1);
+    });
+
+    emitEvent("terminal-output", { sessionId: "terminal-claude-1", data: "use one." });
+    expect(mocks.terminals[0].writes.filter((chunk) => chunk.includes("use one."))).toEqual(["use one."]);
   });
 });

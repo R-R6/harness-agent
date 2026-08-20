@@ -351,9 +351,13 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .terminal-pane__toolbar { display: flex; min-height: 38px; align-items: center; gap: 7px; padding: 5px 8px; border-bottom: 1px solid #242b35; background: #0f141a; color: #687687; }
 .terminal-pane__toolbar input { min-width: 0; flex: 1; height: 27px; padding: 0 7px; border: 1px solid #26303b; border-radius: 5px; outline: 0; background: #0b0f14; color: #a9b5c5; font: 10px "Cascadia Mono", monospace; }
 .terminal-pane__toolbar input:focus { border-color: var(--codex); box-shadow: 0 0 0 2px rgba(91, 140, 255, 0.2); }
-.terminal-surface { min-height: 0; flex: 1; padding: 8px 10px; overflow: hidden; }
-.terminal-surface .xterm { height: 100%; padding: 3px 2px; }
-.terminal-surface .xterm-viewport { background: transparent !important; }
+.terminal-surface { min-height: 0; flex: 1; padding: 0; overflow: hidden; line-height: normal; background: inherit; }
+/* FitAddon sizes the canvas to N rows. Stretching .xterm to 100% makes the
+   viewport taller than the cell grid and can show the previous TUI frame. */
+.terminal-surface .xterm { padding: 0; overflow: hidden; background: inherit; }
+.terminal-surface .xterm-viewport { background: inherit !important; }
+.terminal-surface .xterm-helper-textarea:focus,
+.terminal-surface .xterm-helper-textarea:focus-visible { outline: none; }
 .terminal-pane__error { display: flex; align-items: flex-start; gap: 7px; padding: 8px 11px; border-top: 1px solid rgba(242, 142, 142, 0.25); background: rgba(242, 142, 142, 0.09); color: #ed9e9e; font-size: 11px; line-height: 1.45; }
 .terminal-pane__foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 28px; padding: 0 11px; border-top: 1px solid #242b35; color: #5f6c7b; font: 9px "Cascadia Mono", monospace; }
 .terminal-pane__foot span:first-child { display: inline-flex; align-items: center; gap: 5px; font-family: inherit; }

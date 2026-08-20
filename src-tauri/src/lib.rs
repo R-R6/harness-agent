@@ -1,7 +1,7 @@
 // 会话数据代理：复用 mcp-lab 的 agent-sessions-mcp (server.js)（独立 crate：crates/session_proxy）
 use session_proxy::{SessionInfo, TranscriptEntry};
 use supervise_runner::{ReviewArtifact, SuperviseRequest};
-use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty, spawn as spawn_terminal_pty, wait as wait_terminal_process, write_input as write_terminal_input};
+use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command, wait as wait_terminal_process, write_input as write_terminal_input};
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read};
@@ -61,30 +61,6 @@ impl TerminalState {
                 let _ = kill_process_tree(process.pid);
                 let _ = kill_terminal_process(&process.child);
             }
-        }
-    }
-}
-
-fn terminal_command(agent: &str) -> Result<(String, Vec<String>), String> {
-    #[cfg(windows)]
-    {
-        // Claude/Codex 在 Windows 上都是 npm 装的 .cmd shim。走 cmd.exe 让 PATHEXT
-        // 解析出 .cmd，而不是直接 CreateProcessW 裸名——裸名会先命中 npm 全局目录里
-        // 那个无扩展名的 sh 脚本（#!/bin/sh，不是 Win32 程序），报 ERROR_BAD_EXE_FORMAT
-        // (os error 193)。cmd.exe 同时转发 stdin/stdout/ANSI/Ctrl+C。
-        if matches!(agent, "claude" | "codex") {
-            return Ok((
-                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
-                vec!["/d".into(), "/s".into(), "/c".into(), agent.to_string()],
-            ));
-        }
-        return Err(format!("不支持的终端 Agent: {agent}"));
-    }
-    #[cfg(not(windows))]
-    {
-        match agent {
-            "claude" | "codex" => Ok((agent.to_string(), Vec::new())),
-            other => Err(format!("不支持的终端 Agent: {other}")),
         }
     }
 }

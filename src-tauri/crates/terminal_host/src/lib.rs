@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+mod launch;
+pub use launch::terminal_command;
+
 pub struct SpawnedTerminal {
     pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
