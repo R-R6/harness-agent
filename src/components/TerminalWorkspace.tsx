@@ -529,11 +529,6 @@ function TerminalPane({
     };
   }, [disposeTerminal]);
 
-  const clear = () => {
-    terminalRef.current?.clear();
-    hostRef.current?.querySelector("textarea")?.focus();
-  };
-
   const browseWorkDir = async () => {
     try {
       const dir = await open({
@@ -615,9 +610,6 @@ function TerminalPane({
             <Icon name="play" size={14} /> {pane.status === "starting" ? "启动中" : "启动"}
           </button>
         )}
-        <IconButton label={`清屏 ${agent.label}`} onClick={clear}>
-          <Icon name="trash" size={14} />
-        </IconButton>
       </div>
       <div ref={hostRef} className="terminal-surface" aria-label={`${agent.label} 终端输出`} />
       {(pane.error || terminalError) && (
