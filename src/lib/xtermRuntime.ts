@@ -1,5 +1,5 @@
 import type { FitAddon } from "@xterm/addon-fit";
-import type { ITerminalOptions, ITheme, IWindowsPty, Terminal } from "@xterm/xterm";
+import type { IDisposable, ITerminalOptions, ITheme, IWindowsPty, Terminal } from "@xterm/xterm";
 
 export interface XtermRuntime {
   Terminal: typeof Terminal;
@@ -71,6 +71,123 @@ export function buildXtermOptions(env?: NavigatorLike): ITerminalOptions {
     rescaleOverlappingGlyphs: false,
     theme: TERMINAL_THEME,
     ...(windowsPty ? { windowsPty } : {}),
+  };
+}
+
+export const CODEX_CURSOR_PIN = "\x1b[?25l";
+
+/** DECSCUSR blinking styles are odd: 1 block, 3 underline, 5 bar. */
+export function steadyDecscusrParam(param: number): number {
+  if (param <= 0) return 0;
+  return param % 2 === 1 ? param + 1 : param;
+}
+
+export function decscusrCursorStyle(param: number): ITerminalOptions["cursorStyle"] | undefined {
+  switch (steadyDecscusrParam(param)) {
+    case 2:
+      return "block";
+    case 4:
+      return "underline";
+    case 6:
+      return "bar";
+    default:
+      return undefined;
+  }
+}
+
+function isCompleteEscape(tail: string): boolean {
+  if (tail.charCodeAt(0) === 0x9b) {
+    for (let i = 1; i < tail.length; i++) {
+      const code = tail.charCodeAt(i);
+      if (code >= 0x40 && code <= 0x7e) return true;
+    }
+    return false;
+  }
+  if (tail.length < 2) return false;
+  const intro = tail[1];
+  if (intro === "[") {
+    for (let i = 2; i < tail.length; i++) {
+      const code = tail.charCodeAt(i);
+      if (code >= 0x40 && code <= 0x7e) return true;
+    }
+    return false;
+  }
+  if (intro === "]") {
+    return tail.includes("\x07") || tail.includes("\x1b\\");
+  }
+  return true;
+}
+
+function incompleteEscapeSuffix(data: string): string {
+  const esc = Math.max(data.lastIndexOf("\x1b"), data.lastIndexOf("\x9b"));
+  if (esc === -1) return "";
+  const tail = data.slice(esc);
+  return isCompleteEscape(tail) ? "" : tail;
+}
+
+function rewritePrivateModes(body: string, flag: string): string {
+  const modes = body
+    .split(";")
+    .filter(Boolean)
+    .map(Number)
+    .filter((mode) => mode !== 12 && !(flag === "h" && mode === 25));
+  if (modes.length === 0) return "";
+  return `\x1b[?${modes.join(";")}${flag}`;
+}
+
+function stabilizeComplete(data: string): string {
+  return data
+    .replace(/(?:\x1b\[|\x9b)(\d*) q/g, () => "")
+    .replace(/(?:\x1b\[|\x9b)\?([\d;]*)([hl])/g, (_match, body: string, flag: string) => rewritePrivateModes(body, flag));
+}
+
+/**
+ * Codex's hardware cursor sits on the prompt and blinks. Hide it; input still
+ * goes to the CLI. Claude draws its own inverse caret and is left alone.
+ */
+export function createOutputStabilizer(): { reset(): void; push(chunk: string): string } {
+  let pending = "";
+  return {
+    reset() {
+      pending = "";
+    },
+    push(chunk: string) {
+      const data = pending + chunk;
+      const suffix = incompleteEscapeSuffix(data);
+      pending = suffix;
+      const complete = suffix ? data.slice(0, data.length - suffix.length) : data;
+      if (!complete) return "";
+      return stabilizeComplete(complete) + CODEX_CURSOR_PIN;
+    },
+  };
+}
+
+/** Keep the Codex hardware cursor hidden even if a show/blink sequence arrives. */
+export function pinCursorSteady(terminal: Terminal): IDisposable {
+  terminal.options.cursorBlink = false;
+
+  const decset = terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
+    const modes = params.flat();
+    if (modes.includes(12) || modes.includes(25)) {
+      terminal.options.cursorBlink = false;
+      return modes.every((mode) => mode === 12 || mode === 25);
+    }
+    return false;
+  });
+  const decscusr = terminal.parser.registerCsiHandler({ intermediates: " ", final: "q" }, () => {
+    terminal.options.cursorBlink = false;
+    return true;
+  });
+  const parsed = terminal.onWriteParsed(() => {
+    if (terminal.options.cursorBlink) terminal.options.cursorBlink = false;
+  });
+
+  return {
+    dispose() {
+      decset.dispose();
+      decscusr.dispose();
+      parsed.dispose();
+    },
   };
 }
 

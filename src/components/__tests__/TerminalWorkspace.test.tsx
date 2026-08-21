@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TerminalWorkspace } from "../TerminalWorkspace";
+import { CODEX_CURSOR_PIN } from "../../lib/xtermRuntime";
 
 const mocks = vi.hoisted(() => {
   const terminals: MockTerminal[] = [];
@@ -167,6 +168,36 @@ describe("TerminalWorkspace", () => {
       cursorBlink: false,
       scrollback: 0,
     }));
+  });
+
+  it("只钉住 Codex 的光标，Claude 输出原样写入", async () => {
+    mocks.invoke.mockImplementation((command: string, payload?: { request?: { agent: string } }) => {
+      if (command === "start_terminal") {
+        const agent = payload?.request?.agent ?? "claude";
+        return Promise.resolve({
+          id: `terminal-${agent}-1`,
+          agent,
+          work_dir: "F:\\project\\workspace-side\\Harness_agent",
+          status: "running",
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<TerminalWorkspace active />);
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })).toHaveLength(2));
+    const startButtons = screen.getAllByRole("button", { name: "启动" });
+    await userEvent.click(startButtons[0]);
+    await userEvent.click(startButtons[1]);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "停止 Codex CLI" })).toBeInTheDocument();
+    });
+
+    emitEvent("terminal-output", { sessionId: "terminal-claude-1", data: "A\x1b[?25lB" });
+    emitEvent("terminal-output", { sessionId: "terminal-codex-1", data: "A\x1b[?25hB" });
+    expect(mocks.terminals[0].writes.at(-1)).toBe("A\x1b[?25lB");
+    expect(mocks.terminals[1].writes.at(-1)).toBe(`AB${CODEX_CURSOR_PIN}`);
   });
 
   it("启动失败后恢复空闲提示，不留下空白终端", async () => {

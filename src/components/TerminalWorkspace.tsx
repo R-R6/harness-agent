@@ -4,7 +4,7 @@ import type { FitAddon } from "@xterm/addon-fit";
 import type { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { resizeTerminal, startTerminal, stopTerminal, writeTerminal } from "../lib/terminalApi";
-import { buildXtermOptions, loadXtermRuntime } from "../lib/xtermRuntime";
+import { buildXtermOptions, CODEX_CURSOR_PIN, createOutputStabilizer, loadXtermRuntime, pinCursorSteady } from "../lib/xtermRuntime";
 import type { TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
 import { Icon, IconButton } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
@@ -93,6 +93,7 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
     claude: Promise.resolve(),
     codex: Promise.resolve(),
   });
+  const codexStabilizerRef = useRef(createOutputStabilizer());
   const pendingOutputRef = useRef(new Map<TerminalAgent, { sessionId: string; data: string }>());
   const outputFrameRef = useRef<number | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -134,7 +135,8 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
     pendingOutputRef.current.clear();
     for (const [agent, chunk] of output) {
       if (panesRef.current[agent].session?.id === chunk.sessionId) {
-        terminals.current.get(agent)?.write(chunk.data);
+        const data = agent === "codex" ? codexStabilizerRef.current.push(chunk.data) : chunk.data;
+        if (data) terminals.current.get(agent)?.write(data);
       }
     }
   }, []);
@@ -225,6 +227,7 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
         return;
       }
       patchPane(agent, { status: "starting", error: "" });
+      if (agent === "codex") codexStabilizerRef.current.reset();
       try {
         const session = await startTerminal({
           agent,
@@ -367,6 +370,7 @@ function TerminalPane({
   const mountedRef = useRef(false);
   const unmountedRef = useRef(false);
   const dataListenerRef = useRef<{ dispose: () => void } | null>(null);
+  const cursorPinRef = useRef<{ dispose: () => void } | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const fitFrameRef = useRef<number | null>(null);
   const lastPtySizeRef = useRef("");
@@ -421,6 +425,8 @@ function TerminalPane({
   const disposeTerminal = useCallback(() => {
     dataListenerRef.current?.dispose();
     dataListenerRef.current = null;
+    cursorPinRef.current?.dispose();
+    cursorPinRef.current = null;
     resizeObserverRef.current?.disconnect();
     resizeObserverRef.current = null;
     if (fitFrameRef.current !== null && fitFrameRef.current >= 0) {
@@ -463,6 +469,10 @@ function TerminalPane({
         setTerminalReady(true);
         writeIdleBanner(terminal, agent);
         dataListenerRef.current = terminal.onData((data) => callbacksRef.current.onInput(agent.id, data));
+        if (agent.id === "codex") {
+          cursorPinRef.current = pinCursorSteady(terminal);
+          terminal.write(CODEX_CURSOR_PIN);
+        }
         // FitAddon no-ops while cell metrics are 0; retry after layout.
         scheduleFitAndResize();
         requestAnimationFrame(() => {
