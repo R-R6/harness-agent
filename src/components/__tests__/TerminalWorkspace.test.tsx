@@ -46,6 +46,7 @@ const mocks = vi.hoisted(() => {
   return {
     invoke: vi.fn(),
     listen: vi.fn(),
+    dialogOpen: vi.fn(),
     loadRuntime: vi.fn(),
     listeners: new Map<string, Array<(event: { payload: unknown }) => void>>(),
     terminals,
@@ -56,6 +57,7 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.dialogOpen }));
 vi.mock("../../lib/xtermRuntime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/xtermRuntime")>();
   return { ...actual, loadXtermRuntime: mocks.loadRuntime };
@@ -84,6 +86,7 @@ describe("TerminalWorkspace", () => {
   beforeEach(() => {
     mocks.invoke.mockReset();
     mocks.listen.mockReset();
+    mocks.dialogOpen.mockReset();
     mocks.loadRuntime.mockReset();
     mocks.listeners.clear();
     mocks.terminals.splice(0);
@@ -314,5 +317,35 @@ describe("TerminalWorkspace", () => {
 
     emitEvent("terminal-output", { sessionId: "terminal-claude-1", data: "use one." });
     expect(mocks.terminals[0].writes.filter((chunk) => chunk.includes("use one."))).toEqual(["use one."]);
+  });
+
+  it("点击文件夹图标打开目录选择器，并只更新对应面板的工作目录", async () => {
+    mocks.dialogOpen.mockResolvedValue("D:\\picked-project");
+    render(<TerminalWorkspace active />);
+    await waitFor(() => expect(mocks.terminals).toHaveLength(2));
+
+    await userEvent.click(screen.getByRole("button", { name: "选择 Claude CLI 工作目录" }));
+    expect(mocks.dialogOpen).toHaveBeenCalledWith(
+      expect.objectContaining({
+        directory: true,
+        multiple: false,
+        defaultPath: "F:\\project\\workspace-side\\Harness_agent",
+      }),
+    );
+    expect(screen.getByLabelText("Claude CLI 工作目录")).toHaveValue("D:\\picked-project");
+    expect(screen.getByLabelText("Codex CLI 工作目录")).toHaveValue(
+      "F:\\project\\workspace-side\\Harness_agent",
+    );
+  });
+
+  it("目录选择器取消时保持当前工作目录不变", async () => {
+    mocks.dialogOpen.mockResolvedValue(null);
+    render(<TerminalWorkspace active />);
+    await waitFor(() => expect(mocks.terminals).toHaveLength(2));
+
+    await userEvent.click(screen.getByRole("button", { name: "选择 Codex CLI 工作目录" }));
+    expect(screen.getByLabelText("Codex CLI 工作目录")).toHaveValue(
+      "F:\\project\\workspace-side\\Harness_agent",
+    );
   });
 });

@@ -349,6 +349,19 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .terminal-status--starting, .terminal-status--stopping { color: #d8ba76; }
 .terminal-status--error { color: #e88d8d; }
 .terminal-pane__toolbar { display: flex; min-height: 38px; align-items: center; gap: 7px; padding: 5px 8px; border-bottom: 1px solid #242b35; background: #0f141a; color: #687687; }
+.terminal-pane__toolbar .icon-button--toolbar {
+  width: 27px;
+  height: 27px;
+  flex: 0 0 27px;
+  border-color: #26303b;
+  background: #0b0f14;
+  color: #687687;
+}
+.terminal-pane__toolbar .icon-button--toolbar:hover:not(:disabled) {
+  border-color: #3a4654;
+  background: #121821;
+  color: #a9b5c5;
+}
 .terminal-pane__toolbar input { min-width: 0; flex: 1; height: 27px; padding: 0 7px; border: 1px solid #26303b; border-radius: 5px; outline: 0; background: #0b0f14; color: #a9b5c5; font: 10px "Cascadia Mono", monospace; }
 .terminal-pane__toolbar input:focus { border-color: var(--codex); box-shadow: 0 0 0 2px rgba(91, 140, 255, 0.2); }
 .terminal-surface { min-height: 0; flex: 1; padding: 0; overflow: hidden; line-height: normal; background: inherit; }

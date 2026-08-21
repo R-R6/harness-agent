@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { FitAddon } from "@xterm/addon-fit";
 import type { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -533,6 +534,20 @@ function TerminalPane({
     hostRef.current?.querySelector("textarea")?.focus();
   };
 
+  const browseWorkDir = async () => {
+    try {
+      const dir = await open({
+        directory: true,
+        multiple: false,
+        title: `选择 ${agent.label} 工作目录`,
+        defaultPath: pane.workDir.trim() || undefined,
+      });
+      if (typeof dir === "string") onWorkDirChange(dir);
+    } catch {
+      // Keep the current path if the dialog fails or is unavailable.
+    }
+  };
+
   const statusLabel = {
     idle: "未启动",
     starting: "启动中",
@@ -559,12 +574,18 @@ function TerminalPane({
         </span>
       </header>
       <div className="terminal-pane__toolbar">
-        <Icon name="folder" size={13} />
+        <IconButton
+          label={`选择 ${agent.label} 工作目录`}
+          className="icon-button--toolbar"
+          onClick={() => void browseWorkDir()}
+        >
+          <Icon name="folder" size={13} />
+        </IconButton>
         <input
           value={pane.workDir}
           onChange={(event) => onWorkDirChange(event.currentTarget.value)}
           aria-label={`${agent.label} 工作目录`}
-          title="工作目录"
+          title="工作目录（也可点左侧文件夹图标选择）"
           spellCheck={false}
         />
         {pane.status === "running" || pane.status === "stopping" ? (
