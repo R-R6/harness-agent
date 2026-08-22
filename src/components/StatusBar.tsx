@@ -5,6 +5,7 @@ interface Props {
   claudeCount: number;
   codexCount: number;
   terminalRunning?: number;
+  superviseRunning?: number;
   mcpHealth?: "checking" | "healthy" | "degraded";
 }
 
@@ -13,6 +14,7 @@ export function StatusBar({
   claudeCount,
   codexCount,
   terminalRunning = 0,
+  superviseRunning = 0,
   mcpHealth = "checking",
 }: Props) {
   const healthLabel = mcpHealth === "healthy" ? "MCP 健康" : mcpHealth === "degraded" ? "MCP 需要处理" : "MCP 检查中";
@@ -29,6 +31,11 @@ export function StatusBar({
         {terminalRunning > 0 && (
           <span className="status-chip status-chip--running">
             <Icon name="terminal" size={13} /> {terminalRunning} terminal{terminalRunning > 1 ? "s" : ""}
+          </span>
+        )}
+        {superviseRunning > 0 && (
+          <span className="status-chip status-chip--running">
+            <Icon name="shield" size={13} /> {superviseRunning} supervising
           </span>
         )}
         <span className="status-chip status-chip--claude">

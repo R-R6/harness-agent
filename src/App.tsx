@@ -105,6 +105,11 @@ function App() {
   const [projectWorkDir, setProjectWorkDir] = useStoredString("ha-project-work-dir", "");
   const [superviseDir, setSuperviseDir] = useState<string | null>(null);
   const [terminalRunning, setTerminalRunning] = useState(0);
+  const [superviseRunning, setSuperviseRunning] = useState(0);
+
+  const handleSuperviseRunningChange = useCallback((running: boolean) => {
+    setSuperviseRunning(running ? 1 : 0);
+  }, []);
 
   // ---- 可调面板宽度（可拖动分割线控制内容密度）----
   const [navWidth, setNavWidth] = useStoredNumber("ha-layout-nav-width", 248);
@@ -549,6 +554,7 @@ function App() {
                 workDir={projectWorkDir}
                 onWorkDirChange={setProjectWorkDir}
                 onStarted={handleSuperviseStarted}
+                onRunningChange={handleSuperviseRunningChange}
               />
             </div>
             <SplitHandle
@@ -574,6 +580,7 @@ function App() {
           claudeCount={claudeCount}
           codexCount={codexCount}
           terminalRunning={terminalRunning}
+          superviseRunning={superviseRunning}
           mcpHealth={mcpHealth}
         />
       </div>

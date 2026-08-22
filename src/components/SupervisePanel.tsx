@@ -10,6 +10,8 @@ interface Props {
   onWorkDirChange: (dir: string) => void;
   /** 启动成功后回调（携带启动时的目录，供审查看板定位 .supervise 产物） */
   onStarted: (workDir: string) => void;
+  /** 运行状态变化（true=有监督任务在跑，供状态栏计数） */
+  onRunningChange?: (running: boolean) => void;
 }
 
 interface LogLine {
@@ -18,7 +20,7 @@ interface LogLine {
 }
 
 /** 闭环启动器：任务表单 + 启动/取消 + 实时日志流 */
-export function SupervisePanel({ workDir, onWorkDirChange, onStarted }: Props) {
+export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningChange }: Props) {
   const [task, setTask] = useState("");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
@@ -55,6 +57,10 @@ export function SupervisePanel({ workDir, onWorkDirChange, onStarted }: Props) {
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
+
+  useEffect(() => {
+    onRunningChange?.(runningTask !== null);
+  }, [runningTask, onRunningChange]);
 
   const start = async () => {
     setError("");
