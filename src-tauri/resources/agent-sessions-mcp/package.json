@@ -1,0 +1,7 @@
+{
+  "name": "agent-sessions-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js"
+}

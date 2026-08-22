@@ -28,7 +28,10 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "WebView2Loader.dll"
+      "WebView2Loader.dll",
+      "resources/agent-sessions-mcp/package.json",
+      "resources/agent-sessions-mcp/server.js",
+      "resources/supervise-loop-script/supervise.ps1"
     ],
     "icon": [
       "icons/32x32.png",

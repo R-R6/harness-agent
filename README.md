@@ -6,7 +6,7 @@
 
 - **便宜模型**（Claude/DeepSeek/Kimi/GLM）干活
 - **贵模型**（Codex）读 JSONL 审查 + 意见回灌返工
-- **会话可见性**：复用 mcp-lab 的 agent-sessions-mcp
+- **会话可见性**：内置 agent-sessions-mcp（会话数据读取，随应用打包）
 
 ## 技术栈
 
