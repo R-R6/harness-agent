@@ -1,0 +1,9 @@
+[package]
+name = "supervise_engine"
+version = "0.1.0"
+description = "监督引擎：驱动可见 Claude 终端 pane 的轮次状态机（Stop hook 主信号 + 静默兜底）"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

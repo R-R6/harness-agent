@@ -23,6 +23,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 session_proxy = { path = "crates/session_proxy" }
 supervise_runner = { path = "crates/supervise_runner" }
+supervise_engine = { path = "crates/supervise_engine" }
 mcp_checker = { path = "crates/mcp_checker" }
 terminal_host = { path = "crates/terminal_host" }
 tauri = { version = "2", features = [] }
@@ -40,5 +41,6 @@ members = [
     "crates/supervise_runner",
     "crates/mcp_checker",
     "crates/terminal_host",
+    "crates/supervise_engine",
 ]
 resolver = "2"
