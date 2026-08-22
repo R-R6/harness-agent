@@ -598,3 +598,29 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(all(test, unix))]
+mod path_tests {
+    /// 剥到 launchd 级最小 PATH 后调用采集：登录 shell 的条目（含用户级 npm bin、
+    /// homebrew）必须被追加进来，且原有条目不丢。改的是进程级环境，测试结束还原。
+    /// 注：不能依赖 ps eww 观测——它显示的是 exec 时的环境块快照，看不到运行期
+    /// set_var 的修改，必须进程内断言。
+    #[test]
+    fn augment_path_from_login_shell_merges_missing_entries() {
+        let saved = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        super::augment_path_from_login_shell();
+        let now = std::env::var("PATH").expect("PATH 仍在");
+        let count = now.split(':').filter(|s| !s.is_empty()).count();
+        assert!(
+            count > 4,
+            "登录 shell 的 PATH 条目应被追加合并（实际 {count} 条）: {now}"
+        );
+        for base in ["/usr/bin", "/bin"] {
+            assert!(now.contains(base), "原有条目不丢: {now}");
+        }
+        if let Some(p) = saved {
+            std::env::set_var("PATH", p);
+        }
+    }
+}
