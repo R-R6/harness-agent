@@ -156,10 +156,8 @@ where
 {
     std::thread::spawn(move || {
         use std::io::BufRead;
-        for line in std::io::BufReader::new(stderr).lines() {
-            if let Ok(l) = line {
-                on_line(l);
-            }
+        for line in std::io::BufReader::new(stderr).lines().flatten() {
+            on_line(line);
         }
     });
 }

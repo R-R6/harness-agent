@@ -1,8 +1,8 @@
 // 会话数据代理：内置 agent-sessions-mcp (server.js)，资源路径由 setup 注入（独立 crate：crates/session_proxy）
 use session_proxy::{SessionInfo, TranscriptEntry};
 use supervise_engine::{
-    hook::ensure_stop_hook, CodexReviewer, EngineOptions, MarkerSource, MockReviewer, PaneIo,
-    Reviewer, Verdict,
+    hook::{ensure_stop_hook, remove_stop_hook}, CodexReviewer, EngineOptions, MarkerSource,
+    MockReviewer, PaneIo, Reviewer, Verdict,
 };
 use supervise_runner::{ReviewArtifact, SuperviseRequest};
 use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command, wait as wait_terminal_process, write_input as write_terminal_input};
@@ -524,32 +524,21 @@ async fn run_supervise_terminal(
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
 
-    // 定位正在跑的 Claude pane（必须在任务目录上——引擎逐轮校验绑定）
-    let (session_id, pane_dir) = {
+    // 定位正在跑的 Claude pane（必须在任务目录上——引擎逐轮校验绑定）。
+    // 单次遍历取 (id, dir)：两次 find 在同目录多 pane 时可能各命中不同的
+    // pane（HashMap 无序），id 与目录错配
+    let session_id = {
         let term = app.state::<TerminalState>();
         let sessions = term.sessions.lock().map_err(|_| "终端状态锁已损坏")?;
-        let found = sessions
-            .values()
-            .find(|p| p.agent == "claude" && normalize_path(&p.work_dir) == work_dir)
-            .map(|p| p.work_dir.clone());
-        match found {
-            Some(dir) => {
-                let id = sessions
-                    .iter()
-                    .find(|(_, p)| p.agent == "claude" && normalize_path(&p.work_dir) == work_dir)
-                    .map(|(id, _)| id.clone())
-                    .unwrap();
-                (id, dir)
-            }
-            None => {
-                return Err(
-                    "未找到运行中的 Claude 终端（请先在终端工作台以该工作目录启动 Claude CLI）"
-                        .into(),
-                );
-            }
-        }
+        sessions
+            .iter()
+            .find(|(_, p)| p.agent == "claude" && normalize_path(&p.work_dir) == work_dir)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| {
+                "未找到运行中的 Claude 终端（请先在终端工作台以该工作目录启动 Claude CLI）"
+                    .to_string()
+            })?
     };
-    let _ = pane_dir;
 
     // 目录占用登记（与 run_supervise 同款防竞态：同锁检查+登记）
     {
@@ -562,20 +551,21 @@ async fn run_supervise_terminal(
 
     // Stop hook 幂等安装 + marker 文件（.supervise/stop-markers.jsonl，随项目走）
     let supervise_dir = std::path::Path::new(&request.work_dir).join(".supervise");
-    std::fs::create_dir_all(&supervise_dir).map_err(|e| format!("创建 .supervise 失败: {e}"))?;
+    if let Err(e) = std::fs::create_dir_all(&supervise_dir) {
+        // 登记之后的所有失败路径都必须回滚，否则该目录被永久锁死
+        state.busy_workdirs.lock().unwrap().retain(|w| w != &work_dir);
+        return Err(format!("创建 .supervise 失败: {e}"));
+    }
     let marker_file = supervise_dir.join("stop-markers.jsonl");
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
+        .map_err(|_| "无法定位用户主目录（USERPROFILE/HOME 均缺失）".to_string())?;
     let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
-    if !request.mock {
-        match ensure_stop_hook(&settings, &marker_file) {
-            Ok(true) => {}
-            Ok(false) => {}
-            Err(e) => {
-                state.busy_workdirs.lock().unwrap().retain(|w| w != &work_dir);
-                return Err(format!("安装 Stop hook 失败（可重试或改用无头模式）: {e}"));
-            }
+    let hook_installed = !request.mock;
+    if hook_installed {
+        if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
+            state.busy_workdirs.lock().unwrap().retain(|w| w != &work_dir);
+            return Err(format!("安装 Stop hook 失败（可重试或改用无头模式）: {e}"));
         }
     }
 
@@ -610,6 +600,8 @@ async fn run_supervise_terminal(
     let app2 = app.clone();
     let task_id2 = task_id.clone();
     let work_dir2 = work_dir.clone();
+    let settings2 = settings.clone();
+    let marker_file2 = marker_file.clone();
     std::thread::spawn(move || {
         let markers = MarkerSource::new(marker_file);
         let projects_root = std::path::PathBuf::from(&home).join(".claude").join("projects");
@@ -626,28 +618,46 @@ async fn run_supervise_terminal(
                     serde_json::json!({ "taskId": task_id3, "line": line.to_string() }),
                 );
             });
-        let outcome = supervise_engine::run(
-            &opts,
-            pane,
-            reviewer,
-            &markers,
-            &projects_root,
-            &cancel,
-            &on_log,
-        );
+        // 引擎 panic（锁中毒/审查器内部异常）也必须走到收尾——否则目录永久
+        // 占用、engine_cancels 泄漏、前端永远停在"取消任务"状态
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                supervise_engine::run(&opts, pane, reviewer, &markers, &projects_root, &cancel, &on_log)
+            }))
+            .unwrap_or_else(|panic| {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "未知异常".to_string()
+                };
+                supervise_engine::EngineOutcome {
+                    status: supervise_engine::EngineStatus::Aborted(format!("引擎线程异常: {msg}")),
+                    rounds: 0,
+                    last_reason: msg,
+                }
+            });
 
-        // 收尾：清登记、emit done
+        // 收尾：清登记 →（无其他引擎时）卸载 hook → emit done。
+        // Stop hook 指向本项目 marker，遗留会让用户所有 Claude 会话每次
+        // Stop 都白跑一次 powershell，多项目还会累积死条目
         let app_state = app2.state::<SuperviseState>();
-        app_state
-            .engine_cancels
-            .lock()
-            .unwrap()
-            .remove(&task_id2);
+        let remaining_engines = {
+            let mut flags = app_state.engine_cancels.lock().unwrap();
+            flags.remove(&task_id2);
+            flags.len()
+        };
         app_state
             .busy_workdirs
             .lock()
             .unwrap()
             .retain(|w| w != &work_dir2);
+        if hook_installed && remaining_engines == 0 {
+            if let Err(e) = remove_stop_hook(&settings2, &marker_file2) {
+                eprintln!("[supervise] 卸载 Stop hook 失败（不影响任务结果）: {e}");
+            }
+        }
         let code = match outcome.status {
             supervise_engine::EngineStatus::Accepted
             | supervise_engine::EngineStatus::Cancelled => 0,

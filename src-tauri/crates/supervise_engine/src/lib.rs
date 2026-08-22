@@ -91,7 +91,9 @@ pub struct EngineOutcome {
 /// （快照初始行数，规避 timestamp 解析；其他项目/会话的 marker 天然被过滤）
 pub struct MarkerSource {
     path: PathBuf,
-    initial_lines: usize,
+    /// 已消费到的行数（游标）：read_new 只返回其后的新行并推进，
+    /// 防止上一轮的旧 marker 在下一轮被重复消费
+    consumed: std::cell::Cell<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,31 +105,50 @@ pub struct StopMarker {
 impl MarkerSource {
     pub fn new(path: PathBuf) -> Self {
         let initial_lines = read_lines(&path).len();
-        Self { path, initial_lines }
+        Self {
+            path,
+            consumed: std::cell::Cell::new(initial_lines),
+        }
     }
 
-    /// 引擎启动之后新增的 markers（坏行跳过）
+    /// 自上次调用以来新增的 markers（坏行跳过、游标推进）。
+    /// 必须推进游标：无游标版每次都返回启动后的全部 marker，第 2 轮等待时
+    /// 旧 marker 会立即短路轮次状态机（第 1 轮的 Stop 信号被重复消费）。
     pub fn read_new(&self) -> Vec<StopMarker> {
-        read_lines(&self.path)
-            .into_iter()
-            .skip(self.initial_lines)
-            .filter_map(|line| {
-                let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-                Some(StopMarker {
+        let lines = read_lines(&self.path);
+        let mut start = self.consumed.get();
+        if lines.len() < start {
+            // 文件被截断/重建：全部视为新事件
+            start = 0;
+        }
+        let mut out = vec![];
+        for (i, line) in lines.into_iter().enumerate().skip(start) {
+            self.consumed.set(i + 1);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                out.push(StopMarker {
                     session_id: v.get("session_id").and_then(|s| s.as_str()).map(String::from),
                     transcript_path: v
                         .get("transcript_path")
                         .and_then(|s| s.as_str())
                         .map(String::from),
-                })
-            })
-            .collect()
+                });
+            }
+        }
+        out
     }
 }
 
 fn read_lines(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
-        .map(|text| text.lines().map(str::to_string).collect())
+        .map(|text| {
+            let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+            // PS5.1 的 Add-Content -Encoding UTF8 首次建文件带 BOM，不剥掉会
+            // 让首个 marker 的 JSON 解析失败、第一轮丢失主信号
+            if let Some(first) = lines.first_mut() {
+                *first = first.trim_start_matches('\u{feff}').to_string();
+            }
+            lines
+        })
         .unwrap_or_default()
 }
 
@@ -227,6 +248,9 @@ fn wait_round_end(
     projects_root: &Path,
     slug: &str,
     cutoff: SystemTime,
+    // 会话锁定：首轮确定后只认该会话的 marker——同目录其他 Claude 会话
+    // （外部终端/别的 pane）Stop 时不能串台结束本轮
+    session_pin: &mut Option<String>,
     cancel: &AtomicBool,
 ) -> (Option<PathBuf>, RoundEnd) {
     let start = Instant::now();
@@ -236,16 +260,25 @@ fn wait_round_end(
         if cancel.load(Ordering::Relaxed) {
             return (transcript, RoundEnd::Cancelled);
         }
-        // 主信号：本项目 slug 目录内的新 marker
+        // 主信号：本项目 slug 目录内、且（已锁定会话时）属于该会话的新 marker
         for m in markers.read_new() {
-            if let Some(tp) = &m.transcript_path {
-                let in_project = Path::new(tp)
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .is_some_and(|n| n.to_string_lossy() == slug);
-                if in_project {
-                    return (Some(PathBuf::from(tp)), RoundEnd::StopMarker);
+            let Some(tp) = &m.transcript_path else { continue };
+            let in_project = Path::new(tp)
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n.to_string_lossy() == slug);
+            let session_ok = session_pin
+                .as_ref()
+                .map(|p| m.session_id.as_deref() == Some(p.as_str()))
+                .unwrap_or(true);
+            if in_project && session_ok {
+                let path = PathBuf::from(tp);
+                if let Some(sid) = &m.session_id {
+                    *session_pin = Some(sid.clone());
+                } else if let Some(stem) = path.file_stem() {
+                    *session_pin = Some(stem.to_string_lossy().to_string());
                 }
+                return (Some(path), RoundEnd::StopMarker);
             }
         }
         // 兜底定位：slug 目录里引擎启动后活跃的会话文件
@@ -268,9 +301,6 @@ fn wait_round_end(
 }
 
 // ---------------- 引擎主循环 ----------------
-
-/// 审查连续失败的最大次数（防审查器故障导致空转烧轮/死循环）
-const MAX_REVIEW_FAILURES: i64 = 3;
 
 /// 单轮记录（产物落盘用；与 supervise_runner::VerdictEntry 契约对齐）
 struct RoundRecord {
@@ -432,6 +462,7 @@ fn run_loop(
 
     let mut last_reason = String::new();
     let mut first_inject = true;
+    let mut session_pin: Option<String> = None;
     let mut round: i64 = 0;
     while round < opts.max_rounds {
         if cancel.load(Ordering::Relaxed) {
@@ -483,7 +514,8 @@ fn run_loop(
             opts.max_rounds
         ));
 
-        let (transcript, ended) = wait_round_end(opts, markers, projects_root, &slug, cutoff, cancel);
+        let (transcript, ended) =
+            wait_round_end(opts, markers, projects_root, &slug, cutoff, &mut session_pin, cancel);
         if ended == RoundEnd::Cancelled {
             return EngineOutcome {
                 status: EngineStatus::Cancelled,
@@ -507,35 +539,26 @@ fn run_loop(
             continue;
         };
 
-        // 审查（带重试）：失败重试同一份 transcript，不消耗轮次、不重新注入
-        let verdict = {
-            let mut failures = 0i64;
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    return EngineOutcome {
-                        status: EngineStatus::Cancelled,
-                        rounds: round,
-                        last_reason,
-                    };
-                }
-                match reviewer.review(&transcript, round) {
-                    Ok(v) => break v,
-                    Err(e) => {
-                        failures += 1;
-                        last_reason = format!("审查失败：{e}");
-                        on_log(&format!(
-                            "[WARN] {last_reason}（{failures}/{MAX_REVIEW_FAILURES}）"
-                        ));
-                        if failures >= MAX_REVIEW_FAILURES {
-                            return EngineOutcome {
-                                status: EngineStatus::Aborted(last_reason.clone()),
-                                rounds: round,
-                                last_reason,
-                            };
-                        }
-                        std::thread::sleep(Duration::from_secs(2));
-                    }
-                }
+        // 审查：Reviewer 内部自带重试（CodexReviewer 5 次 × 8s），引擎层不再
+        // 叠加重试——两层嵌套最坏 15 次 codex exec、单轮可拖约 20 分钟，
+        // 且取消延迟被放大。审查硬失败即中止（失败信息落日志与产物）
+        if cancel.load(Ordering::Relaxed) {
+            return EngineOutcome {
+                status: EngineStatus::Cancelled,
+                rounds: round,
+                last_reason,
+            };
+        }
+        let verdict = match reviewer.review(&transcript, round, cancel) {
+            Ok(v) => v,
+            Err(e) => {
+                last_reason = format!("审查失败：{e}");
+                on_log(&format!("[FAIL] {last_reason}"));
+                return EngineOutcome {
+                    status: EngineStatus::Aborted(last_reason.clone()),
+                    rounds: round,
+                    last_reason,
+                };
             }
         };
 
@@ -712,7 +735,6 @@ mod tests {
 
         // 第 1 轮 REVIEW（缺校验），第 2 轮 PASS
         let reviewer = MockReviewer::scripted(vec![
-            Err("第一次审查工具抖动".into()), // 触发重试不烧轮
             Ok(Verdict { pass: false, reason: "缺少输入校验".into() }),
             Ok(Verdict { pass: true, reason: "校验已补齐".into() }),
         ]);
@@ -873,7 +895,8 @@ mod tests {
     }
 
     #[test]
-    fn engine_aborts_after_repeated_review_failures() {
+    fn engine_aborts_when_reviewer_hard_fails() {
+        // Reviewer 内部自带重试，引擎层对硬失败立即中止（不再嵌套重试拖时间）
         let dir = tmp_dir("reviewfail");
         let slug = project_slug(&dir.to_string_lossy());
         let projects_root = dir.join("projects");
@@ -903,6 +926,127 @@ mod tests {
             &on_log,
         );
         assert!(matches!(outcome.status, EngineStatus::Aborted(_)), "{:?}", outcome.status);
+        assert_eq!(outcome.rounds, 1, "硬失败应立即中止而非烧完轮次");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C1 回归：第 1 轮的旧 Stop marker 不能在第 2 轮被重复消费。
+    /// 第 2 轮 worker 故意延迟写 marker（1.5s > 轮询间隔），若游标缺失，
+    /// 第 2 轮会在首次轮询（30ms）时被第 1 轮的旧 marker 立即"结束"。
+    #[test]
+    fn second_round_ignores_stale_marker_from_round_one() {
+        let dir = tmp_dir("stale-marker");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("s.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let marker_file = dir.join("markers.jsonl");
+        std::fs::write(&marker_file, "").unwrap();
+
+        let pane = Arc::new(FakePane {
+            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
+            writes: Mutex::new(vec![]),
+            fail_write: AtomicBool::new(false),
+        });
+        let pane2 = pane.clone();
+        let marker2 = marker_file.clone();
+        let transcript2 = transcript.clone();
+        std::thread::spawn(move || {
+            let mut seen_rounds = 0;
+            let start = Instant::now();
+            loop {
+                let writes = pane2.writes.lock().unwrap().len();
+                if writes > seen_rounds {
+                    let delay = if seen_rounds == 0 {
+                        Duration::from_millis(150) // 第 1 轮：很快写 marker
+                    } else {
+                        Duration::from_millis(1500) // 第 2 轮：故意延迟
+                    };
+                    seen_rounds = writes;
+                    std::thread::sleep(delay);
+                    std::fs::write(&transcript2, format!("round {seen_rounds}\n")).unwrap();
+                    // 必须用 json! 序列化：路径反斜杠不转义会产出非法 JSON 被跳过
+                    let marker = serde_json::json!({
+                        "session_id": "s1",
+                        "transcript_path": transcript2.to_string_lossy(),
+                    });
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&marker2)
+                        .unwrap();
+                    writeln!(f, "{marker}").unwrap();
+                }
+                if start.elapsed() > Duration::from_secs(15) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        // 第 1 轮 REVIEW → 注入返工 → 第 2 轮必须等新 marker（≥1.5s）才结束
+        let reviewer = MockReviewer::scripted(vec![
+            Ok(Verdict { pass: false, reason: "缺校验".into() }),
+            Ok(Verdict { pass: true, reason: "已补".into() }),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let round2_start = Arc::new(Mutex::new(None::<Instant>));
+        let round2_end = Arc::new(Mutex::new(None::<Instant>));
+        let round2_by_marker = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let all_logs = Arc::new(Mutex::new(vec![]));
+        let on_log: OnLog = {
+            let all_logs = all_logs.clone();
+            let round2_start = round2_start.clone();
+            let round2_end = round2_end.clone();
+            let round2_by_marker = round2_by_marker.clone();
+            Arc::new(move |l: &str| {
+                all_logs.lock().unwrap().push(l.to_string());
+                if l.contains("第 2/2 轮已注入") {
+                    *round2_start.lock().unwrap() = Some(Instant::now());
+                }
+                if l.contains("第 2 轮结束") {
+                    *round2_end.lock().unwrap() = Some(Instant::now());
+                    if l.contains("Stop hook 信号") {
+                        round2_by_marker.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        // 静默阈值调大到 3s：第 2 轮（marker 延迟 1.5s 写入）必须靠新 marker
+        // 结束，而不是 400ms 的静默兜底抢先——这样才真正验证游标行为
+        let mut opts = quick_opts(&dir, 2);
+        opts.silence = Duration::from_secs(3);
+
+        let src = MarkerSource::new(marker_file);
+        let outcome = run(
+            &opts,
+            pane.clone(),
+            Arc::new(reviewer),
+            &src,
+            &projects_root,
+            &cancel,
+            &on_log,
+        );
+
+        assert_eq!(outcome.status, EngineStatus::Accepted);
+        assert!(
+            round2_by_marker.load(Ordering::Relaxed),
+            "第 2 轮应等到新 marker（Stop hook 信号）才结束，而非旧 marker 短路或静默兜底；日志: {:?}",
+            all_logs.lock().unwrap()
+        );
+        // 第 2 轮从注入到结束必须 ≥ 1.2s（worker 延迟 1.5s 写新 marker），
+        // 旧 marker 若被重复消费会在首次轮询（30ms）内短路
+        let start = round2_start.lock().unwrap();
+        let end = round2_end.lock().unwrap();
+        let duration = end.zip(start.as_ref().copied()).map(|(e, s)| e - s);
+        assert!(
+            duration.is_some_and(|d| d >= Duration::from_millis(1200)),
+            "第 2 轮耗时应 ≥ 1.2s（等新 marker），实际 {duration:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

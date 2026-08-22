@@ -44,6 +44,14 @@ export function sessionId(file: string): string {
   return base.endsWith(".jsonl") ? base.slice(0, -6) : base;
 }
 
+/** Codex 会话文件名 rollout-<timestamp>-<uuid>.jsonl，`codex resume` 接受的
+ *  是尾部 UUID 而非完整文件名；无 UUID 尾段（老文件）回退全名 */
+function codexSessionId(base: string): string {
+  const tail = base.slice(-36);
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tail);
+  return isUuid ? tail : base;
+}
+
 /** 「在终端中续聊」的启动参数：按 agent 生成 resume 命令行；
  *  会话带原始 cwd（Claude）则还原启动目录，否则用 pane 当前目录 */
 export function resumeStart(s: SessionInfo): {
@@ -52,7 +60,8 @@ export function resumeStart(s: SessionInfo): {
   workDir?: string;
 } {
   const agent: TerminalAgent = s.agent === "codex" ? "codex" : "claude";
-  const id = sessionId(s.file);
+  const base = sessionId(s.file);
+  const id = agent === "codex" ? codexSessionId(base) : base;
   return {
     agent,
     args: agent === "claude" ? ["--resume", id] : ["resume", id],

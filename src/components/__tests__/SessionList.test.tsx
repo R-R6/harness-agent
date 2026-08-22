@@ -332,10 +332,19 @@ describe("SessionList", () => {
       args: ["--resume", "aaa"],
       workDir: undefined,
     });
-    expect(resumeStart(sessions[2])).toEqual({
-      agent: "codex",
-      args: ["resume", "rollout-2026-08-13T15-04-04-abc"],
-      workDir: undefined,
-    });
+  });
+
+  it("resumeStart：codex 传尾部 UUID（resume 不认完整 rollout 文件名）", () => {
+    const codexUuid: SessionInfo = {
+      ...sessions[2],
+      file:
+        "C:\\fake\\.codex\\sessions\\2026\\08\\13\\rollout-2026-08-13T15-04-04-0199abcd-0000-7000-8000-00000000abcd.jsonl",
+    };
+    expect(resumeStart(codexUuid).args).toEqual([
+      "resume",
+      "0199abcd-0000-7000-8000-00000000abcd",
+    ]);
+    // 老 fixture 无 UUID 尾段：回退完整文件名
+    expect(resumeStart(sessions[2]).args).toEqual(["resume", "rollout-2026-08-13T15-04-04-abc"]);
   });
 });

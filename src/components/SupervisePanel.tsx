@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listenWhileMounted } from "../lib/listenWhileMounted";
 import { cancelSupervise, runSupervise, runSuperviseTerminal } from "../lib/api";
 import { Icon } from "./Icon";
 
@@ -33,27 +33,25 @@ export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningC
   const logEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    let unLog: UnlistenFn | undefined;
-    let unDone: UnlistenFn | undefined;
-    (async () => {
-      unLog = await listen<LogLine>("supervise-log", (e) => {
-        setLogs((prev) => [...prev.slice(-499), e.payload]); // 最多 500 行
-      });
-      unDone = await listen<{ taskId: string; exitCode?: number | null }>(
-        "supervise-done",
-        (e) => {
-          setRunningTask((cur) => (cur === e.payload.taskId ? null : cur));
-          // 退出码非 0 = 任务失败（cancel 时 exitCode 为 null，不提示）
-          const code = e.payload.exitCode;
-          if (code != null && code !== 0) {
-            setError(`任务失败（退出码 ${code}），详见下方日志`);
-          }
-        },
-      );
-    })();
+    // StrictMode 下卸载可能早于 listen 完成：迟到的订阅必须立即注销，
+    // 否则日志行会被订阅两次画双份（与终端组件同款 listenWhileMounted）
+    const stopLog = listenWhileMounted<LogLine>("supervise-log", (e) => {
+      setLogs((prev) => [...prev.slice(-499), e.payload]); // 最多 500 行
+    });
+    const stopDone = listenWhileMounted<{ taskId: string; exitCode?: number | null }>(
+      "supervise-done",
+      (e) => {
+        setRunningTask((cur) => (cur === e.payload.taskId ? null : cur));
+        // 退出码非 0 = 任务失败（cancel 时 exitCode 为 null/0，不提示）
+        const code = e.payload.exitCode;
+        if (code != null && code !== 0) {
+          setError(`任务失败（退出码 ${code}），详见下方日志`);
+        }
+      },
+    );
     return () => {
-      unLog?.();
-      unDone?.();
+      stopLog();
+      stopDone();
     };
   }, []);
 

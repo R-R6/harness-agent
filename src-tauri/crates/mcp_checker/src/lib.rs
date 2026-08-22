@@ -274,9 +274,7 @@ pub fn verify_handshake(server: &str) -> bool {
         None => return false,
     };
     use std::io::Write;
-    let init = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}}}}}}\n"
-    );
+    let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}\n".to_string();
     if writeln!(stdin, "{init}").is_err() {
         return false;
     }
@@ -287,12 +285,10 @@ pub fn verify_handshake(server: &str) -> bool {
         None => return false,
     };
     let mut ok = false;
-    for line in std::io::BufReader::new(stdout).lines() {
-        if let Ok(l) = line {
-            if l.contains("\"serverInfo\"") {
-                ok = true;
-                break;
-            }
+    for l in std::io::BufReader::new(stdout).lines().flatten() {
+        if l.contains("\"serverInfo\"") {
+            ok = true;
+            break;
         }
     }
     ok

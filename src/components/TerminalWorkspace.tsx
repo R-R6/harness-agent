@@ -1,16 +1,15 @@
 import { Fragment, useCallback, useEffect, useImperativeHandle, useRef, useState, type CSSProperties, type Ref } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { FitAddon } from "@xterm/addon-fit";
 import type { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { resizeTerminal, startTerminal, stopTerminal, writeTerminal } from "../lib/terminalApi";
 import { buildXtermOptions, CODEX_CURSOR_PIN, createOutputStabilizer, loadXtermRuntime, pinCursorSteady } from "../lib/xtermRuntime";
+import { listenWhileMounted } from "../lib/listenWhileMounted";
 import type { TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
 import { Icon, IconButton } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
 import { useElementSize, useStoredNumber, useStoredString } from "../lib/layoutPreferences";
-
 const TERMINAL_STACK_WIDTH = 720;
 const TERMINAL_MIN_WIDTH = 320;
 const TERMINAL_MIN_HEIGHT = 220;
@@ -42,40 +41,10 @@ function writeIdleBanner(terminal: Terminal, agent: { label: string; description
   terminal.writeln("\x1b[90m点击启动后，终端会连接到本机 CLI。\x1b[0m");
 }
 
-/**
- * `listen()` is async. React StrictMode (and fast remounts) run cleanup before
- * the unlisten handle exists, which would leak a second PTY subscriber and
- * paint every chunk twice — Ink/ratatui then looks stacked.
- */
-function listenWhileMounted<T>(
-  event: string,
-  handler: (event: { payload: T }) => void,
-): () => void {
-  let cancelled = false;
-  let unlisten: UnlistenFn | undefined;
-  void listen<T>(event, handler).then(
-    (fn) => {
-      if (cancelled) {
-        fn();
-        return;
-      }
-      unlisten = fn;
-    },
-    () => {
-      // Subscribe failed; the next mount retries.
-    },
-  );
-  return () => {
-    cancelled = true;
-    unlisten?.();
-  };
-}
-
 interface StartOptions {
   workDir?: string;
   args?: string[];
 }
-
 /** 供 App 命令式驱动终端（如会话列表「在终端中续聊」） */
 export interface TerminalWorkspaceHandle {
   startWith: (agent: TerminalAgent, opts?: StartOptions) => void;
@@ -234,7 +203,12 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   const handleStart = useCallback(
     async (agent: TerminalAgent, cols: number, rows: number, opts?: StartOptions) => {
       const pane = panesRef.current[agent];
-      if (["starting", "running", "stopping"].includes(pane.status)) return;
+      if (["starting", "running", "stopping"].includes(pane.status)) {
+        // 主要来自「在终端中续聊」等命令式启动：pane 占用时不能静默失败，
+        // 用户已切到终端 tab，必须告诉他为什么没动静
+        patchPane(agent, { error: "终端已在运行：请先停止当前会话再续聊/启动" });
+        return;
+      }
       const workDir = (opts?.workDir ?? (agent === "claude" ? projectWorkDir ?? "" : codexWorkDir)).trim();
       if (!workDir) {
         patchPane(agent, { status: "error", error: "请输入工作目录" });

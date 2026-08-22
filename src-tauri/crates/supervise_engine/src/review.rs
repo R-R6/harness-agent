@@ -1,8 +1,12 @@
 //! 审查器：读会话 JSONL 做验收裁决。真实实现 spawn `codex exec`（从
 //! supervise.ps1 移植，含 MCP 管道竞态重试），测试用 MockReviewer。
+//! 审查可被取消：轮询等待子进程，取消时立即 kill——不然取消/窗口关闭
+//! 要等整次 codex exec（分钟级）才生效，退出后还会留孤儿进程。
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verdict {
@@ -11,7 +15,9 @@ pub struct Verdict {
 }
 
 pub trait Reviewer: Send + Sync {
-    fn review(&self, transcript: &Path, round: i64) -> Result<Verdict, String>;
+    /// 审查一轮。cancel 置位时应尽快返回 Err("已取消") 并终止子进程。
+    /// 重试在实现内部完成（引擎层不叠加，防嵌套重试放大取消延迟）
+    fn review(&self, transcript: &Path, round: i64, cancel: &AtomicBool) -> Result<Verdict, String>;
 }
 
 // ---------------- codex exec 审查（移植自 supervise.ps1 Invoke-CodexReview） ----------------
@@ -46,15 +52,19 @@ impl CodexReviewer {
 }
 
 impl Reviewer for CodexReviewer {
-    fn review(&self, transcript: &Path, _round: i64) -> Result<Verdict, String> {
+    fn review(&self, transcript: &Path, _round: i64, cancel: &AtomicBool) -> Result<Verdict, String> {
         let prompt = self.prompt(transcript);
         let mut last_err = String::new();
         for attempt in 1..=self.retries {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("已取消".into());
+            }
             // stdin 置 null：codex 在非 TTY 环境会读 stdin 附加输入而挂起；
+            // stderr 置 null：无人消费的管道写满会挂死子进程；
             // CREATE_NO_WINDOW：发布版 GUI 子系统不弹控制台
             let mut command = Command::new("codex");
             path_util::no_console_window(&mut command);
-            let output = command
+            let mut child = command
                 .args([
                     "exec",
                     "--skip-git-repo-check",
@@ -63,21 +73,44 @@ impl Reviewer for CodexReviewer {
                 .args(["-m", &self.model])
                 .arg(&prompt)
                 .stdin(Stdio::null())
-                .output();
-            match output {
-                Ok(out) => {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    if let Some(v) = parse_verdict(&text) {
-                        return Ok(v);
-                    }
-                    last_err = format!("第 {attempt} 次未解析到 VERDICT");
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("spawn codex 失败（请确认 codex CLI 已安装）: {e}"))?;
+
+            // 轮询等待而非 output()：取消能在 200ms 内 kill 子进程退出
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("已取消".into());
                 }
-                Err(e) => {
-                    last_err = format!("spawn codex 失败（第 {attempt} 次）: {e}");
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let mut out = String::new();
+                        if let Some(mut so) = child.stdout.take() {
+                            use std::io::Read;
+                            let _ = so.read_to_string(&mut out);
+                        }
+                        if let Some(v) = parse_verdict(&out) {
+                            return Ok(v);
+                        }
+                        last_err = match status.code() {
+                            Some(0) => format!("第 {attempt} 次未解析到 VERDICT"),
+                            Some(code) => format!("codex 退出码 {code}（第 {attempt} 次）"),
+                            None => format!("codex 被信号终止（第 {attempt} 次）"),
+                        };
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                    Err(e) => {
+                        last_err = format!("等待 codex 失败: {e}");
+                        break;
+                    }
                 }
             }
             if attempt < self.retries {
-                std::thread::sleep(std::time::Duration::from_secs(self.retry_wait_secs));
+                std::thread::sleep(Duration::from_secs(self.retry_wait_secs));
             }
         }
         Err(format!("codex 审查连续 {} 次失败：{last_err}", self.retries))
@@ -136,7 +169,7 @@ impl MockReviewer {
 }
 
 impl Reviewer for MockReviewer {
-    fn review(&self, _transcript: &Path, _round: i64) -> Result<Verdict, String> {
+    fn review(&self, _transcript: &Path, _round: i64, _cancel: &AtomicBool) -> Result<Verdict, String> {
         if let Some(a) = &self.always {
             return a.clone();
         }
