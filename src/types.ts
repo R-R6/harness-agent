@@ -4,6 +4,8 @@ export interface SessionInfo {
   agentLabel: string;
   file: string;
   title?: string; // 会话标题，空则回退文件名
+  /** 会话的原始工作目录（Claude JSONL 记录；Codex 无则缺省） */
+  cwd?: string;
   updated: string;
 }
 
@@ -53,6 +55,8 @@ export interface ReviewArtifact {
   reason: string;
   model: string;
   session_id: string;
+  /** 会话 JSONL 完整路径（产物未携带时为空，跳转按钮隐藏） */
+  file?: string;
 }
 
 // ---- 本机 CLI 终端工作台 ----
@@ -65,6 +69,8 @@ export interface TerminalStartRequest {
   work_dir: string;
   cols: number;
   rows: number;
+  /** 额外 CLI 参数（续聊：claude --resume <id> / codex resume <id>） */
+  args?: string[];
 }
 
 export interface TerminalSessionInfo {

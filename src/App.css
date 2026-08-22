@@ -430,6 +430,8 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .verdict-review { background: var(--warn-soft); color: var(--warn); }
 .model, .session-id { color: var(--text-faint); font-size: 10px; }
 .session-id { margin-left: auto; max-width: 35%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link-button { border: none; background: none; padding: 2px 6px; border-radius: 6px; color: var(--accent, #8fb5ff); font-size: 10px; cursor: pointer; }
+.link-button:hover { background: var(--border); }
 .reason { margin: 10px 0 0; padding-top: 10px; border-top: 1px solid var(--border); color: var(--text-secondary); font: 11px/1.65 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; }
 
 /* ---------- MCP ---------- */

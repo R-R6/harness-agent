@@ -1,12 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { cancelSupervise, runSupervise } from "../lib/api";
+import { listenWhileMounted } from "../lib/listenWhileMounted";
+import { cancelSupervise, runSupervise, runSuperviseTerminal } from "../lib/api";
 import { Icon } from "./Icon";
 
 interface Props {
-  /** 启动后回调（父组件刷新审查看板） */
+  /** 工作目录（受控：由 App 持有的项目上下文，与 Claude 终端 pane 同源） */
+  workDir: string;
+  onWorkDirChange: (dir: string) => void;
+  /** 启动成功后回调（携带启动时的目录，供审查看板定位 .supervise 产物） */
   onStarted: (workDir: string) => void;
+  /** 运行状态变化（true=有监督任务在跑，供状态栏计数） */
+  onRunningChange?: (running: boolean) => void;
+  /** 终端驱动模式启动成功后回调（App 切到终端 tab 让用户看到干活过程） */
+  onDriveStarted?: () => void;
 }
 
 interface LogLine {
@@ -15,46 +22,46 @@ interface LogLine {
 }
 
 /** 闭环启动器：任务表单 + 启动/取消 + 实时日志流 */
-export function SupervisePanel({ onStarted }: Props) {
+export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningChange, onDriveStarted }: Props) {
   const [task, setTask] = useState("");
-  const [workDir, setWorkDir] = useState("F:\\project\\workspace-side\\Harness_agent");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
+  const [driveTerminal, setDriveTerminal] = useState(false);
   const [runningTask, setRunningTask] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [error, setError] = useState("");
   const logEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    let unLog: UnlistenFn | undefined;
-    let unDone: UnlistenFn | undefined;
-    (async () => {
-      unLog = await listen<LogLine>("supervise-log", (e) => {
-        setLogs((prev) => [...prev.slice(-499), e.payload]); // 最多 500 行
-      });
-      unDone = await listen<{ taskId: string; exitCode?: number | null }>(
-        "supervise-done",
-        (e) => {
-          setRunningTask((cur) => (cur === e.payload.taskId ? null : cur));
-          // 退出码非 0 = 任务失败（cancel 时 exitCode 为 null，不提示）
-          const code = e.payload.exitCode;
-          if (code != null && code !== 0) {
-            setError(`任务失败（退出码 ${code}），详见下方日志`);
-          }
-          onStarted(workDir);
-        },
-      );
-    })();
+    // StrictMode 下卸载可能早于 listen 完成：迟到的订阅必须立即注销，
+    // 否则日志行会被订阅两次画双份（与终端组件同款 listenWhileMounted）
+    const stopLog = listenWhileMounted<LogLine>("supervise-log", (e) => {
+      setLogs((prev) => [...prev.slice(-499), e.payload]); // 最多 500 行
+    });
+    const stopDone = listenWhileMounted<{ taskId: string; exitCode?: number | null }>(
+      "supervise-done",
+      (e) => {
+        setRunningTask((cur) => (cur === e.payload.taskId ? null : cur));
+        // 退出码非 0 = 任务失败（cancel 时 exitCode 为 null/0，不提示）
+        const code = e.payload.exitCode;
+        if (code != null && code !== 0) {
+          setError(`任务失败（退出码 ${code}），详见下方日志`);
+        }
+      },
+    );
     return () => {
-      unLog?.();
-      unDone?.();
+      stopLog();
+      stopDone();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
+
+  useEffect(() => {
+    onRunningChange?.(runningTask !== null);
+  }, [runningTask, onRunningChange]);
 
   const start = async () => {
     setError("");
@@ -67,12 +74,20 @@ export function SupervisePanel({ onStarted }: Props) {
       return;
     }
     try {
-      const taskId = await runSupervise({
+      const req = {
         task: task.trim(),
         work_dir: workDir.trim(),
         level,
         mock,
-      });
+      };
+      const taskId = driveTerminal
+        ? await runSuperviseTerminal(req)
+        : await runSupervise(req);
+      // 启动即上报目录（非 done 时）：闭包取的是当前 props，避免过期值；
+      // 审查看板从任务运行起就指向正确目录
+      onStarted(workDir.trim());
+      // 终端驱动模式：切过去看干活过程（监督的核心体验——全程可见、可插手）
+      if (driveTerminal) onDriveStarted?.();
       setRunningTask(taskId);
       setLogs([]);
     } catch (e) {
@@ -98,7 +113,7 @@ export function SupervisePanel({ onStarted }: Props) {
         multiple: false,
         title: "选择项目工作目录",
       });
-      if (typeof dir === "string") setWorkDir(dir);
+      if (typeof dir === "string") onWorkDirChange(dir);
     } catch (e) {
       setError(String(e));
     }
@@ -121,7 +136,7 @@ export function SupervisePanel({ onStarted }: Props) {
           <div className="dir-row">
             <input
               value={workDir}
-              onChange={(e) => setWorkDir(e.currentTarget.value)}
+              onChange={(e) => onWorkDirChange(e.currentTarget.value)}
               placeholder="Claude 干活的项目目录（可点击浏览选择）"
             />
             <button type="button" className="browse" onClick={browseDir} title="打开资源管理器选择目录">
@@ -145,6 +160,14 @@ export function SupervisePanel({ onStarted }: Props) {
               onChange={(e) => setMock(e.currentTarget.checked)}
             />
             模拟模式（不花钱）
+          </label>
+          <label className="checkbox" title="任务注入运行中的 Claude 终端 pane：干活全程可见、可随时插手；需先在终端工作台以该目录启动 Claude CLI">
+            <input
+              type="checkbox"
+              checked={driveTerminal}
+              onChange={(e) => setDriveTerminal(e.currentTarget.checked)}
+            />
+            驱动 Claude 终端
           </label>
         </div>
         {error && <div className="error">{error}</div>}

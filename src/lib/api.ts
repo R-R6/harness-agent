@@ -33,9 +33,14 @@ export async function searchSessions(keyword: string): Promise<SessionInfo[]> {
 
 // ---- 监督闭环（阶段 2） ----
 
-/** 启动监督闭环，返回 task_id */
+/** 启动监督闭环（无头 ps1 模式），返回 task_id */
 export async function runSupervise(req: SuperviseRequest): Promise<string> {
   return invoke<string>("run_supervise", { request: req });
+}
+
+/** 启动终端驱动监督（阶段 2：任务注入运行中的 Claude 终端 pane），返回 task_id */
+export async function runSuperviseTerminal(req: SuperviseRequest): Promise<string> {
+  return invoke<string>("run_supervise_terminal", { request: req });
 }
 
 /** 取消运行中的监督任务 */

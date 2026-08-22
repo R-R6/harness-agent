@@ -1,17 +1,15 @@
-import { Fragment, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { Fragment, useCallback, useEffect, useImperativeHandle, useRef, useState, type CSSProperties, type Ref } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { FitAddon } from "@xterm/addon-fit";
 import type { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { resizeTerminal, startTerminal, stopTerminal, writeTerminal } from "../lib/terminalApi";
 import { buildXtermOptions, CODEX_CURSOR_PIN, createOutputStabilizer, loadXtermRuntime, pinCursorSteady } from "../lib/xtermRuntime";
+import { listenWhileMounted } from "../lib/listenWhileMounted";
 import type { TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
 import { Icon, IconButton } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
-import { useElementSize, useStoredNumber } from "../lib/layoutPreferences";
-
-const DEFAULT_WORK_DIR = "F:\\project\\workspace-side\\Harness_agent";
+import { useElementSize, useStoredNumber, useStoredString } from "../lib/layoutPreferences";
 const TERMINAL_STACK_WIDTH = 720;
 const TERMINAL_MIN_WIDTH = 320;
 const TERMINAL_MIN_HEIGHT = 220;
@@ -25,14 +23,12 @@ interface PaneState {
   session: TerminalSessionInfo | null;
   status: TerminalStatus;
   error: string;
-  workDir: string;
 }
 
 const initialPane = (): PaneState => ({
   session: null,
   status: "idle",
   error: "",
-  workDir: DEFAULT_WORK_DIR,
 });
 
 const AGENTS: { id: TerminalAgent; label: string; description: string }[] = [
@@ -45,45 +41,31 @@ function writeIdleBanner(terminal: Terminal, agent: { label: string; description
   terminal.writeln("\x1b[90m点击启动后，终端会连接到本机 CLI。\x1b[0m");
 }
 
-/**
- * `listen()` is async. React StrictMode (and fast remounts) run cleanup before
- * the unlisten handle exists, which would leak a second PTY subscriber and
- * paint every chunk twice — Ink/ratatui then looks stacked.
- */
-function listenWhileMounted<T>(
-  event: string,
-  handler: (event: { payload: T }) => void,
-): () => void {
-  let cancelled = false;
-  let unlisten: UnlistenFn | undefined;
-  void listen<T>(event, handler).then(
-    (fn) => {
-      if (cancelled) {
-        fn();
-        return;
-      }
-      unlisten = fn;
-    },
-    () => {
-      // Subscribe failed; the next mount retries.
-    },
-  );
-  return () => {
-    cancelled = true;
-    unlisten?.();
-  };
+interface StartOptions {
+  workDir?: string;
+  args?: string[];
+}
+/** 供 App 命令式驱动终端（如会话列表「在终端中续聊」） */
+export interface TerminalWorkspaceHandle {
+  startWith: (agent: TerminalAgent, opts?: StartOptions) => void;
 }
 
 interface Props {
   active: boolean;
   onRunningChange?: (count: number) => void;
+  /** 项目工作目录（Claude pane 的共享上下文，由 App 持有，监督闭环同源） */
+  projectWorkDir?: string;
+  onProjectWorkDirChange?: (dir: string) => void;
+  ref?: Ref<TerminalWorkspaceHandle>;
 }
 
 /**
  * Two persistent local CLI panes. The browser only renders xterm; the Rust side
  * owns the PTY, child process and lifecycle so switching workspaces is harmless.
+ * The Claude pane's work dir is the shared project context (App-owned); the
+ * Codex pane keeps its own persisted dir for side-by-side review.
  */
-export function TerminalWorkspace({ active, onRunningChange }: Props) {
+export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onProjectWorkDirChange, ref }: Props) {
   const [panes, setPanes] = useState<Record<TerminalAgent, PaneState>>({
     claude: initialPane(),
     codex: initialPane(),
@@ -97,6 +79,7 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
   const codexStabilizerRef = useRef(createOutputStabilizer());
   const pendingOutputRef = useRef(new Map<TerminalAgent, { sessionId: string; data: string }>());
   const outputFrameRef = useRef<number | null>(null);
+  const [codexWorkDir, setCodexWorkDir] = useStoredString("ha-workdir-codex", "");
   const gridRef = useRef<HTMLDivElement>(null);
   const gridSize = useElementSize(gridRef);
   const stacked = gridSize.width > 0 && gridSize.width < TERMINAL_STACK_WIDTH;
@@ -111,9 +94,15 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
   const ratio = clampRatio(stacked ? stackedRatio : wideRatio, minRatio, maxRatio);
   const setRatio = stacked ? setStackedRatio : setWideRatio;
 
-  useEffect(() => {
-    panesRef.current = panes;
-  }, [panes]);
+  // panesRef 以 ref 为准、同步更新：terminal-exit 事件与 stop invoke 的拒绝
+  // 可能在同一 tick 内先后到达，若靠 useEffect 在提交后才同步 ref，catch 里
+  // 读到的是旧值（session 仍在），竞态判断失效（M4 卡死的真实根因）
+  const patchPane = useCallback((agent: TerminalAgent, patch: Partial<PaneState>) => {
+    const current = panesRef.current;
+    const next = { ...current, [agent]: { ...current[agent], ...patch } };
+    panesRef.current = next;
+    setPanes(next);
+  }, []);
 
   const mountTerminal = useCallback((agent: TerminalAgent, terminal: Terminal) => {
     terminals.current.set(agent, terminal);
@@ -121,13 +110,6 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
 
   const unmountTerminal = useCallback((agent: TerminalAgent) => {
     terminals.current.delete(agent);
-  }, []);
-
-  const patchPane = useCallback((agent: TerminalAgent, patch: Partial<PaneState>) => {
-    setPanes((current) => ({
-      ...current,
-      [agent]: { ...current[agent], ...patch },
-    }));
   }, []);
 
   const flushOutput = useCallback(() => {
@@ -219,10 +201,15 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
   }, [enqueueOutput, patchPane]);
 
   const handleStart = useCallback(
-    async (agent: TerminalAgent, cols: number, rows: number) => {
+    async (agent: TerminalAgent, cols: number, rows: number, opts?: StartOptions) => {
       const pane = panesRef.current[agent];
-      if (["starting", "running", "stopping"].includes(pane.status)) return;
-      const workDir = pane.workDir.trim();
+      if (["starting", "running", "stopping"].includes(pane.status)) {
+        // 主要来自「在终端中续聊」等命令式启动：pane 占用时不能静默失败，
+        // 用户已切到终端 tab，必须告诉他为什么没动静
+        patchPane(agent, { error: "终端已在运行：请先停止当前会话再续聊/启动" });
+        return;
+      }
+      const workDir = (opts?.workDir ?? (agent === "claude" ? projectWorkDir ?? "" : codexWorkDir)).trim();
       if (!workDir) {
         patchPane(agent, { status: "error", error: "请输入工作目录" });
         return;
@@ -235,13 +222,30 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
           work_dir: workDir,
           cols,
           rows,
+          args: opts?.args,
         });
         patchPane(agent, { session, status: "running", error: "" });
       } catch (error) {
         patchPane(agent, { status: "error", error: String(error) });
       }
     },
-    [patchPane],
+    [patchPane, projectWorkDir, codexWorkDir],
+  );
+
+  // 命令式启动入口（会话列表「在终端中续聊」）：目录覆盖走正常受控链路
+  useImperativeHandle(
+    ref,
+    () => ({
+      startWith: (agent, opts) => {
+        if (opts?.workDir !== undefined) {
+          if (agent === "claude") onProjectWorkDirChange?.(opts.workDir);
+          else setCodexWorkDir(opts.workDir);
+        }
+        const terminal = terminals.current.get(agent);
+        void handleStart(agent, terminal?.cols ?? 120, terminal?.rows ?? 30, opts);
+      },
+    }),
+    [handleStart, onProjectWorkDirChange],
   );
 
   const handleStop = useCallback(
@@ -252,7 +256,12 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
       try {
         await stopTerminal(session.id);
       } catch (error) {
-        patchPane(agent, { status: "running", error: String(error) });
+        // 仅当会话仍在时回滚 running：CLI 恰在点停止时自行退出的竞态下，
+        // terminal-exit 已把面板置为 exited/session=null，再回滚 running 会
+        // 造成"停止按钮无响应且无启动按钮"的永久卡死
+        if (panesRef.current[agent].session?.id === session.id) {
+          patchPane(agent, { status: "running", error: String(error) });
+        }
       }
     },
     [patchPane],
@@ -316,6 +325,7 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
               agent={agent}
               active={active}
               pane={panes[agent.id]}
+              workDir={agent.id === "claude" ? (projectWorkDir ?? "") : codexWorkDir}
               onMount={(terminal) => mountTerminal(agent.id, terminal)}
               onUnmount={() => unmountTerminal(agent.id)}
               onStart={handleStart}
@@ -328,7 +338,10 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
                   patchPane(agent.id, { error: String(error) });
                 }
               }}
-              onWorkDirChange={(workDir) => patchPane(agent.id, { workDir })}
+              onWorkDirChange={(workDir) => {
+                if (agent.id === "claude") onProjectWorkDirChange?.(workDir);
+                else setCodexWorkDir(workDir);
+              }}
             />
           </Fragment>
         ))}
@@ -341,6 +354,7 @@ interface PaneProps {
   agent: { id: TerminalAgent; label: string; description: string };
   active: boolean;
   pane: PaneState;
+  workDir: string;
   onMount: (terminal: Terminal) => void;
   onUnmount: () => void;
   onStart: (agent: TerminalAgent, cols: number, rows: number) => void;
@@ -354,6 +368,7 @@ function TerminalPane({
   agent,
   active,
   pane,
+  workDir,
   onMount,
   onUnmount,
   onStart,
@@ -535,7 +550,7 @@ function TerminalPane({
         directory: true,
         multiple: false,
         title: `选择 ${agent.label} 工作目录`,
-        defaultPath: pane.workDir.trim() || undefined,
+        defaultPath: workDir.trim() || undefined,
       });
       if (typeof dir === "string") onWorkDirChange(dir);
     } catch {
@@ -577,7 +592,7 @@ function TerminalPane({
           <Icon name="folder" size={13} />
         </IconButton>
         <input
-          value={pane.workDir}
+          value={workDir}
           onChange={(event) => onWorkDirChange(event.currentTarget.value)}
           aria-label={`${agent.label} 工作目录`}
           title="工作目录（也可点左侧文件夹图标选择）"

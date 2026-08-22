@@ -47,6 +47,22 @@ pub fn strip_verbatim(p: PathBuf) -> PathBuf {
     p
 }
 
+/// GUI 进程（发布版 windows_subsystem="windows"）spawn 控制台程序时必须加
+/// CREATE_NO_WINDOW，否则每次 spawn node/pwsh/taskkill/codex 都会弹出一个
+/// 可见控制台窗口（开发版是 console 子系统所以看不出来）。其他平台 no-op。
+pub fn no_console_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -70,6 +70,10 @@ pub struct ReviewArtifact {
     pub reason: String,
     pub model: String,
     pub session_id: String,
+    /// 会话 JSONL 完整路径（final-report 携带、review-N.md 的「会话文件：」行
+    /// 提取；旧产物无此信息时为空——前端据此禁用跳转）
+    #[serde(default)]
+    pub file: String,
 }
 
 // ---------------- 路径定位 ----------------
@@ -106,6 +110,8 @@ fn supervise_script_path() -> PathBuf {
 /// spawn pwsh supervise.ps1（stdout/stderr 用管道，由调用方异步读取；stdin 关闭）
 pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
     let mut cmd = Command::new(pwsh_path());
+    // 发布版是 GUI 子系统：不加 CREATE_NO_WINDOW 会在桌面弹出一个 pwsh 窗口
+    path_util::no_console_window(&mut cmd);
     cmd.arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
@@ -141,6 +147,21 @@ pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
         .map_err(|e| format!("spawn pwsh 失败（请确认 PowerShell 可用）: {e}"))
 }
 
+/// 后台线程消费子进程 stderr，逐行回调。
+/// stderr 管道若无人读取，子进程写满系统管道缓冲（Windows 4-64KB）后会阻塞在
+/// stderr 写入上——整个监督任务挂死、busy_workdirs 永不清理、该目录被永久锁死。
+pub fn drain_stderr<F>(stderr: std::process::ChildStderr, on_line: F)
+where
+    F: Fn(String) + Send + 'static,
+{
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines().flatten() {
+            on_line(line);
+        }
+    });
+}
+
 // ---------------- 产物解析 ----------------
 
 /// 读 .supervise 目录产物：
@@ -166,6 +187,7 @@ pub fn read_artifacts(work_dir: &str) -> Result<Vec<ReviewArtifact>, String> {
                         reason: v.reason.clone(),
                         model: String::new(),
                         session_id: v.session_id.clone(),
+                        file: v.file.clone(),
                     })
                     .collect();
                 if !artifacts.is_empty() {
@@ -230,9 +252,21 @@ fn parse_review_md(text: &str) -> Option<ReviewArtifact> {
 
     let session_id = text
         .lines()
-        .find(|l| l.contains("会话"))
+        .find(|l| l.contains("会话："))
         .and_then(|l| l.split(['：', ':']).nth(1))
         .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // 会话 JSONL 完整路径（新版产物携带；「会话：」行不含、注意与 sessionId 行区分）。
+    // 只按第一个冒号切分：Windows 路径自带 "C:" 冒号，多分隔符切分会截断成盘符
+    let file = text
+        .lines()
+        .find(|l| l.contains("会话文件"))
+        .and_then(|l| {
+            l.split_once('：')
+                .or_else(|| l.split_once(':'))
+                .map(|(_, rest)| rest.trim().to_string())
+        })
         .unwrap_or_default();
 
     // reason：## 意见 之后的所有行
@@ -248,6 +282,7 @@ fn parse_review_md(text: &str) -> Option<ReviewArtifact> {
         reason,
         model,
         session_id,
+        file,
     })
 }
 
@@ -261,13 +296,27 @@ mod tests {
 
     #[test]
     fn parse_review_md_extracts_fields() {
-        let md = "# 第 3 轮审查意见\n\n- 判定：REVIEW\n- 审查模型：gpt-5.6-luna\n- 会话：mock-0001\n\n## 意见\n\n缺少输入校验，请补充。\n";
+        let md = "# 第 3 轮审查意见\n\n- 判定：REVIEW\n- 审查模型：gpt-5.6-luna\n- 会话：mock-0001\n- 会话文件：C:\\Users\\u\\.claude\\projects\\p\\s.jsonl\n\n## 意见\n\n缺少输入校验，请补充。\n";
         let a = parse_review_md(md).expect("应解析成功");
         assert_eq!(a.round, 3);
         assert_eq!(a.verdict, "REVIEW");
         assert_eq!(a.model, "gpt-5.6-luna");
         assert_eq!(a.session_id, "mock-0001");
+        assert_eq!(
+            a.file, "C:\\Users\\u\\.claude\\projects\\p\\s.jsonl",
+            "会话文件行应提取完整路径"
+        );
         assert!(a.reason.contains("缺少输入校验"));
+    }
+
+    /// 旧版产物没有「会话文件：」行：file 为空（前端据此禁用跳转），其余字段正常
+    #[test]
+    fn parse_review_md_old_artifact_has_empty_file() {
+        let md = "# 第 1 轮审查意见\n\n- 判定：PASS\n- 会话：mock-1\n\n## 意见\n\n一次通过。\n";
+        let a = parse_review_md(md).expect("应解析成功");
+        assert_eq!(a.file, "");
+        assert_eq!(a.session_id, "mock-1");
+        assert_eq!(a.verdict, "PASS");
     }
 
     #[test]
@@ -307,13 +356,14 @@ mod tests {
         // fixture 带 UTF-8 BOM，与 supervise.ps1 的真实产物一致（UTF8Encoding($true)）
         std::fs::write(
             sup.join("review-1.md"),
-            "\u{feff}# 第 1 轮审查意见\n\n- 判定：PASS\n- 审查模型：gpt-5.6-luna\n- 会话：mock-9\n\n## 意见\n\n一次通过。\n",
+            "\u{feff}# 第 1 轮审查意见\n\n- 判定：PASS\n- 审查模型：gpt-5.6-luna\n- 会话：mock-9\n- 会话文件：C:\\s\\mock-9.jsonl\n\n## 意见\n\n一次通过。\n",
         )
         .unwrap();
         let arts = read_artifacts(&tmp.to_string_lossy()).expect("解析成功");
         assert_eq!(arts.len(), 1);
         assert_eq!(arts[0].verdict, "PASS");
         assert_eq!(arts[0].session_id, "mock-9");
+        assert_eq!(arts[0].file, "C:\\s\\mock-9.jsonl");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -381,6 +431,91 @@ mod tests {
         assert!(out.contains("LEVEL=L2"), "含 Level: {out}");
         // Mock 是 switch：传了 -Mock 时输出 "MOCK=True"
         assert!(out.contains("MOCK=True"), "含 Mock: {out}");
+
+        match old_script {
+            Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),
+            None => std::env::remove_var("HARNESS_SUPERVISE_SCRIPT"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// stderr 管道必须有人消费：子进程写超过管道缓冲（4-64KB）的 stderr 时，
+    /// 无人读取会导致子进程阻塞在写入上永远不退出。drain_stderr 消费后子进程
+    /// 正常退出且逐行回调不丢首尾行。
+    #[test]
+    fn drain_stderr_consumes_more_than_pipe_buffer() {
+        let tmp = std::env::temp_dir().join(format!("sv-errdrain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 8192 行 × ~16 字节 ≈ 128KB，远超 Windows 管道缓冲
+        let fake_script = tmp.join("stderr-flood.ps1");
+        std::fs::write(
+            &fake_script,
+            "param()\n\
+             try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}\n\
+             for ($i = 1; $i -le 8192; $i++) { [Console]::Error.WriteLine(\"ERR-$i-padpadpadpad\") }\n\
+             Write-Output \"DONE\"\n",
+        )
+        .unwrap();
+
+        let old_script = std::env::var("HARNESS_SUPERVISE_SCRIPT").ok();
+        std::env::set_var("HARNESS_SUPERVISE_SCRIPT", &fake_script);
+        std::env::set_var("HARNESS_PWSH", "powershell");
+
+        let req = SuperviseRequest {
+            task: "t".into(),
+            work_dir: "D:\\work".into(),
+            level: None,
+            max_rounds: None,
+            model: None,
+            mock: true,
+        };
+        let mut child = spawn_supervise(&req).expect("spawn 成功");
+        let stderr = child.stderr.take().expect("stderr 管道");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        drain_stderr(stderr, move |line| {
+            let _ = tx.send(line);
+        });
+
+        // 只读 stdout（不读 stderr）：若 drain_stderr 没在消费，子进程会在写满
+        // 管道缓冲后阻塞，stdout 永远等不到 DONE，测试在此超时
+        use std::io::BufRead;
+        let stdout = child.stdout.take().expect("stdout 管道");
+        let saw_done = std::io::BufReader::new(stdout)
+            .lines()
+            .any(|l| l.map(|l| l.contains("DONE")).unwrap_or(false));
+        let _ = child.wait();
+
+        // wait 返回时 drain 线程可能还在收尾，用 recv_timeout 等它读完管道余量
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut count = 0usize;
+        let mut first = String::new();
+        let mut last = String::new();
+        while count < 8192 {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(line) => {
+                    if count == 0 {
+                        first = line.clone();
+                    }
+                    last = line;
+                    count += 1;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                }
+            }
+        }
+        for line in rx.try_iter() {
+            last = line;
+            count += 1;
+        }
+        assert!(saw_done, "子进程必须能写完 stderr 后正常退出");
+        assert_eq!(count, 8192, "8192 行 stderr 必须全部收到，实际 {count}");
+        assert!(first.starts_with("ERR-1-"), "首行: {first}");
+        assert!(last.starts_with("ERR-8192-"), "末行: {last}");
 
         match old_script {
             Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),

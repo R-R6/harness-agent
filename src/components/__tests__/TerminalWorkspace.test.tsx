@@ -1,8 +1,23 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { TerminalWorkspace } from "../TerminalWorkspace";
+import { useState } from "react";
+import { TerminalWorkspace, type TerminalWorkspaceHandle } from "../TerminalWorkspace";
 import { CODEX_CURSOR_PIN } from "../../lib/xtermRuntime";
+
+/** 与 App 中一致的受控宿主：Claude pane 的项目目录由父组件持有 */
+const PROJECT_DIR = "F:\\project\\workspace-side\\Harness_agent";
+
+function WorkspaceHost({ active = true }: { active?: boolean }) {
+  const [dir, setDir] = useState(PROJECT_DIR);
+  return (
+    <TerminalWorkspace active={active} projectWorkDir={dir} onProjectWorkDirChange={setDir} />
+  );
+}
+
+function renderHost(active = true) {
+  return render(<WorkspaceHost active={active} />);
+}
 
 const mocks = vi.hoisted(() => {
   const terminals: MockTerminal[] = [];
@@ -90,6 +105,8 @@ describe("TerminalWorkspace", () => {
     mocks.loadRuntime.mockReset();
     mocks.listeners.clear();
     mocks.terminals.splice(0);
+    // Codex pane 的目录是组件内 localStorage 持久化状态，预填与旧默认值一致
+    localStorage.setItem("ha-workdir-codex", PROJECT_DIR);
     vi.stubGlobal("ResizeObserver", MockResizeObserver);
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
       callback(0);
@@ -124,8 +141,12 @@ describe("TerminalWorkspace", () => {
     });
   });
 
+  afterEach(() => {
+    localStorage.removeItem("ha-workdir-codex");
+  });
+
   it("按需启动本机 CLI，并在切换工作区时保留 xterm 实例和 PTY 会话", async () => {
-    const { rerender } = render(<TerminalWorkspace active />);
+    const { rerender } = renderHost();
 
     await waitFor(() => {
       expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled();
@@ -154,8 +175,8 @@ describe("TerminalWorkspace", () => {
       "hello from CLI",
     ]);
 
-    rerender(<TerminalWorkspace active={false} />);
-    rerender(<TerminalWorkspace active />);
+    rerender(<WorkspaceHost active={false} />);
+    rerender(<WorkspaceHost active />);
 
     expect(mocks.terminals).toHaveLength(2);
     expect(mocks.terminals.every((terminal) => terminal.dispose.mock.calls.length === 0)).toBe(true);
@@ -164,7 +185,7 @@ describe("TerminalWorkspace", () => {
   });
 
   it("为 PTY 托管的 TUI 关闭 convertEol，避免全屏界面叠成两层", async () => {
-    render(<TerminalWorkspace active />);
+    renderHost();
     await waitFor(() => expect(mocks.terminals).toHaveLength(2));
     expect(mocks.terminals[0].options).toEqual(expect.objectContaining({
       convertEol: false,
@@ -187,7 +208,7 @@ describe("TerminalWorkspace", () => {
       return Promise.resolve(undefined);
     });
 
-    render(<TerminalWorkspace active />);
+    renderHost();
     await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })).toHaveLength(2));
     const startButtons = screen.getAllByRole("button", { name: "启动" });
     await userEvent.click(startButtons[0]);
@@ -211,7 +232,7 @@ describe("TerminalWorkspace", () => {
       return Promise.resolve(undefined);
     });
 
-    render(<TerminalWorkspace active />);
+    renderHost();
     await waitFor(() => expect(mocks.terminals).toHaveLength(2));
     await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
 
@@ -223,7 +244,7 @@ describe("TerminalWorkspace", () => {
   });
 
   it("Claude 与 Codex 终端之间提供可访问的拖动分隔线", async () => {
-    render(<TerminalWorkspace active />);
+    renderHost();
     const splitter = await screen.findByRole("separator", { name: "调整 Claude 与 Codex 终端区域" });
     expect(splitter).toHaveAttribute("aria-orientation", "vertical");
     expect(splitter).toHaveAttribute("aria-valuenow", "50");
@@ -249,7 +270,7 @@ describe("TerminalWorkspace", () => {
       return Promise.resolve(undefined);
     });
 
-    render(<TerminalWorkspace active />);
+    renderHost();
     await waitFor(() => expect(mocks.terminals).toHaveLength(2));
     await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
     await waitFor(() => expect(mocks.terminals[0].onDataHandler).not.toBeNull());
@@ -295,7 +316,7 @@ describe("TerminalWorkspace", () => {
       };
     });
 
-    const { unmount } = render(<TerminalWorkspace active />);
+    const { unmount } = renderHost();
     await waitFor(() => expect(mocks.listen).toHaveBeenCalled());
     expect(mocks.listeners.get("terminal-output") ?? []).toHaveLength(0);
     unmount();
@@ -307,7 +328,7 @@ describe("TerminalWorkspace", () => {
   });
 
   it("每个 PTY 数据块只写入一次，不会因为重复订阅叠成两层", async () => {
-    render(<TerminalWorkspace active />);
+    renderHost();
     await waitFor(() => expect(mocks.terminals).toHaveLength(2));
     await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
     await waitFor(() => {
@@ -319,9 +340,72 @@ describe("TerminalWorkspace", () => {
     expect(mocks.terminals[0].writes.filter((chunk) => chunk.includes("use one."))).toEqual(["use one."]);
   });
 
+  it("startWith 命令式启动：携带 resume 参数（在终端中续聊）", async () => {
+    const ref = { current: null as TerminalWorkspaceHandle | null };
+    render(
+      <TerminalWorkspace
+        ref={ref as unknown as React.Ref<TerminalWorkspaceHandle>}
+        active
+        projectWorkDir={PROJECT_DIR}
+        onProjectWorkDirChange={() => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+
+    act(() => ref.current?.startWith("claude", { args: ["--resume", "session-42"] }));
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("start_terminal", {
+        request: expect.objectContaining({
+          agent: "claude",
+          work_dir: PROJECT_DIR,
+          args: ["--resume", "session-42"],
+        }),
+      });
+    });
+  });
+
+  it("停止与自行退出竞态：invoke 失败不再回滚 running 卡死面板", async () => {
+    const stopRejected = deferred<void>();
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "start_terminal") {
+        return Promise.resolve({
+          id: "terminal-claude-1",
+          agent: "claude",
+          work_dir: PROJECT_DIR,
+          status: "running",
+        });
+      }
+      if (command === "stop_terminal") {
+        return stopRejected.promise.then(() => {
+          throw new Error("终端会话不存在或已退出");
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+    await waitFor(() => expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument());
+
+    // 点停止（invoke 挂起）期间 CLI 自行退出：exit 事件先把面板置 exited
+    await userEvent.click(screen.getByRole("button", { name: "停止 Claude CLI" }));
+    emitEvent("terminal-exit", { sessionId: "terminal-claude-1", code: 0 });
+
+    // invoke 现在才失败。旧代码无条件回滚 running，造成"停止按钮无响应、
+    // 启动按钮不出现"的永久卡死；修复后保持 exited
+    stopRejected.resolve();
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: "启动" })).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "停止 Claude CLI" })).not.toBeInTheDocument();
+    });
+  });
+
   it("点击文件夹图标打开目录选择器，并只更新对应面板的工作目录", async () => {
     mocks.dialogOpen.mockResolvedValue("D:\\picked-project");
-    render(<TerminalWorkspace active />);
+    renderHost();
     await waitFor(() => expect(mocks.terminals).toHaveLength(2));
 
     await userEvent.click(screen.getByRole("button", { name: "选择 Claude CLI 工作目录" }));
@@ -340,7 +424,7 @@ describe("TerminalWorkspace", () => {
 
   it("目录选择器取消时保持当前工作目录不变", async () => {
     mocks.dialogOpen.mockResolvedValue(null);
-    render(<TerminalWorkspace active />);
+    renderHost();
     await waitFor(() => expect(mocks.terminals).toHaveLength(2));
 
     await userEvent.click(screen.getByRole("button", { name: "选择 Codex CLI 工作目录" }));

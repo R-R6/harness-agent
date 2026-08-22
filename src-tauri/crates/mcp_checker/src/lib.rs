@@ -91,7 +91,9 @@ fn locate_host_exe() -> Option<PathBuf> {
         return p.exists().then_some(p);
     }
     let which = if cfg!(windows) { "where" } else { "which" };
-    let out = Command::new(which).arg("codex").output().ok()?;
+    let mut command = Command::new(which);
+    path_util::no_console_window(&mut command);
+    let out = command.arg("codex").output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -255,7 +257,9 @@ pub fn check_mcp(config_path: &str) -> McpStatus {
 pub fn verify_handshake(server: &str) -> bool {
     let node = std::env::var("HARNESS_NODE_PATH").unwrap_or_else(|_| "node".to_string());
     let server = path_util::strip_verbatim(PathBuf::from(server));
-    let mut child = match Command::new(node)
+    let mut command = Command::new(node);
+    path_util::no_console_window(&mut command);
+    let mut child = match command
         .arg(&server)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -270,9 +274,7 @@ pub fn verify_handshake(server: &str) -> bool {
         None => return false,
     };
     use std::io::Write;
-    let init = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}}}}}}\n"
-    );
+    let init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}\n".to_string();
     if writeln!(stdin, "{init}").is_err() {
         return false;
     }
@@ -283,12 +285,10 @@ pub fn verify_handshake(server: &str) -> bool {
         None => return false,
     };
     let mut ok = false;
-    for line in std::io::BufReader::new(stdout).lines() {
-        if let Ok(l) = line {
-            if l.contains("\"serverInfo\"") {
-                ok = true;
-                break;
-            }
+    for l in std::io::BufReader::new(stdout).lines().flatten() {
+        if l.contains("\"serverInfo\"") {
+            ok = true;
+            break;
         }
     }
     ok

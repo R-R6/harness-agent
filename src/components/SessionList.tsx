@@ -3,7 +3,7 @@ import { formatShort } from "../lib/formatTime";
 import { exportTranscriptMd } from "../lib/api";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { save } from "@tauri-apps/plugin-dialog";
-import type { SessionInfo } from "../types";
+import type { SessionInfo, TerminalAgent } from "../types";
 import { Icon, type IconName } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
 import { useElementSize, useStoredNumber } from "../lib/layoutPreferences";
@@ -16,6 +16,8 @@ interface Props {
   searching?: boolean;
   /** 搜索结果中按 Esc 恢复完整列表 */
   onEscapeSearch?: () => void;
+  /** 「在终端中续聊」：切到终端工作台以对应 CLI resume 该会话 */
+  onResumeInTerminal?: (s: SessionInfo) => void;
 }
 
 /** 固定双栏顺序：Claude 左 / Codex 右（不依赖数据顺序） */
@@ -37,9 +39,34 @@ function fileName(file: string): string {
 }
 
 /** 会话 ID：文件名去扩展名（Claude UUID / Codex rollout-xxx） */
-function sessionId(file: string): string {
+export function sessionId(file: string): string {
   const base = fileName(file);
   return base.endsWith(".jsonl") ? base.slice(0, -6) : base;
+}
+
+/** Codex 会话文件名 rollout-<timestamp>-<uuid>.jsonl，`codex resume` 接受的
+ *  是尾部 UUID 而非完整文件名；无 UUID 尾段（老文件）回退全名 */
+function codexSessionId(base: string): string {
+  const tail = base.slice(-36);
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tail);
+  return isUuid ? tail : base;
+}
+
+/** 「在终端中续聊」的启动参数：按 agent 生成 resume 命令行；
+ *  会话带原始 cwd（Claude）则还原启动目录，否则用 pane 当前目录 */
+export function resumeStart(s: SessionInfo): {
+  agent: TerminalAgent;
+  args: string[];
+  workDir?: string;
+} {
+  const agent: TerminalAgent = s.agent === "codex" ? "codex" : "claude";
+  const base = sessionId(s.file);
+  const id = agent === "codex" ? codexSessionId(base) : base;
+  return {
+    agent,
+    args: agent === "claude" ? ["--resume", id] : ["resume", id],
+    workDir: s.cwd?.trim() || undefined,
+  };
 }
 
 /** 续聊命令（按 agent 生成，可直接粘贴到终端） */
@@ -81,7 +108,7 @@ interface MenuState {
  * 会话列表：Claude / Codex 双栏并列（各自独立滚动，中间分割线可拖）
  * 右键菜单：复制路径/ID/续聊命令、在文件夹中显示、收藏置顶、导出 Markdown
  */
-export function SessionList({ sessions, selectedFile, onSelect, searching = false, onEscapeSearch }: Props) {
+export function SessionList({ sessions, selectedFile, onSelect, searching = false, onEscapeSearch, onResumeInTerminal }: Props) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [toast, setToast] = useState("");
   const [starred, setStarred] = useState<Set<string>>(() => {
@@ -247,11 +274,14 @@ export function SessionList({ sessions, selectedFile, onSelect, searching = fals
           }
           break;
         }
+        case "resume-terminal":
+          onResumeInTerminal?.(s);
+          break;
         default:
           break;
       }
     },
-    [showToast, toggleStar, starred],
+    [showToast, toggleStar, starred, onResumeInTerminal],
   );
 
   const openMenu = (e: React.MouseEvent, s: SessionInfo) => {
@@ -272,6 +302,9 @@ export function SessionList({ sessions, selectedFile, onSelect, searching = fals
     { action: "copy-path", label: "复制文件路径", icon: "copy" },
     { action: "copy-id", label: "复制会话 ID", icon: "clipboard" },
     { action: "copy-resume", label: "复制续聊命令", icon: "terminal" },
+    ...(onResumeInTerminal
+      ? [{ action: "resume-terminal", label: "在终端中续聊", icon: "play" as IconName }]
+      : []),
     { action: "reveal", label: "在文件夹中显示", icon: "folder-open" },
     { action: "star", label: starred.has(menu?.session.file ?? "") ? "取消收藏" : "收藏（置顶）", icon: "star" },
     { action: "export-md", label: "导出为 Markdown", icon: "upload" },

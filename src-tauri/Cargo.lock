@@ -1448,13 +1448,15 @@ dependencies = [
 
 [[package]]
 name = "harness_agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mcp_checker",
+ "path_util",
  "portable-pty",
  "serde",
  "serde_json",
  "session_proxy",
+ "supervise_engine",
  "supervise_runner",
  "tauri",
  "tauri-build",
@@ -3386,6 +3388,16 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "supervise_engine"
+version = "0.1.0"
+dependencies = [
+ "path_util",
+ "serde",
+ "serde_json",
+ "supervise_runner",
+]
 
 [[package]]
 name = "supervise_runner"

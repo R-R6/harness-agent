@@ -1,5 +1,6 @@
 ﻿import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { ReviewBoard } from "../ReviewBoard";
 import type { ReviewArtifact } from "../../types";
 
@@ -13,6 +14,7 @@ const artifacts: ReviewArtifact[] = [
     reason: "缺少输入校验，请补充。",
     model: "gpt-5.6-luna",
     session_id: "mock-0001",
+    file: "C:\\Users\\u\\.claude\\projects\\p\\session-abc.jsonl",
   },
   {
     round: 2,
@@ -63,7 +65,28 @@ describe("ReviewBoard", () => {
     mocks.invoke.mockRejectedValueOnce(new Error("读 .supervise 失败"));
     render(<ReviewBoard workDir={"D:\\work"} />);
     await waitFor(() => {
-      expect(screen.getByText(/读 .supervise 失败/)).toBeInTheDocument();
+      expect(screen.getByText(/读 \.supervise 失败/)).toBeInTheDocument();
     });
+  });
+
+  it("带 file 的轮次显示「查看会话」，点击回调完整路径", async () => {
+    mocks.invoke.mockResolvedValue(artifacts);
+    const onViewSession = vi.fn();
+    render(<ReviewBoard workDir={"D:\\work"} onViewSession={onViewSession} />);
+    await waitFor(() => expect(screen.getByText("第 1 轮")).toBeInTheDocument());
+    // 只有第 1 轮（带 file）有按钮，第 2 轮（无 file）没有
+    const buttons = screen.getAllByRole("button", { name: "查看会话" });
+    expect(buttons).toHaveLength(1);
+    await userEvent.click(buttons[0]);
+    expect(onViewSession).toHaveBeenCalledWith(
+      "C:\\Users\\u\\.claude\\projects\\p\\session-abc.jsonl",
+    );
+  });
+
+  it("未传 onViewSession 时不显示跳转按钮", async () => {
+    mocks.invoke.mockResolvedValue(artifacts);
+    render(<ReviewBoard workDir={"D:\\work"} />);
+    await waitFor(() => expect(screen.getByText("第 1 轮")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "查看会话" })).not.toBeInTheDocument();
   });
 });

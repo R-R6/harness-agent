@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { SupervisePanel } from "../SupervisePanel";
 
 const mocks = vi.hoisted(() => ({
@@ -13,6 +14,29 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.dialogOpen }));
 
+/** 受控宿主：面板的 workDir 由父组件持有（与 App 中的用法一致） */
+function renderPanel(initialDir = "D:\\work", extra: { onDriveStarted?: () => void } = {}) {
+  const onStarted = vi.fn();
+  const onWorkDirChange = vi.fn();
+  const Host = () => {
+    const [dir, setDir] = useState(initialDir);
+    const handleDirChange = (v: string) => {
+      onWorkDirChange(v);
+      setDir(v);
+    };
+    return (
+      <SupervisePanel
+        workDir={dir}
+        onWorkDirChange={handleDirChange}
+        onStarted={onStarted}
+        onDriveStarted={extra.onDriveStarted}
+      />
+    );
+  };
+  const view = render(<Host />);
+  return { ...view, onStarted, onWorkDirChange };
+}
+
 describe("SupervisePanel", () => {
   beforeEach(() => {
     mocks.invoke.mockReset();
@@ -23,7 +47,7 @@ describe("SupervisePanel", () => {
   });
 
   it("渲染任务表单（任务/目录/分级/模拟开关）", () => {
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel();
     expect(screen.getByText("任务描述")).toBeInTheDocument();
     expect(screen.getByText("工作目录")).toBeInTheDocument();
     expect(screen.getByText("分级")).toBeInTheDocument();
@@ -31,7 +55,7 @@ describe("SupervisePanel", () => {
   });
 
   it("空任务点击启动 → 显示错误，不调用 invoke", async () => {
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel();
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     expect(screen.getByText("任务描述不能为空")).toBeInTheDocument();
     expect(mocks.invoke).not.toHaveBeenCalled();
@@ -39,7 +63,7 @@ describe("SupervisePanel", () => {
 
   it("填写任务 + 工作目录 → 启动调用 run_supervise", async () => {
     mocks.invoke.mockResolvedValue("task-123");
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel("F:\\preset-dir");
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "写个猜数字游戏");
     const dirInput = screen.getByPlaceholderText(/浏览选择/);
     await userEvent.clear(dirInput);
@@ -55,9 +79,22 @@ describe("SupervisePanel", () => {
     });
   });
 
+  it("启动成功即以当前目录回调 onStarted（看板从运行起就指向正确目录）", async () => {
+    mocks.invoke.mockResolvedValue("task-7");
+    const { onStarted } = renderPanel("D:\\initial");
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
+    // 挂载后修改目录再启动：回调必须带新目录，而不是挂载时的旧值（stale 闭包回归）
+    const dirInput = screen.getByPlaceholderText(/浏览选择/);
+    await userEvent.clear(dirInput);
+    await userEvent.type(dirInput, "D:\\changed");
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalled());
+    expect(onStarted).toHaveBeenCalledWith("D:\\changed");
+  });
+
   it("点📁浏览 → 打开目录选择器并填入选中的目录", async () => {
     mocks.dialogOpen.mockResolvedValue("D:\\my-project");
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel("D:\\before");
     await userEvent.click(screen.getByRole("button", { name: /浏览/ }));
     expect(mocks.dialogOpen).toHaveBeenCalledWith(
       expect.objectContaining({ directory: true }),
@@ -68,7 +105,7 @@ describe("SupervisePanel", () => {
 
   it("目录选择器取消（返回 null）→ 不改变当前目录", async () => {
     mocks.dialogOpen.mockResolvedValue(null);
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel("D:\\keep");
     const dirInput = screen.getByPlaceholderText(/浏览选择/);
     const before = (dirInput as HTMLInputElement).value;
     await userEvent.click(screen.getByRole("button", { name: /浏览/ }));
@@ -76,10 +113,8 @@ describe("SupervisePanel", () => {
   });
 
   it("工作目录为空时提示且不提交", async () => {
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel("");
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "测试任务");
-    const dirInput = screen.getByPlaceholderText(/浏览选择/);
-    await userEvent.clear(dirInput);
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     expect(screen.getByText(/工作目录不能为空/)).toBeInTheDocument();
     expect(mocks.invoke).not.toHaveBeenCalled();
@@ -96,7 +131,7 @@ describe("SupervisePanel", () => {
       }
       return Promise.resolve(() => {});
     });
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel("D:\\work");
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     await waitFor(() =>
@@ -108,12 +143,30 @@ describe("SupervisePanel", () => {
 
   it("mock 关闭时 request.mock=false", async () => {
     mocks.invoke.mockResolvedValue("task-1");
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel();
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "t");
     await userEvent.click(screen.getByLabelText("模拟模式（不花钱）"));
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     const req = mocks.invoke.mock.calls[0][1].request;
     expect(req.mock).toBe(false);
+  });
+
+  it("勾选「驱动 Claude 终端」→ 调用 run_supervise_terminal 并回调 onDriveStarted", async () => {
+    mocks.invoke.mockResolvedValue("task-8");
+    const onDriveStarted = vi.fn();
+    renderPanel("D:\\work", { onDriveStarted });
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务B");
+    await userEvent.click(screen.getByLabelText("驱动 Claude 终端"));
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    expect(mocks.invoke).toHaveBeenCalledWith("run_supervise_terminal", {
+      request: {
+        task: "任务B",
+        work_dir: "D:\\work",
+        level: "L1",
+        mock: true,
+      },
+    });
+    await waitFor(() => expect(onDriveStarted).toHaveBeenCalledTimes(1));
   });
 
   it("收到 supervise-log 事件 → 渲染日志行", async () => {
@@ -125,7 +178,7 @@ describe("SupervisePanel", () => {
     });
     mocks.invoke.mockResolvedValue("task-1");
 
-    render(<SupervisePanel onStarted={() => {}} />);
+    renderPanel();
     // 等 useEffect 异步注册 listener 完成
     await waitFor(() => expect(logHandler).toBeDefined());
     // 触发一次日志事件

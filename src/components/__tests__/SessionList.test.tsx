@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { SessionList } from "../SessionList";
+import { SessionList, resumeStart } from "../SessionList";
 import type { SessionInfo } from "../../types";
 
 const mocks = vi.hoisted(() => ({
@@ -288,5 +288,63 @@ describe("SessionList", () => {
     await waitFor(() => {
       expect(screen.queryByText("复制文件路径")).not.toBeInTheDocument();
     });
+  });
+
+  it("右键菜单「在终端中续聊」回调完整会话（prop 存在时才显示）", async () => {
+    const onResumeInTerminal = vi.fn();
+    const { rerender } = render(
+      <SessionList
+        sessions={sessions}
+        selectedFile={null}
+        onSelect={() => {}}
+        onResumeInTerminal={onResumeInTerminal}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    await userEvent.click(screen.getByRole("button", { name: "在终端中续聊" }));
+    expect(onResumeInTerminal).toHaveBeenCalledWith(sessions[0]);
+    await waitFor(() => {
+      expect(screen.queryByText("复制文件路径")).not.toBeInTheDocument();
+    });
+
+    // 未传 prop 时菜单不显示该项
+    rerender(
+      <SessionList sessions={sessions} selectedFile={null} onSelect={() => {}} />,
+    );
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    expect(screen.queryByRole("button", { name: "在终端中续聊" })).not.toBeInTheDocument();
+    fireEvent.click(document.body);
+  });
+
+  it("resumeStart：按 agent 生成 resume 参数，有 cwd 还原原始目录", () => {
+    const claudeWithCwd: SessionInfo = {
+      ...sessions[0],
+      cwd: "F:\\proj\\my_skils",
+    };
+    expect(resumeStart(claudeWithCwd)).toEqual({
+      agent: "claude",
+      args: ["--resume", "aaa"],
+      workDir: "F:\\proj\\my_skils",
+    });
+    // 无 cwd：workDir 缺省（回落到 pane 当前目录）
+    expect(resumeStart(sessions[0])).toEqual({
+      agent: "claude",
+      args: ["--resume", "aaa"],
+      workDir: undefined,
+    });
+  });
+
+  it("resumeStart：codex 传尾部 UUID（resume 不认完整 rollout 文件名）", () => {
+    const codexUuid: SessionInfo = {
+      ...sessions[2],
+      file:
+        "C:\\fake\\.codex\\sessions\\2026\\08\\13\\rollout-2026-08-13T15-04-04-0199abcd-0000-7000-8000-00000000abcd.jsonl",
+    };
+    expect(resumeStart(codexUuid).args).toEqual([
+      "resume",
+      "0199abcd-0000-7000-8000-00000000abcd",
+    ]);
+    // 老 fixture 无 UUID 尾段：回退完整文件名
+    expect(resumeStart(sessions[2]).args).toEqual(["resume", "rollout-2026-08-13T15-04-04-abc"]);
   });
 });

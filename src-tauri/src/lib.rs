@@ -1,13 +1,16 @@
 // 会话数据代理：内置 agent-sessions-mcp (server.js)，资源路径由 setup 注入（独立 crate：crates/session_proxy）
 use session_proxy::{SessionInfo, TranscriptEntry};
+use supervise_engine::{
+    hook::{ensure_stop_hook, remove_stop_hook}, CodexReviewer, EngineOptions, MarkerSource,
+    MockReviewer, PaneIo, Reviewer, Verdict,
+};
 use supervise_runner::{ReviewArtifact, SuperviseRequest};
 use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command, wait as wait_terminal_process, write_input as write_terminal_input};
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read};
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// 监督任务 id 自增计数器（避免毫秒时间戳碰撞）
@@ -17,10 +20,35 @@ static TERMINAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 // ---------------- 监督进程状态（并发锁 + 进程表） ----------------
 
 struct SuperviseState {
-    /// task_id → 运行中的子进程（用于取消）
+    /// task_id → 运行中的子进程（ps1 无头模式，用于取消）
     running: Mutex<HashMap<String, std::process::Child>>,
     /// 正在跑监督任务的工作目录（并发锁：同目录只能跑一个）
     busy_workdirs: Mutex<Vec<String>>,
+    /// task_id → 终端驱动引擎（阶段 2）的取消标志
+    engine_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl SuperviseState {
+    /// 窗口关闭时终止全部监督任务——否则 pwsh + claude/codex 孤儿进程
+    /// 会在应用退出后继续无人监督地跑完整轮任务（烧 token）
+    fn stop_all(&self) {
+        let mut running = match self.running.lock() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        for (_id, mut child) in running.drain() {
+            let pid = child.id();
+            let _ = kill_process_tree(Some(pid));
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // 引擎线程：置取消标志（注入/等待循环每 500ms 检查一次即退出）
+        if let Ok(flags) = self.engine_cancels.lock() {
+            for flag in flags.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 // ---------------- 本机 CLI 终端状态（ConPTY） ----------------
@@ -31,6 +59,9 @@ struct TerminalStartRequest {
     work_dir: String,
     cols: u16,
     rows: u16,
+    /// 额外 CLI 参数（续聊：claude --resume <id> / codex resume <id>）
+    #[serde(default)]
+    args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -43,6 +74,8 @@ struct TerminalSessionInfo {
 }
 
 struct TerminalProcess {
+    agent: String,
+    work_dir: String,
     writer: std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
     master: std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     child: std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send>>>,
@@ -120,7 +153,9 @@ fn kill_process_tree(pid: Option<u32>) -> Result<(), String> {
     let Some(pid) = pid else { return Ok(()) };
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("taskkill")
+        let mut command = std::process::Command::new("taskkill");
+        path_util::no_console_window(&mut command);
+        let output = command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output()
             .map_err(|error| format!("taskkill 启动失败: {error}"))?;
@@ -188,7 +223,14 @@ fn start_terminal(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
-    let (command, args) = terminal_command(&request.agent)?;
+    let extra_args: Vec<String> = request
+        .args
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| !a.trim().is_empty())
+        .collect();
+    let (command, args) = terminal_command(&request.agent, &extra_args)?;
     let spawned = spawn_terminal_pty(
         &command,
         &args,
@@ -205,6 +247,8 @@ fn start_terminal(
         pid: spawned.pid,
     };
     let process = TerminalProcess {
+        agent: request.agent.clone(),
+        work_dir: request.work_dir.clone(),
         writer: spawned.writer,
         master: spawned.master,
         child: spawned.child,
@@ -321,20 +365,33 @@ async fn run_supervise(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
+    // 检查与登记必须同一次持锁完成：分成两段锁的话，并发启动同目录的两个
+    // 任务都能通过检查（TOCTOU）。spawn 失败时回滚登记。
     {
-        let busy = state.busy_workdirs.lock().unwrap();
+        let mut busy = state.busy_workdirs.lock().unwrap();
         if busy.contains(&work_dir) {
             return Err(format!("工作目录 {work_dir} 已有监督任务在运行"));
         }
+        busy.push(work_dir.clone());
     }
 
-    let mut child = supervise_runner::spawn_supervise(&request)?;
+    let mut child = match supervise_runner::spawn_supervise(&request) {
+        Ok(c) => c,
+        Err(e) => {
+            state
+                .busy_workdirs
+                .lock()
+                .unwrap()
+                .retain(|w| w != &work_dir);
+            return Err(e);
+        }
+    };
     let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
     let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
-    {
-        state.running.lock().unwrap().insert(task_id.clone(), child);
-        state.busy_workdirs.lock().unwrap().push(work_dir.clone());
-    }
+    // stderr 必须有人消费：写满管道缓冲会挂死子进程（busy_workdirs 永不清理）。
+    // 逐行并入 supervise-log（带 [stderr] 前缀），诊断信息直接进 UI 日志流。
+    let stderr = child.stderr.take();
+    state.running.lock().unwrap().insert(task_id.clone(), child);
 
     // 后台线程读 stdout → 逐行 emit 到前端；进程结束后清理 State 并 emit done
     let app2 = app.clone();
@@ -371,27 +428,249 @@ async fn run_supervise(
         );
     });
 
+    if let Some(stderr) = stderr {
+        let app3 = app.clone();
+        let task_id3 = task_id.clone();
+        supervise_runner::drain_stderr(stderr, move |line| {
+            let _ = app3.emit(
+                "supervise-log",
+                serde_json::json!({ "taskId": task_id3, "line": format!("[stderr] {line}") }),
+            );
+        });
+    }
+
     Ok(task_id)
 }
 
-/// 取消运行中的监督任务（kill 整个进程树：pwsh + claude/codex/node 子进程）
+/// 取消运行中的监督任务（ps1 无头模式杀进程树；终端驱动引擎置取消标志）
 #[tauri::command]
 async fn cancel_supervise(app: AppHandle, task_id: String) -> Result<(), String> {
     let state = app.state::<SuperviseState>();
     let mut running = state.running.lock().unwrap();
-    if let Some(mut c) = running.remove(&task_id) {
-        let pid = c.id();
-        let _ = c.kill();
-        let _ = c.wait();
-        // 级联清理子进程：taskkill /T（失败无妨——主进程已杀，且某些环境无 taskkill）
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if let Some((pid, mut child)) = running.remove(&task_id).map(|c| (c.id(), c)) {
+        // 先杀整棵进程树再杀主进程：父进程先死后 taskkill /T 枚举不到子树，
+        // claude/codex 子孙会变孤儿继续跑（与 stop_terminal 同款顺序）
+        if let Err(error) = kill_process_tree(Some(pid)) {
+            eprintln!("[supervise] 终止监督进程树（PID {pid}）失败: {error}");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(());
+    }
+    drop(running);
+    if let Some(flag) = state.engine_cancels.lock().unwrap().get(&task_id) {
+        flag.store(true, Ordering::Relaxed);
         return Ok(());
     }
     Err("任务不存在或已结束".into())
+}
+
+// ---------------- 终端驱动监督引擎（阶段 2） ----------------
+
+/// Level → 轮数/模型推导（与 supervise.ps1 Get-LevelDefaults 同语义）
+fn level_defaults(level: Option<&str>, max_rounds: Option<i64>) -> (i64, &'static str) {
+    let base = match level {
+        Some("L0") => 1,
+        Some("L2") => 5,
+        _ => 3, // L1 与未知值：默认 3 轮
+    };
+    (max_rounds.filter(|m| *m > 0).unwrap_or(base), "gpt-5.6-luna")
+}
+
+/// 引擎与终端 pane 的桥：注入走 pane 的 PTY writer；绑定校验查会话表
+struct TerminalPaneAdapter {
+    app: AppHandle,
+    session_id: String,
+}
+
+impl PaneIo for TerminalPaneAdapter {
+    fn write(&self, data: &str) -> Result<(), String> {
+        let state = self.app.state::<TerminalState>();
+        let sessions = state.sessions.lock().map_err(|_| "终端状态锁已损坏")?;
+        let process = sessions
+            .get(&self.session_id)
+            .ok_or("终端会话已退出")?;
+        write_terminal_input(&process.writer, data.as_bytes())
+    }
+
+    fn current_work_dir(&self) -> Option<String> {
+        let state = self.app.state::<TerminalState>();
+        sessions_dir_of(&state, &self.session_id)
+    }
+}
+
+fn sessions_dir_of(state: &TerminalState, session_id: &str) -> Option<String> {
+    state
+        .sessions
+        .lock()
+        .ok()?
+        .get(session_id)
+        .map(|p| p.work_dir.clone())
+}
+
+/// 终端驱动监督：任务注入运行中的 Claude 终端 pane，干活全程可见、人可插手；
+/// 轮次完成靠 Stop hook marker（启动时幂等安装），审查走无头 codex exec。
+#[tauri::command]
+async fn run_supervise_terminal(
+    app: AppHandle,
+    state: State<'_, SuperviseState>,
+    request: SuperviseRequest,
+) -> Result<String, String> {
+    let work_dir = normalize_path(&request.work_dir);
+    if work_dir.is_empty() {
+        return Err("工作目录不能为空".into());
+    }
+    if !std::path::Path::new(&request.work_dir).is_dir() {
+        return Err(format!("工作目录不存在: {}", request.work_dir));
+    }
+
+    // 定位正在跑的 Claude pane（必须在任务目录上——引擎逐轮校验绑定）。
+    // 单次遍历取 (id, dir)：两次 find 在同目录多 pane 时可能各命中不同的
+    // pane（HashMap 无序），id 与目录错配
+    let session_id = {
+        let term = app.state::<TerminalState>();
+        let sessions = term.sessions.lock().map_err(|_| "终端状态锁已损坏")?;
+        sessions
+            .iter()
+            .find(|(_, p)| p.agent == "claude" && normalize_path(&p.work_dir) == work_dir)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| {
+                "未找到运行中的 Claude 终端（请先在终端工作台以该工作目录启动 Claude CLI）"
+                    .to_string()
+            })?
+    };
+
+    // 目录占用登记（与 run_supervise 同款防竞态：同锁检查+登记）
+    {
+        let mut busy = state.busy_workdirs.lock().unwrap();
+        if busy.contains(&work_dir) {
+            return Err(format!("工作目录 {work_dir} 已有监督任务在运行"));
+        }
+        busy.push(work_dir.clone());
+    }
+
+    // Stop hook 幂等安装 + marker 文件（.supervise/stop-markers.jsonl，随项目走）
+    let supervise_dir = std::path::Path::new(&request.work_dir).join(".supervise");
+    if let Err(e) = std::fs::create_dir_all(&supervise_dir) {
+        // 登记之后的所有失败路径都必须回滚，否则该目录被永久锁死
+        state.busy_workdirs.lock().unwrap().retain(|w| w != &work_dir);
+        return Err(format!("创建 .supervise 失败: {e}"));
+    }
+    let marker_file = supervise_dir.join("stop-markers.jsonl");
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "无法定位用户主目录（USERPROFILE/HOME 均缺失）".to_string())?;
+    let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
+    let hook_installed = !request.mock;
+    if hook_installed {
+        if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
+            state.busy_workdirs.lock().unwrap().retain(|w| w != &work_dir);
+            return Err(format!("安装 Stop hook 失败（可重试或改用无头模式）: {e}"));
+        }
+    }
+
+    let (rounds, model) = level_defaults(request.level.as_deref(), request.max_rounds);
+    let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .engine_cancels
+        .lock()
+        .unwrap()
+        .insert(task_id.clone(), cancel.clone());
+
+    let opts = EngineOptions {
+        task: request.task.clone(),
+        work_dir: request.work_dir.clone(),
+        max_rounds: rounds,
+        // 产物落 .supervise（审查看板与「查看会话」跳转消费同一套格式）
+        artifacts_dir: Some(supervise_dir.clone()),
+        reviewer_label: if request.mock { "mock" } else { model }.to_string(),
+        ..Default::default()
+    };
+    let reviewer: Arc<dyn Reviewer> = if request.mock {
+        // mock：第 1 轮模拟返工意见、第 2 轮通过（无 CLI 环境也能演示全链路）
+        Arc::new(MockReviewer::scripted(vec![
+            Ok(Verdict { pass: false, reason: "（模拟）缺少输入校验，请补充。".into() }),
+            Ok(Verdict { pass: true, reason: "（模拟）校验已补齐，验收通过。".into() }),
+        ]))
+    } else {
+        Arc::new(CodexReviewer::new(model, &request.task))
+    };
+
+    let app2 = app.clone();
+    let task_id2 = task_id.clone();
+    let work_dir2 = work_dir.clone();
+    let settings2 = settings.clone();
+    let marker_file2 = marker_file.clone();
+    std::thread::spawn(move || {
+        let markers = MarkerSource::new(marker_file);
+        let projects_root = std::path::PathBuf::from(&home).join(".claude").join("projects");
+        let pane = Arc::new(TerminalPaneAdapter {
+            app: app2.clone(),
+            session_id,
+        });
+        let app3 = app2.clone();
+        let task_id3 = task_id2.clone();
+        let on_log: supervise_engine::OnLog =
+            Arc::new(move |line: &str| {
+                let _ = app3.emit(
+                    "supervise-log",
+                    serde_json::json!({ "taskId": task_id3, "line": line.to_string() }),
+                );
+            });
+        // 引擎 panic（锁中毒/审查器内部异常）也必须走到收尾——否则目录永久
+        // 占用、engine_cancels 泄漏、前端永远停在"取消任务"状态
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                supervise_engine::run(&opts, pane, reviewer, &markers, &projects_root, &cancel, &on_log)
+            }))
+            .unwrap_or_else(|panic| {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "未知异常".to_string()
+                };
+                supervise_engine::EngineOutcome {
+                    status: supervise_engine::EngineStatus::Aborted(format!("引擎线程异常: {msg}")),
+                    rounds: 0,
+                    last_reason: msg,
+                }
+            });
+
+        // 收尾：清登记 →（无其他引擎时）卸载 hook → emit done。
+        // Stop hook 指向本项目 marker，遗留会让用户所有 Claude 会话每次
+        // Stop 都白跑一次 powershell，多项目还会累积死条目
+        let app_state = app2.state::<SuperviseState>();
+        let remaining_engines = {
+            let mut flags = app_state.engine_cancels.lock().unwrap();
+            flags.remove(&task_id2);
+            flags.len()
+        };
+        app_state
+            .busy_workdirs
+            .lock()
+            .unwrap()
+            .retain(|w| w != &work_dir2);
+        if hook_installed && remaining_engines == 0 {
+            if let Err(e) = remove_stop_hook(&settings2, &marker_file2) {
+                eprintln!("[supervise] 卸载 Stop hook 失败（不影响任务结果）: {e}");
+            }
+        }
+        let code = match outcome.status {
+            supervise_engine::EngineStatus::Accepted
+            | supervise_engine::EngineStatus::Cancelled => 0,
+            supervise_engine::EngineStatus::Rejected => 1,
+            supervise_engine::EngineStatus::Aborted(_) => 2,
+        };
+        let _ = app2.emit(
+            "supervise-done",
+            serde_json::json!({ "taskId": task_id2, "exitCode": code, "reason": outcome.last_reason }),
+        );
+    });
+
+    Ok(task_id)
 }
 
 /// 读取监督闭环产物（.supervise 目录）
@@ -453,6 +732,7 @@ pub fn run() {
         .manage(SuperviseState {
             running: Mutex::new(HashMap::new()),
             busy_workdirs: Mutex::new(vec![]),
+            engine_cancels: Mutex::new(HashMap::new()),
         })
         .manage(TerminalState {
             sessions: Mutex::new(HashMap::new()),
@@ -484,6 +764,7 @@ pub fn run() {
             stop_terminal,
             run_supervise,
             cancel_supervise,
+            run_supervise_terminal,
             read_review_artifacts,
             check_mcp,
             fix_mcp,
@@ -492,6 +773,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 window.state::<TerminalState>().stop_all();
+                window.state::<SuperviseState>().stop_all();
             }
         })
         .run(tauri::generate_context!())

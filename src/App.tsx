@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { SessionList } from "./components/SessionList";
+import { SessionList, resumeStart } from "./components/SessionList";
 import { TranscriptView } from "./components/TranscriptView";
 import { SearchBox } from "./components/SearchBox";
 import { SupervisePanel } from "./components/SupervisePanel";
@@ -8,12 +8,12 @@ import { ReviewBoard } from "./components/ReviewBoard";
 import { MCPStatusPanel } from "./components/MCPStatusPanel";
 import { Icon, IconButton, type IconName } from "./components/Icon";
 import { StatusBar } from "./components/StatusBar";
-import { TerminalWorkspace } from "./components/TerminalWorkspace";
+import { TerminalWorkspace, type TerminalWorkspaceHandle } from "./components/TerminalWorkspace";
 import { SplitHandle } from "./components/SplitHandle";
 import harnessMark from "./assets/harness-mark.svg";
 import { fetchSessions, fetchTranscript, searchSessions } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
-import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
+import { useElementSize, useMediaQuery, useStoredNumber, useStoredString } from "./lib/layoutPreferences";
 import type { SessionInfo, TranscriptEntry } from "./types";
 import "./App.css";
 
@@ -100,10 +100,31 @@ function App() {
   const activeFileRef = useRef<string | null>(null); // 翻页期间切走会话时丢弃过期结果
 
   // ---- 监督闭环状态（常驻 App）----
-  const [superviseWorkDir, setSuperviseWorkDir] = useState(
-    "F:\\project\\workspace-side\\Harness_agent",
-  );
+  // 项目工作目录单一来源（Claude 终端 pane 与监督表单共享，持久化）；
+  // superviseDir 记录最近一次启动监督的目录，审查看板跟随
+  const [projectWorkDir, setProjectWorkDir] = useStoredString("ha-project-work-dir", "");
+  const [superviseDir, setSuperviseDir] = useState<string | null>(null);
   const [terminalRunning, setTerminalRunning] = useState(0);
+  const [superviseRunning, setSuperviseRunning] = useState(0);
+
+  const handleSuperviseRunningChange = useCallback((running: boolean) => {
+    setSuperviseRunning(running ? 1 : 0);
+  }, []);
+
+  /** 终端驱动监督启动后切到终端 tab：监督的核心体验是干活全程可见 */
+  const handleDriveStarted = useCallback(() => {
+    setTab("terminals");
+  }, []);
+
+  const terminalRef = useRef<TerminalWorkspaceHandle>(null);
+
+  /** 会话列表「在终端中续聊」：切到终端工作台，以对应 CLI 的 resume 参数启动；
+   *  会话带原始 cwd（Claude JSONL 记录）则还原该会话的工作目录 */
+  const handleResumeInTerminal = useCallback((s: SessionInfo) => {
+    const start = resumeStart(s);
+    setTab("terminals");
+    terminalRef.current?.startWith(start.agent, { args: start.args, workDir: start.workDir });
+  }, []);
 
   // ---- 可调面板宽度（可拖动分割线控制内容密度）----
   const [navWidth, setNavWidth] = useStoredNumber("ha-layout-nav-width", 248);
@@ -267,6 +288,19 @@ function App() {
     }
   }, []);
 
+  /** 审看看板跳转：按文件路径直接打开 transcript（监督会话是活文件，绕过缓存） */
+  const openTranscriptByFile = useCallback((file: string) => {
+    transcriptCache.current.delete(file);
+    void selectSession({
+      agent: "claude",
+      agentLabel: "Claude Code",
+      file,
+      title: "",
+      updated: "",
+    });
+    setTab("sessions");
+  }, [selectSession]);
+
   const loadEarlier = useCallback(async () => {
     if (!selected || !transcriptHasMore || loadingEarlier) return;
     const file = selected.file;
@@ -295,7 +329,7 @@ function App() {
   }, [selected, transcript, transcriptHasMore, loadingEarlier]);
 
   const handleSuperviseStarted = useCallback((workDir: string) => {
-    setSuperviseWorkDir(workDir);
+    setSuperviseDir(workDir);
   }, []);
 
   const handleMcpHealthChange = useCallback((health: McpHealth) => {
@@ -472,6 +506,7 @@ function App() {
                   onSelect={selectSession}
                   searching={Boolean(searchKeyword)}
                   onEscapeSearch={searchKeyword ? handleClear : undefined}
+                  onResumeInTerminal={handleResumeInTerminal}
                 />
               )}
             </aside>
@@ -527,7 +562,13 @@ function App() {
         </section>
 
         <section className={`view ${tab === "terminals" ? "active" : ""}`} aria-hidden={tab !== "terminals"}>
-          <TerminalWorkspace active={tab === "terminals"} onRunningChange={setTerminalRunning} />
+          <TerminalWorkspace
+            ref={terminalRef}
+            active={tab === "terminals"}
+            onRunningChange={setTerminalRunning}
+            projectWorkDir={projectWorkDir}
+            onProjectWorkDirChange={setProjectWorkDir}
+          />
         </section>
 
         <section className={`view ${tab === "supervise" ? "active" : ""}`} aria-hidden={tab !== "supervise"}>
@@ -539,7 +580,13 @@ function App() {
               className="panel-container"
               style={compactSupervise ? { height: panelHeight } : { width: panelWidth }}
             >
-              <SupervisePanel onStarted={handleSuperviseStarted} />
+              <SupervisePanel
+                workDir={projectWorkDir}
+                onWorkDirChange={setProjectWorkDir}
+                onStarted={handleSuperviseStarted}
+                onRunningChange={handleSuperviseRunningChange}
+                onDriveStarted={handleDriveStarted}
+              />
             </div>
             <SplitHandle
               orientation={compactSupervise ? "horizontal" : "vertical"}
@@ -551,7 +598,7 @@ function App() {
               className="supervise-split"
               valueText={`监督配置${compactSupervise ? "高度" : "宽度"} ${Math.round(compactSupervise ? panelHeight : panelWidth)} 像素`}
             />
-            <ReviewBoard workDir={superviseWorkDir} />
+            <ReviewBoard workDir={superviseDir ?? projectWorkDir} onViewSession={openTranscriptByFile} />
           </div>
         </section>
 
@@ -564,6 +611,7 @@ function App() {
           claudeCount={claudeCount}
           codexCount={codexCount}
           terminalRunning={terminalRunning}
+          superviseRunning={superviseRunning}
           mcpHealth={mcpHealth}
         />
       </div>
