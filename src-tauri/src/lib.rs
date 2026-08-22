@@ -5,7 +5,6 @@ use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -21,6 +20,23 @@ struct SuperviseState {
     running: Mutex<HashMap<String, std::process::Child>>,
     /// 正在跑监督任务的工作目录（并发锁：同目录只能跑一个）
     busy_workdirs: Mutex<Vec<String>>,
+}
+
+impl SuperviseState {
+    /// 窗口关闭时终止全部监督任务——否则 pwsh + claude/codex 孤儿进程
+    /// 会在应用退出后继续无人监督地跑完整轮任务（烧 token）
+    fn stop_all(&self) {
+        let mut running = match self.running.lock() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        for (_id, mut child) in running.drain() {
+            let pid = child.id();
+            let _ = kill_process_tree(Some(pid));
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 // ---------------- 本机 CLI 终端状态（ConPTY） ----------------
@@ -331,23 +347,33 @@ async fn run_supervise(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
+    // 检查与登记必须同一次持锁完成：分成两段锁的话，并发启动同目录的两个
+    // 任务都能通过检查（TOCTOU）。spawn 失败时回滚登记。
     {
-        let busy = state.busy_workdirs.lock().unwrap();
+        let mut busy = state.busy_workdirs.lock().unwrap();
         if busy.contains(&work_dir) {
             return Err(format!("工作目录 {work_dir} 已有监督任务在运行"));
         }
+        busy.push(work_dir.clone());
     }
 
-    let mut child = supervise_runner::spawn_supervise(&request)?;
+    let mut child = match supervise_runner::spawn_supervise(&request) {
+        Ok(c) => c,
+        Err(e) => {
+            state
+                .busy_workdirs
+                .lock()
+                .unwrap()
+                .retain(|w| w != &work_dir);
+            return Err(e);
+        }
+    };
     let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
     let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
     // stderr 必须有人消费：写满管道缓冲会挂死子进程（busy_workdirs 永不清理）。
     // 逐行并入 supervise-log（带 [stderr] 前缀），诊断信息直接进 UI 日志流。
     let stderr = child.stderr.take();
-    {
-        state.running.lock().unwrap().insert(task_id.clone(), child);
-        state.busy_workdirs.lock().unwrap().push(work_dir.clone());
-    }
+    state.running.lock().unwrap().insert(task_id.clone(), child);
 
     // 后台线程读 stdout → 逐行 emit 到前端；进程结束后清理 State 并 emit done
     let app2 = app.clone();
@@ -403,16 +429,14 @@ async fn run_supervise(
 async fn cancel_supervise(app: AppHandle, task_id: String) -> Result<(), String> {
     let state = app.state::<SuperviseState>();
     let mut running = state.running.lock().unwrap();
-    if let Some(mut c) = running.remove(&task_id) {
-        let pid = c.id();
-        let _ = c.kill();
-        let _ = c.wait();
-        // 级联清理子进程：taskkill /T（失败无妨——主进程已杀，且某些环境无 taskkill）
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if let Some((pid, mut child)) = running.remove(&task_id).map(|c| (c.id(), c)) {
+        // 先杀整棵进程树再杀主进程：父进程先死后 taskkill /T 枚举不到子树，
+        // claude/codex 子孙会变孤儿继续跑（与 stop_terminal 同款顺序）
+        if let Err(error) = kill_process_tree(Some(pid)) {
+            eprintln!("[supervise] 终止监督进程树（PID {pid}）失败: {error}");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
         return Ok(());
     }
     Err("任务不存在或已结束".into())
@@ -516,6 +540,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 window.state::<TerminalState>().stop_all();
+                window.state::<SuperviseState>().stop_all();
             }
         })
         .run(tauri::generate_context!())
