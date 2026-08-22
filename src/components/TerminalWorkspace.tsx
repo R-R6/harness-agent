@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { Fragment, useCallback, useEffect, useImperativeHandle, useRef, useState, type CSSProperties, type Ref } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { FitAddon } from "@xterm/addon-fit";
@@ -71,12 +71,23 @@ function listenWhileMounted<T>(
   };
 }
 
+interface StartOptions {
+  workDir?: string;
+  args?: string[];
+}
+
+/** 供 App 命令式驱动终端（如会话列表「在终端中续聊」） */
+export interface TerminalWorkspaceHandle {
+  startWith: (agent: TerminalAgent, opts?: StartOptions) => void;
+}
+
 interface Props {
   active: boolean;
   onRunningChange?: (count: number) => void;
   /** 项目工作目录（Claude pane 的共享上下文，由 App 持有，监督闭环同源） */
   projectWorkDir?: string;
   onProjectWorkDirChange?: (dir: string) => void;
+  ref?: Ref<TerminalWorkspaceHandle>;
 }
 
 /**
@@ -85,7 +96,7 @@ interface Props {
  * The Claude pane's work dir is the shared project context (App-owned); the
  * Codex pane keeps its own persisted dir for side-by-side review.
  */
-export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onProjectWorkDirChange }: Props) {
+export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onProjectWorkDirChange, ref }: Props) {
   const [panes, setPanes] = useState<Record<TerminalAgent, PaneState>>({
     claude: initialPane(),
     codex: initialPane(),
@@ -222,10 +233,10 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   }, [enqueueOutput, patchPane]);
 
   const handleStart = useCallback(
-    async (agent: TerminalAgent, cols: number, rows: number) => {
+    async (agent: TerminalAgent, cols: number, rows: number, opts?: StartOptions) => {
       const pane = panesRef.current[agent];
       if (["starting", "running", "stopping"].includes(pane.status)) return;
-      const workDir = (agent === "claude" ? projectWorkDir ?? "" : codexWorkDir).trim();
+      const workDir = (opts?.workDir ?? (agent === "claude" ? projectWorkDir ?? "" : codexWorkDir)).trim();
       if (!workDir) {
         patchPane(agent, { status: "error", error: "请输入工作目录" });
         return;
@@ -238,6 +249,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           work_dir: workDir,
           cols,
           rows,
+          args: opts?.args,
         });
         patchPane(agent, { session, status: "running", error: "" });
       } catch (error) {
@@ -245,6 +257,22 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       }
     },
     [patchPane, projectWorkDir, codexWorkDir],
+  );
+
+  // 命令式启动入口（会话列表「在终端中续聊」）：目录覆盖走正常受控链路
+  useImperativeHandle(
+    ref,
+    () => ({
+      startWith: (agent, opts) => {
+        if (opts?.workDir !== undefined) {
+          if (agent === "claude") onProjectWorkDirChange?.(opts.workDir);
+          else setCodexWorkDir(opts.workDir);
+        }
+        const terminal = terminals.current.get(agent);
+        void handleStart(agent, terminal?.cols ?? 120, terminal?.rows ?? 30, opts);
+      },
+    }),
+    [handleStart, onProjectWorkDirChange],
   );
 
   const handleStop = useCallback(

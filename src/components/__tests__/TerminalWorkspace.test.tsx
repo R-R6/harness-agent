@@ -1,8 +1,8 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { TerminalWorkspace } from "../TerminalWorkspace";
+import { TerminalWorkspace, type TerminalWorkspaceHandle } from "../TerminalWorkspace";
 import { CODEX_CURSOR_PIN } from "../../lib/xtermRuntime";
 
 /** 与 App 中一致的受控宿主：Claude pane 的项目目录由父组件持有 */
@@ -338,6 +338,30 @@ describe("TerminalWorkspace", () => {
 
     emitEvent("terminal-output", { sessionId: "terminal-claude-1", data: "use one." });
     expect(mocks.terminals[0].writes.filter((chunk) => chunk.includes("use one."))).toEqual(["use one."]);
+  });
+
+  it("startWith 命令式启动：携带 resume 参数（在终端中续聊）", async () => {
+    const ref = { current: null as TerminalWorkspaceHandle | null };
+    render(
+      <TerminalWorkspace
+        ref={ref as unknown as React.Ref<TerminalWorkspaceHandle>}
+        active
+        projectWorkDir={PROJECT_DIR}
+        onProjectWorkDirChange={() => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+
+    act(() => ref.current?.startWith("claude", { args: ["--resume", "session-42"] }));
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("start_terminal", {
+        request: expect.objectContaining({
+          agent: "claude",
+          work_dir: PROJECT_DIR,
+          args: ["--resume", "session-42"],
+        }),
+      });
+    });
   });
 
   it("点击文件夹图标打开目录选择器，并只更新对应面板的工作目录", async () => {

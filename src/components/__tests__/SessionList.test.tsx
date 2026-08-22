@@ -289,4 +289,30 @@ describe("SessionList", () => {
       expect(screen.queryByText("复制文件路径")).not.toBeInTheDocument();
     });
   });
+
+  it("右键菜单「在终端中续聊」回调完整会话（prop 存在时才显示）", async () => {
+    const onResumeInTerminal = vi.fn();
+    const { rerender } = render(
+      <SessionList
+        sessions={sessions}
+        selectedFile={null}
+        onSelect={() => {}}
+        onResumeInTerminal={onResumeInTerminal}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    await userEvent.click(screen.getByRole("button", { name: "在终端中续聊" }));
+    expect(onResumeInTerminal).toHaveBeenCalledWith(sessions[0]);
+    await waitFor(() => {
+      expect(screen.queryByText("复制文件路径")).not.toBeInTheDocument();
+    });
+
+    // 未传 prop 时菜单不显示该项
+    rerender(
+      <SessionList sessions={sessions} selectedFile={null} onSelect={() => {}} />,
+    );
+    fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
+    expect(screen.queryByRole("button", { name: "在终端中续聊" })).not.toBeInTheDocument();
+    fireEvent.click(document.body);
+  });
 });

@@ -4,19 +4,19 @@ use std::path::{Path, PathBuf};
 
 const NATIVE_BINARY_MIN_BYTES: u64 = 4096;
 
-pub fn terminal_command(agent: &str) -> Result<(String, Vec<String>), String> {
+pub fn terminal_command(agent: &str, extra_args: &[String]) -> Result<(String, Vec<String>), String> {
     #[cfg(windows)]
     {
         match agent {
-            "claude" => windows_claude_command(),
-            "codex" => windows_cmd_agent("codex"),
+            "claude" => windows_claude_command(extra_args),
+            "codex" => windows_cmd_agent("codex", extra_args),
             other => Err(format!("不支持的终端 Agent: {other}")),
         }
     }
     #[cfg(not(windows))]
     {
         match agent {
-            "claude" | "codex" => Ok((agent.to_string(), Vec::new())),
+            "claude" | "codex" => Ok((agent.to_string(), extra_args.to_vec())),
             other => Err(format!("不支持的终端 Agent: {other}")),
         }
     }
@@ -28,31 +28,31 @@ fn comspec() -> String {
 }
 
 #[cfg(windows)]
-fn windows_cmd_agent(name: &str) -> Result<(String, Vec<String>), String> {
+fn windows_cmd_agent(name: &str, extra_args: &[String]) -> Result<(String, Vec<String>), String> {
     // Claude/Codex 在 Windows 上都是 npm 装的 .cmd shim。走 cmd.exe 让 PATHEXT
     // 解析出 .cmd，而不是直接 CreateProcessW 裸名——裸名会先命中 npm 全局目录里
     // 那个无扩展名的 sh 脚本（#!/bin/sh，不是 Win32 程序），报 ERROR_BAD_EXE_FORMAT
-    // (os error 193)。cmd.exe 同时转发 stdin/stdout/ANSI/Ctrl+C。
-    Ok((
-        comspec(),
-        vec!["/d".into(), "/s".into(), "/c".into(), name.to_string()],
-    ))
+    // (os error 193)。cmd.exe 同时转发 stdin/stdout/ANSI/Ctrl+C。续聊等附加参数
+    // 追加在 CLI 名之后，由 cmd /c 原样转发。
+    let mut args = vec!["/d".into(), "/s".into(), "/c".into(), name.to_string()];
+    args.extend(extra_args.iter().cloned());
+    Ok((comspec(), args))
 }
 
 #[cfg(windows)]
-fn windows_claude_command() -> Result<(String, Vec<String>), String> {
+fn windows_claude_command(extra_args: &[String]) -> Result<(String, Vec<String>), String> {
     if let Some(shim) = find_on_path("claude.cmd") {
         if let Some(prefix) = shim.parent() {
-            return windows_claude_from_prefix(prefix);
+            return windows_claude_from_prefix(prefix, extra_args);
         }
     }
-    windows_cmd_agent("claude")
+    windows_cmd_agent("claude", extra_args)
 }
 
 #[cfg(windows)]
-fn windows_claude_from_prefix(prefix: &Path) -> Result<(String, Vec<String>), String> {
+fn windows_claude_from_prefix(prefix: &Path, extra_args: &[String]) -> Result<(String, Vec<String>), String> {
     if let Some(exe) = find_claude_native_exe(prefix) {
-        return Ok((exe.to_string_lossy().into_owned(), Vec::new()));
+        return Ok((exe.to_string_lossy().into_owned(), extra_args.to_vec()));
     }
 
     let stub = prefix.join(r"node_modules\@anthropic-ai\claude-code\bin\claude.exe");
@@ -62,7 +62,7 @@ fn windows_claude_from_prefix(prefix: &Path) -> Result<(String, Vec<String>), St
         );
     }
 
-    windows_cmd_agent("claude")
+    windows_cmd_agent("claude", extra_args)
 }
 
 fn looks_like_windows_pe(path: &Path) -> bool {
@@ -188,10 +188,31 @@ mod tests {
         );
         write_bytes(&leftover, &fake_pe());
 
-        let (command, args) = windows_claude_from_prefix(&prefix).expect("launch leftover");
+        let extra = vec!["--resume".to_string(), "session-42".to_string()];
+        let (command, args) = windows_claude_from_prefix(&prefix, &extra).expect("launch leftover");
         assert_eq!(Path::new(&command), leftover.as_path());
-        assert!(args.is_empty());
+        assert_eq!(args, extra, "原生 exe 的附加参数应原样透传");
         let _ = fs::remove_dir_all(prefix);
+    }
+
+    /// cmd.exe 路径的附加参数追加在 CLI 名之后（续聊：codex resume <id>）
+    #[cfg(windows)]
+    #[test]
+    fn cmd_agent_appends_extra_args_after_cli_name() {
+        let (command, args) =
+            windows_cmd_agent("codex", &["resume".into(), "abc-123".into()]).expect("cmd args");
+        assert!(command.to_lowercase().ends_with("cmd.exe"), "command: {command}");
+        assert_eq!(
+            args,
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "codex".to_string(),
+                "resume".to_string(),
+                "abc-123".to_string(),
+            ]
+        );
     }
 
     #[cfg(windows)]
@@ -200,7 +221,7 @@ mod tests {
         let prefix = temp_prefix();
         let stub = prefix.join(r"node_modules\@anthropic-ai\claude-code\bin\claude.exe");
         write_bytes(&stub, b"echo stub\nexit 1\n");
-        let error = windows_claude_from_prefix(&prefix).expect_err("stub must fail");
+        let error = windows_claude_from_prefix(&prefix, &[]).expect_err("stub must fail");
         assert!(error.contains("原生程序未安装"), "{error}");
         let _ = fs::remove_dir_all(prefix);
     }

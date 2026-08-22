@@ -67,6 +67,8 @@ export interface TerminalStartRequest {
   work_dir: string;
   cols: number;
   rows: number;
+  /** 额外 CLI 参数（续聊：claude --resume <id> / codex resume <id>） */
+  args?: string[];
 }
 
 export interface TerminalSessionInfo {

@@ -31,6 +31,9 @@ struct TerminalStartRequest {
     work_dir: String,
     cols: u16,
     rows: u16,
+    /// 额外 CLI 参数（续聊：claude --resume <id> / codex resume <id>）
+    #[serde(default)]
+    args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -188,7 +191,14 @@ fn start_terminal(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
-    let (command, args) = terminal_command(&request.agent)?;
+    let extra_args: Vec<String> = request
+        .args
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| !a.trim().is_empty())
+        .collect();
+    let (command, args) = terminal_command(&request.agent, &extra_args)?;
     let spawned = spawn_terminal_pty(
         &command,
         &args,
