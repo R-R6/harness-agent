@@ -70,6 +70,10 @@ pub struct ReviewArtifact {
     pub reason: String,
     pub model: String,
     pub session_id: String,
+    /// 会话 JSONL 完整路径（final-report 携带、review-N.md 的「会话文件：」行
+    /// 提取；旧产物无此信息时为空——前端据此禁用跳转）
+    #[serde(default)]
+    pub file: String,
 }
 
 // ---------------- 路径定位 ----------------
@@ -183,6 +187,7 @@ pub fn read_artifacts(work_dir: &str) -> Result<Vec<ReviewArtifact>, String> {
                         reason: v.reason.clone(),
                         model: String::new(),
                         session_id: v.session_id.clone(),
+                        file: v.file.clone(),
                     })
                     .collect();
                 if !artifacts.is_empty() {
@@ -247,9 +252,21 @@ fn parse_review_md(text: &str) -> Option<ReviewArtifact> {
 
     let session_id = text
         .lines()
-        .find(|l| l.contains("会话"))
+        .find(|l| l.contains("会话："))
         .and_then(|l| l.split(['：', ':']).nth(1))
         .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // 会话 JSONL 完整路径（新版产物携带；「会话：」行不含、注意与 sessionId 行区分）。
+    // 只按第一个冒号切分：Windows 路径自带 "C:" 冒号，多分隔符切分会截断成盘符
+    let file = text
+        .lines()
+        .find(|l| l.contains("会话文件"))
+        .and_then(|l| {
+            l.split_once('：')
+                .or_else(|| l.split_once(':'))
+                .map(|(_, rest)| rest.trim().to_string())
+        })
         .unwrap_or_default();
 
     // reason：## 意见 之后的所有行
@@ -265,6 +282,7 @@ fn parse_review_md(text: &str) -> Option<ReviewArtifact> {
         reason,
         model,
         session_id,
+        file,
     })
 }
 
@@ -278,13 +296,27 @@ mod tests {
 
     #[test]
     fn parse_review_md_extracts_fields() {
-        let md = "# 第 3 轮审查意见\n\n- 判定：REVIEW\n- 审查模型：gpt-5.6-luna\n- 会话：mock-0001\n\n## 意见\n\n缺少输入校验，请补充。\n";
+        let md = "# 第 3 轮审查意见\n\n- 判定：REVIEW\n- 审查模型：gpt-5.6-luna\n- 会话：mock-0001\n- 会话文件：C:\\Users\\u\\.claude\\projects\\p\\s.jsonl\n\n## 意见\n\n缺少输入校验，请补充。\n";
         let a = parse_review_md(md).expect("应解析成功");
         assert_eq!(a.round, 3);
         assert_eq!(a.verdict, "REVIEW");
         assert_eq!(a.model, "gpt-5.6-luna");
         assert_eq!(a.session_id, "mock-0001");
+        assert_eq!(
+            a.file, "C:\\Users\\u\\.claude\\projects\\p\\s.jsonl",
+            "会话文件行应提取完整路径"
+        );
         assert!(a.reason.contains("缺少输入校验"));
+    }
+
+    /// 旧版产物没有「会话文件：」行：file 为空（前端据此禁用跳转），其余字段正常
+    #[test]
+    fn parse_review_md_old_artifact_has_empty_file() {
+        let md = "# 第 1 轮审查意见\n\n- 判定：PASS\n- 会话：mock-1\n\n## 意见\n\n一次通过。\n";
+        let a = parse_review_md(md).expect("应解析成功");
+        assert_eq!(a.file, "");
+        assert_eq!(a.session_id, "mock-1");
+        assert_eq!(a.verdict, "PASS");
     }
 
     #[test]
@@ -324,13 +356,14 @@ mod tests {
         // fixture 带 UTF-8 BOM，与 supervise.ps1 的真实产物一致（UTF8Encoding($true)）
         std::fs::write(
             sup.join("review-1.md"),
-            "\u{feff}# 第 1 轮审查意见\n\n- 判定：PASS\n- 审查模型：gpt-5.6-luna\n- 会话：mock-9\n\n## 意见\n\n一次通过。\n",
+            "\u{feff}# 第 1 轮审查意见\n\n- 判定：PASS\n- 审查模型：gpt-5.6-luna\n- 会话：mock-9\n- 会话文件：C:\\s\\mock-9.jsonl\n\n## 意见\n\n一次通过。\n",
         )
         .unwrap();
         let arts = read_artifacts(&tmp.to_string_lossy()).expect("解析成功");
         assert_eq!(arts.len(), 1);
         assert_eq!(arts[0].verdict, "PASS");
         assert_eq!(arts[0].session_id, "mock-9");
+        assert_eq!(arts[0].file, "C:\\s\\mock-9.jsonl");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

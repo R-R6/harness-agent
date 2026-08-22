@@ -238,7 +238,7 @@ function Reset-ArtifactDir {
 }
 
 function Write-ReviewArtifact {
-  param([int]$Round, [string]$Verdict, [string]$Reason, [string]$Model, [string]$SessionId)
+  param([int]$Round, [string]$Verdict, [string]$Reason, [string]$Model, [string]$SessionId, [string]$File)
   $dir = Join-Path (Get-Location) ".supervise"
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
   $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -249,6 +249,7 @@ function Write-ReviewArtifact {
 - 审查模型：$Model
 - 判定：$Verdict
 - 会话：$SessionId
+- 会话文件：$File
 
 ## 意见
 
@@ -308,7 +309,7 @@ function Run-Loop {
       file = $sess.file
     }
     Log "INFO" "审查结果: $($v.verdict) — $($v.reason)"
-    Write-ReviewArtifact -Round $round -Verdict $v.verdict -Reason $v.reason -Model $Model -SessionId $sess.sessionId
+    Write-ReviewArtifact -Round $round -Verdict $v.verdict -Reason $v.reason -Model $Model -SessionId $sess.sessionId -File $sess.file
 
     if ($v.verdict -eq "PASS") {
       Log "PASS" "验收通过（第 $round 轮）: $($v.reason)"

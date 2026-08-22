@@ -273,6 +273,19 @@ function App() {
     }
   }, []);
 
+  /** 审看看板跳转：按文件路径直接打开 transcript（监督会话是活文件，绕过缓存） */
+  const openTranscriptByFile = useCallback((file: string) => {
+    transcriptCache.current.delete(file);
+    void selectSession({
+      agent: "claude",
+      agentLabel: "Claude Code",
+      file,
+      title: "",
+      updated: "",
+    });
+    setTab("sessions");
+  }, [selectSession]);
+
   const loadEarlier = useCallback(async () => {
     if (!selected || !transcriptHasMore || loadingEarlier) return;
     const file = selected.file;
@@ -567,7 +580,7 @@ function App() {
               className="supervise-split"
               valueText={`监督配置${compactSupervise ? "高度" : "宽度"} ${Math.round(compactSupervise ? panelHeight : panelWidth)} 像素`}
             />
-            <ReviewBoard workDir={superviseDir ?? projectWorkDir} />
+            <ReviewBoard workDir={superviseDir ?? projectWorkDir} onViewSession={openTranscriptByFile} />
           </div>
         </section>
 

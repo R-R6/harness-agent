@@ -53,6 +53,8 @@ export interface ReviewArtifact {
   reason: string;
   model: string;
   session_id: string;
+  /** 会话 JSONL 完整路径（产物未携带时为空，跳转按钮隐藏） */
+  file?: string;
 }
 
 // ---- 本机 CLI 终端工作台 ----
