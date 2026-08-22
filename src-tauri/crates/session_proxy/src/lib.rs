@@ -1,4 +1,7 @@
-//! session_proxy —— 复用 mcp-lab 的 agent-sessions-mcp (server.js) 作为会话数据源
+//! session_proxy —— 内置的 agent-sessions-mcp (server.js) 会话数据源
+//!
+//! server.js 随应用打包（src-tauri/resources/agent-sessions-mcp/server.js），
+//! 本 crate 只做 stdio 转发，不实现会话解析逻辑。
 //!
 //! 设计约束（计划 v3，审阅者硬性要求）：
 //! - 本 crate **永不直读会话 JSONL**，会话数据一律经 server.js 提供
@@ -12,7 +15,9 @@
 //! 拆成无 tauri 依赖的独立 crate 后，`cargo test -p session_proxy` 可正常跑。
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -49,11 +54,26 @@ fn node_path() -> String {
     std::env::var("HARNESS_NODE_PATH").unwrap_or_else(|_| "node".to_string())
 }
 
-/// server.js 路径：优先环境变量 HARNESS_MCP_SERVER，否则用 mcp-lab 仓库内路径
-fn server_js_path() -> String {
-    std::env::var("HARNESS_MCP_SERVER").unwrap_or_else(|_| {
-        "F:\\project\\workspace-side\\mcp-lab\\agent-sessions-mcp\\server.js".to_string()
-    })
+/// server.js 路径（三级解析）：
+/// 1. 环境变量 HARNESS_MCP_SERVER（测试/调试覆盖）
+/// 2. tauri setup 注入的打包资源路径（发布/开发，来自 BaseDirectory::Resource）
+/// 3. 兜底：仓库内副本（cargo test 无注入时的默认值）
+static SERVER_JS: OnceLock<PathBuf> = OnceLock::new();
+
+/// 由 tauri 启动时注入打包资源目录里的真实 server.js 路径
+pub fn set_server_js(path: PathBuf) {
+    let _ = SERVER_JS.set(path);
+}
+
+fn server_js_path() -> PathBuf {
+    path_util::resolve_script(
+        "HARNESS_MCP_SERVER",
+        SERVER_JS.get(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/agent-sessions-mcp/server.js"
+        ),
+    )
 }
 
 // ---------------- MCP stdio 客户端 ----------------

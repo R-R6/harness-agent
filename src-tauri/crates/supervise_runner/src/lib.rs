@@ -1,6 +1,7 @@
 //! supervise_runner —— 监督闭环进程桥
 //!
-//! 复用 mcp-lab 方案 A 的 supervise.ps1（真实闭环引擎），本 crate 负责：
+//! 复用内置的 supervise.ps1（真实闭环引擎，随应用打包在
+//! src-tauri/resources/supervise-loop-script/），本 crate 负责：
 //! 1. spawn pwsh supervise.ps1（参数映射）
 //! 2. 解析 .supervise 产物（review-N.md 逐轮意见 + final-report.json 最终报告）
 //!
@@ -9,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -77,11 +79,26 @@ fn pwsh_path() -> String {
     std::env::var("HARNESS_PWSH").unwrap_or_else(|_| "powershell".to_string())
 }
 
-/// supervise.ps1 路径：优先 HARNESS_SUPERVISE_SCRIPT，否则 mcp-lab 方案 A 脚本
-fn supervise_script_path() -> String {
-    std::env::var("HARNESS_SUPERVISE_SCRIPT").unwrap_or_else(|_| {
-        "F:\\project\\workspace-side\\mcp-lab\\supervise-loop-script\\supervise.ps1".to_string()
-    })
+/// supervise.ps1 路径（三级解析）：
+/// 1. 环境变量 HARNESS_SUPERVISE_SCRIPT（测试/调试覆盖）
+/// 2. tauri setup 注入的打包资源路径（发布/开发）
+/// 3. 兜底：仓库内副本（cargo test 无注入时的默认值）
+static SUPERVISE_SCRIPT: OnceLock<PathBuf> = OnceLock::new();
+
+/// 由 tauri 启动时注入打包资源目录里的真实 supervise.ps1 路径
+pub fn set_supervise_script(path: PathBuf) {
+    let _ = SUPERVISE_SCRIPT.set(path);
+}
+
+fn supervise_script_path() -> PathBuf {
+    path_util::resolve_script(
+        "HARNESS_SUPERVISE_SCRIPT",
+        SUPERVISE_SCRIPT.get(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/supervise-loop-script/supervise.ps1"
+        ),
+    )
 }
 
 // ---------------- 进程桥 ----------------

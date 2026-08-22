@@ -1,0 +1,5 @@
+[package]
+name = "path_util"
+version = "0.1.0"
+description = "共享路径工具：脚本三级定位（env → 注入 → 仓库兜底）与 Windows verbatim 前缀剥离"
+edition = "2021"

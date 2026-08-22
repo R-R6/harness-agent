@@ -2067,6 +2067,7 @@ dependencies = [
 name = "mcp_checker"
 version = "0.1.0"
 dependencies = [
+ "path_util",
  "serde",
  "toml 0.8.2",
 ]
@@ -2495,6 +2496,10 @@ dependencies = [
  "smallvec",
  "windows-link 0.2.1",
 ]
+
+[[package]]
+name = "path_util"
+version = "0.1.0"
 
 [[package]]
 name = "percent-encoding"
@@ -3216,6 +3221,7 @@ dependencies = [
 name = "session_proxy"
 version = "0.1.0"
 dependencies = [
+ "path_util",
  "serde",
  "serde_json",
 ]
@@ -3385,6 +3391,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 name = "supervise_runner"
 version = "0.1.0"
 dependencies = [
+ "path_util",
  "serde",
  "serde_json",
 ]

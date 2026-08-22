@@ -5,5 +5,6 @@ description = "监督闭环进程桥：spawn pwsh supervise.ps1 + 解析 .superv
 edition = "2021"
 
 [dependencies]
+path_util = { path = "../path_util" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
