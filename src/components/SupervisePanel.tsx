@@ -12,6 +12,8 @@ interface Props {
   onStarted: (workDir: string) => void;
   /** 运行状态变化（true=有监督任务在跑，供状态栏计数） */
   onRunningChange?: (running: boolean) => void;
+  /** 终端驱动模式启动成功后回调（App 切到终端 tab 让用户看到干活过程） */
+  onDriveStarted?: () => void;
 }
 
 interface LogLine {
@@ -20,7 +22,7 @@ interface LogLine {
 }
 
 /** 闭环启动器：任务表单 + 启动/取消 + 实时日志流 */
-export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningChange }: Props) {
+export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningChange, onDriveStarted }: Props) {
   const [task, setTask] = useState("");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
@@ -86,6 +88,8 @@ export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningC
       // 启动即上报目录（非 done 时）：闭包取的是当前 props，避免过期值；
       // 审查看板从任务运行起就指向正确目录
       onStarted(workDir.trim());
+      // 终端驱动模式：切过去看干活过程（监督的核心体验——全程可见、可插手）
+      if (driveTerminal) onDriveStarted?.();
       setRunningTask(taskId);
       setLogs([]);
     } catch (e) {

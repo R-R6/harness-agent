@@ -84,7 +84,10 @@ fn server_js_path() -> PathBuf {
 
 /// 向 server.js 发一次 tools/call，返回解析后的结果 JSON
 fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
-    let mut child = Command::new(node_path())
+    let mut command = Command::new(node_path());
+    // 发布版是 GUI 子系统：不加 CREATE_NO_WINDOW 每次 spawn node 都会闪控制台
+    path_util::no_console_window(&mut command);
+    let mut child = command
         .arg(server_js_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

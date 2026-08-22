@@ -125,9 +125,15 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   const ratio = clampRatio(stacked ? stackedRatio : wideRatio, minRatio, maxRatio);
   const setRatio = stacked ? setStackedRatio : setWideRatio;
 
-  useEffect(() => {
-    panesRef.current = panes;
-  }, [panes]);
+  // panesRef 以 ref 为准、同步更新：terminal-exit 事件与 stop invoke 的拒绝
+  // 可能在同一 tick 内先后到达，若靠 useEffect 在提交后才同步 ref，catch 里
+  // 读到的是旧值（session 仍在），竞态判断失效（M4 卡死的真实根因）
+  const patchPane = useCallback((agent: TerminalAgent, patch: Partial<PaneState>) => {
+    const current = panesRef.current;
+    const next = { ...current, [agent]: { ...current[agent], ...patch } };
+    panesRef.current = next;
+    setPanes(next);
+  }, []);
 
   const mountTerminal = useCallback((agent: TerminalAgent, terminal: Terminal) => {
     terminals.current.set(agent, terminal);
@@ -135,13 +141,6 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
 
   const unmountTerminal = useCallback((agent: TerminalAgent) => {
     terminals.current.delete(agent);
-  }, []);
-
-  const patchPane = useCallback((agent: TerminalAgent, patch: Partial<PaneState>) => {
-    setPanes((current) => ({
-      ...current,
-      [agent]: { ...current[agent], ...patch },
-    }));
   }, []);
 
   const flushOutput = useCallback(() => {
@@ -283,7 +282,12 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       try {
         await stopTerminal(session.id);
       } catch (error) {
-        patchPane(agent, { status: "running", error: String(error) });
+        // 仅当会话仍在时回滚 running：CLI 恰在点停止时自行退出的竞态下，
+        // terminal-exit 已把面板置为 exited/session=null，再回滚 running 会
+        // 造成"停止按钮无响应且无启动按钮"的永久卡死
+        if (panesRef.current[agent].session?.id === session.id) {
+          patchPane(agent, { status: "running", error: String(error) });
+        }
       }
     },
     [patchPane],

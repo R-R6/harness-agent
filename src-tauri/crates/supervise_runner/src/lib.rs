@@ -110,6 +110,8 @@ fn supervise_script_path() -> PathBuf {
 /// spawn pwsh supervise.ps1（stdout/stderr 用管道，由调用方异步读取；stdin 关闭）
 pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
     let mut cmd = Command::new(pwsh_path());
+    // 发布版是 GUI 子系统：不加 CREATE_NO_WINDOW 会在桌面弹出一个 pwsh 窗口
+    path_util::no_console_window(&mut cmd);
     cmd.arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")

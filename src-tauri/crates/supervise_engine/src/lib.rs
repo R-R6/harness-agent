@@ -43,6 +43,12 @@ pub struct EngineOptions {
     /// 单轮硬超时（默认 15min）
     pub round_timeout: Duration,
     pub poll_interval: Duration,
+    /// 产物目录（.supervise）：逐轮 review-N.md + 结束 final-report.json。
+    /// None 则不落盘（纯测试用）。注意只清 review-*.md/final-report.json，
+    /// 不能整目录删——stop-markers.jsonl 也在这里，MarkerSource 正快照着它
+    pub artifacts_dir: Option<PathBuf>,
+    /// 审查者标签（写产物用：模型名 / "mock"）
+    pub reviewer_label: String,
 }
 
 impl Default for EngineOptions {
@@ -54,6 +60,8 @@ impl Default for EngineOptions {
             silence: Duration::from_secs(120),
             round_timeout: Duration::from_secs(15 * 60),
             poll_interval: Duration::from_millis(500),
+            artifacts_dir: None,
+            reviewer_label: String::new(),
         }
     }
 }
@@ -264,7 +272,17 @@ fn wait_round_end(
 /// 审查连续失败的最大次数（防审查器故障导致空转烧轮/死循环）
 const MAX_REVIEW_FAILURES: i64 = 3;
 
+/// 单轮记录（产物落盘用；与 supervise_runner::VerdictEntry 契约对齐）
+struct RoundRecord {
+    round: i64,
+    pass: bool,
+    reason: String,
+    transcript: Option<PathBuf>,
+}
+
 /// 跑完整监督循环。阻塞直到结束/取消/中止（调用方放后台线程）。
+/// 若 opts.artifacts_dir 有值，逐轮写 review-N.md、结束写 final-report.json
+/// （审查看板与「查看会话」跳转消费同一套格式）。
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     opts: &EngineOptions,
@@ -274,6 +292,128 @@ pub fn run(
     projects_root: &Path,
     cancel: &AtomicBool,
     on_log: &OnLog,
+) -> EngineOutcome {
+    let mut records: Vec<RoundRecord> = Vec::new();
+    let outcome = run_loop(opts, pane, reviewer, markers, projects_root, cancel, on_log, &mut records);
+
+    if let Some(dir) = &opts.artifacts_dir {
+        let stem = |p: &Option<PathBuf>| {
+            p.as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        let path_str = |p: &Option<PathBuf>| {
+            p.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
+        let status = match &outcome.status {
+            EngineStatus::Accepted => "accepted",
+            EngineStatus::Rejected => "rejected",
+            EngineStatus::Cancelled => "cancelled",
+            EngineStatus::Aborted(_) => "aborted",
+        };
+        let last = records.last().and_then(|r| r.transcript.clone());
+        let verdicts: Vec<serde_json::Value> = records
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "round": r.round,
+                    "verdict": if r.pass { "PASS" } else { "REVIEW" },
+                    "reason": r.reason,
+                    "sessionId": stem(&r.transcript),
+                    "file": path_str(&r.transcript),
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "status": status,
+            "task": opts.task,
+            "rounds": outcome.rounds,
+            "sessionId": stem(&last),
+            "sessionFile": path_str(&last),
+            "verdicts": verdicts,
+        });
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(
+            dir.join("final-report.json"),
+            serde_json::to_string_pretty(&report).unwrap_or_default(),
+        );
+    }
+
+    outcome
+}
+
+/// 只清本引擎自己的产物，不整目录删——stop-markers.jsonl 也在 .supervise 里，
+/// MarkerSource 正快照着它，删了会让轮次主信号失效
+fn reset_artifacts(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if (name.starts_with("review-") && name.ends_with(".md")) || name == "final-report.json" {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+fn write_round_artifact(dir: &Path, label: &str, rec: &RoundRecord) {
+    let session_id = rec
+        .transcript
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file = rec
+        .transcript
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let verdict = if rec.pass { "PASS" } else { "REVIEW" };
+    let md = format!(
+        "# 第 {} 轮审查意见\n\n- 时间：{}\n- 审查模型：{}\n- 判定：{}\n- 会话：{}\n- 会话文件：{}\n\n## 意见\n\n{}\n",
+        rec.round,
+        unix_ts_string(),
+        label,
+        verdict,
+        session_id,
+        file,
+        rec.reason
+    );
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(format!("review-{}.md", rec.round)), md);
+}
+
+/// unix 秒 → UTC "YYYY-MM-DD HH:MM:SSZ"（不引 chrono 的最小实现，civil-from-days）
+fn unix_ts_string() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (h, m, s) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    let days = (secs / 86400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(mth <= 2);
+    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}:{s:02}Z")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop(
+    opts: &EngineOptions,
+    pane: Arc<dyn PaneIo>,
+    reviewer: Arc<dyn Reviewer>,
+    markers: &MarkerSource,
+    projects_root: &Path,
+    cancel: &AtomicBool,
+    on_log: &OnLog,
+    records: &mut Vec<RoundRecord>,
 ) -> EngineOutcome {
     let slug = project_slug(&opts.work_dir);
     let started_at = SystemTime::now();
@@ -286,6 +426,9 @@ pub fn run(
         "[ENGINE] 监督引擎启动：{} 轮，pane 目录 {}（slug {}）",
         opts.max_rounds, opts.work_dir, slug
     ));
+    if let Some(dir) = &opts.artifacts_dir {
+        reset_artifacts(dir);
+    }
 
     let mut last_reason = String::new();
     let mut first_inject = true;
@@ -395,6 +538,17 @@ pub fn run(
                 }
             }
         };
+
+        // 产物：逐轮落盘（运行中即可在看板刷新看到），报告在 run() 收尾统一写
+        records.push(RoundRecord {
+            round,
+            pass: verdict.pass,
+            reason: verdict.reason.clone(),
+            transcript: Some(transcript.clone()),
+        });
+        if let Some(dir) = &opts.artifacts_dir {
+            write_round_artifact(dir, &opts.reviewer_label, records.last().expect("刚 push"));
+        }
 
         if verdict.pass {
             on_log(&format!("[PASS] 第 {round} 轮验收通过：{}", verdict.reason));
@@ -508,6 +662,8 @@ mod tests {
             silence: Duration::from_millis(400),
             round_timeout: Duration::from_secs(20),
             poll_interval: Duration::from_millis(30),
+            artifacts_dir: None,
+            reviewer_label: "mock".into(),
         }
     }
 
@@ -566,8 +722,17 @@ mod tests {
         let on_log: OnLog = Arc::new(move |l: &str| logs2.lock().unwrap().push(l.to_string()));
 
         let src = MarkerSource::new(marker_file);
+        let mut opts = quick_opts(&dir, 3);
+        opts.artifacts_dir = Some(dir.join(".supervise"));
+        std::fs::create_dir_all(dir.join(".supervise")).unwrap();
+        // 上一次运行的残留：启动时必须清掉，且不能误删 stop-markers.jsonl
+        std::fs::write(dir.join(".supervise").join("review-9.md"), "stale").unwrap();
+        std::fs::write(dir.join(".supervise").join("final-report.json"), "stale").unwrap();
+        let marker_guard = dir.join(".supervise").join("stop-markers.jsonl");
+        std::fs::write(&marker_guard, "keep").unwrap();
+
         let outcome = run(
-            &quick_opts(&dir, 3),
+            &opts,
             pane.clone(),
             Arc::new(reviewer),
             &src,
@@ -582,6 +747,32 @@ mod tests {
         let writes = pane.writes.lock().unwrap();
         assert!(writes[0].contains("写计算器"), "首轮注入任务: {}", writes[0]);
         assert!(writes[1].contains("缺少输入校验"), "次轮注入返工意见: {}", writes[1]);
+
+        // 产物：与 supervise_runner::read_artifacts 契约对齐
+        let sup = dir.join(".supervise");
+        assert!(!sup.join("review-9.md").exists(), "上次残留必须清理");
+        let md1 = std::fs::read_to_string(sup.join("review-1.md")).unwrap();
+        assert!(md1.contains("判定：REVIEW"), "{md1}");
+        assert!(md1.contains("会话文件："), "{md1}");
+        let md2 = std::fs::read_to_string(sup.join("review-2.md")).unwrap();
+        assert!(md2.contains("判定：PASS"), "{md2}");
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(sup.join("final-report.json")).unwrap())
+                .unwrap();
+        assert_eq!(report["status"], "accepted");
+        assert_eq!(report["rounds"], 2);
+        assert_eq!(report["verdicts"].as_array().map(Vec::len), Some(2));
+        assert!(
+            report["verdicts"][0]["file"].as_str().unwrap().ends_with(".jsonl"),
+            "verdicts 需带会话文件路径（看板跳转依赖）"
+        );
+        assert!(marker_guard.exists(), "stop-markers.jsonl 不能被清理误伤");
+        // 跨 crate 契约：看板数据链（read_artifacts）必须能消费引擎产物
+        let arts = supervise_runner::read_artifacts(&dir.to_string_lossy()).expect("read_artifacts 应解析引擎产物");
+        assert_eq!(arts.len(), 2);
+        assert_eq!(arts[0].verdict, "REVIEW");
+        assert_eq!(arts[1].verdict, "PASS");
+        assert!(arts[0].file.ends_with(".jsonl"), "看板跳转依赖 file 字段: {}", arts[0].file);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

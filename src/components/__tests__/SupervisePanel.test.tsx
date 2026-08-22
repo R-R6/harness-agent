@@ -15,7 +15,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.dialogOpen }));
 
 /** 受控宿主：面板的 workDir 由父组件持有（与 App 中的用法一致） */
-function renderPanel(initialDir = "D:\\work") {
+function renderPanel(initialDir = "D:\\work", extra: { onDriveStarted?: () => void } = {}) {
   const onStarted = vi.fn();
   const onWorkDirChange = vi.fn();
   const Host = () => {
@@ -24,7 +24,14 @@ function renderPanel(initialDir = "D:\\work") {
       onWorkDirChange(v);
       setDir(v);
     };
-    return <SupervisePanel workDir={dir} onWorkDirChange={handleDirChange} onStarted={onStarted} />;
+    return (
+      <SupervisePanel
+        workDir={dir}
+        onWorkDirChange={handleDirChange}
+        onStarted={onStarted}
+        onDriveStarted={extra.onDriveStarted}
+      />
+    );
   };
   const view = render(<Host />);
   return { ...view, onStarted, onWorkDirChange };
@@ -144,9 +151,10 @@ describe("SupervisePanel", () => {
     expect(req.mock).toBe(false);
   });
 
-  it("勾选「驱动 Claude 终端」→ 调用 run_supervise_terminal", async () => {
+  it("勾选「驱动 Claude 终端」→ 调用 run_supervise_terminal 并回调 onDriveStarted", async () => {
     mocks.invoke.mockResolvedValue("task-8");
-    renderPanel("D:\\work");
+    const onDriveStarted = vi.fn();
+    renderPanel("D:\\work", { onDriveStarted });
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务B");
     await userEvent.click(screen.getByLabelText("驱动 Claude 终端"));
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
@@ -158,6 +166,7 @@ describe("SupervisePanel", () => {
         mock: true,
       },
     });
+    await waitFor(() => expect(onDriveStarted).toHaveBeenCalledTimes(1));
   });
 
   it("收到 supervise-log 事件 → 渲染日志行", async () => {

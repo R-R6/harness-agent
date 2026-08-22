@@ -153,7 +153,9 @@ fn kill_process_tree(pid: Option<u32>) -> Result<(), String> {
     let Some(pid) = pid else { return Ok(()) };
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("taskkill")
+        let mut command = std::process::Command::new("taskkill");
+        path_util::no_console_window(&mut command);
+        let output = command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output()
             .map_err(|error| format!("taskkill 启动失败: {error}"))?;
@@ -590,6 +592,9 @@ async fn run_supervise_terminal(
         task: request.task.clone(),
         work_dir: request.work_dir.clone(),
         max_rounds: rounds,
+        // 产物落 .supervise（审查看板与「查看会话」跳转消费同一套格式）
+        artifacts_dir: Some(supervise_dir.clone()),
+        reviewer_label: if request.mock { "mock" } else { model }.to_string(),
         ..Default::default()
     };
     let reviewer: Arc<dyn Reviewer> = if request.mock {

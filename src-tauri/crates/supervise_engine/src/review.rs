@@ -50,8 +50,11 @@ impl Reviewer for CodexReviewer {
         let prompt = self.prompt(transcript);
         let mut last_err = String::new();
         for attempt in 1..=self.retries {
-            // stdin 置 null：codex 在非 TTY 环境会读 stdin 附加输入而挂起
-            let output = Command::new("codex")
+            // stdin 置 null：codex 在非 TTY 环境会读 stdin 附加输入而挂起；
+            // CREATE_NO_WINDOW：发布版 GUI 子系统不弹控制台
+            let mut command = Command::new("codex");
+            path_util::no_console_window(&mut command);
+            let output = command
                 .args([
                     "exec",
                     "--skip-git-repo-check",

@@ -111,6 +111,11 @@ function App() {
     setSuperviseRunning(running ? 1 : 0);
   }, []);
 
+  /** 终端驱动监督启动后切到终端 tab：监督的核心体验是干活全程可见 */
+  const handleDriveStarted = useCallback(() => {
+    setTab("terminals");
+  }, []);
+
   const terminalRef = useRef<TerminalWorkspaceHandle>(null);
 
   /** 会话列表「在终端中续聊」：切到终端工作台，以对应 CLI 的 resume 参数启动；
@@ -580,6 +585,7 @@ function App() {
                 onWorkDirChange={setProjectWorkDir}
                 onStarted={handleSuperviseStarted}
                 onRunningChange={handleSuperviseRunningChange}
+                onDriveStarted={handleDriveStarted}
               />
             </div>
             <SplitHandle

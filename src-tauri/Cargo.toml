@@ -1,6 +1,6 @@
 [package]
 name = "harness_agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Harness Agent - 驾驭 Claude 干活 + Codex 审查的桌面端监督闭环应用"
 authors = ["wuzhaoguo"]
 edition = "2021"
@@ -26,6 +26,7 @@ supervise_runner = { path = "crates/supervise_runner" }
 supervise_engine = { path = "crates/supervise_engine" }
 mcp_checker = { path = "crates/mcp_checker" }
 terminal_host = { path = "crates/terminal_host" }
+path_util = { path = "crates/path_util" }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

@@ -364,6 +364,45 @@ describe("TerminalWorkspace", () => {
     });
   });
 
+  it("停止与自行退出竞态：invoke 失败不再回滚 running 卡死面板", async () => {
+    const stopRejected = deferred<void>();
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "start_terminal") {
+        return Promise.resolve({
+          id: "terminal-claude-1",
+          agent: "claude",
+          work_dir: PROJECT_DIR,
+          status: "running",
+        });
+      }
+      if (command === "stop_terminal") {
+        return stopRejected.promise.then(() => {
+          throw new Error("终端会话不存在或已退出");
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+    await waitFor(() => expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument());
+
+    // 点停止（invoke 挂起）期间 CLI 自行退出：exit 事件先把面板置 exited
+    await userEvent.click(screen.getByRole("button", { name: "停止 Claude CLI" }));
+    emitEvent("terminal-exit", { sessionId: "terminal-claude-1", code: 0 });
+
+    // invoke 现在才失败。旧代码无条件回滚 running，造成"停止按钮无响应、
+    // 启动按钮不出现"的永久卡死；修复后保持 exited
+    stopRejected.resolve();
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: "启动" })).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "停止 Claude CLI" })).not.toBeInTheDocument();
+    });
+  });
+
   it("点击文件夹图标打开目录选择器，并只更新对应面板的工作目录", async () => {
     mocks.dialogOpen.mockResolvedValue("D:\\picked-project");
     renderHost();
