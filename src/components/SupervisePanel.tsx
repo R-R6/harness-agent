@@ -5,7 +5,10 @@ import { cancelSupervise, runSupervise } from "../lib/api";
 import { Icon } from "./Icon";
 
 interface Props {
-  /** 启动后回调（父组件刷新审查看板） */
+  /** 工作目录（受控：由 App 持有的项目上下文，与 Claude 终端 pane 同源） */
+  workDir: string;
+  onWorkDirChange: (dir: string) => void;
+  /** 启动成功后回调（携带启动时的目录，供审查看板定位 .supervise 产物） */
   onStarted: (workDir: string) => void;
 }
 
@@ -15,9 +18,8 @@ interface LogLine {
 }
 
 /** 闭环启动器：任务表单 + 启动/取消 + 实时日志流 */
-export function SupervisePanel({ onStarted }: Props) {
+export function SupervisePanel({ workDir, onWorkDirChange, onStarted }: Props) {
   const [task, setTask] = useState("");
-  const [workDir, setWorkDir] = useState("F:\\project\\workspace-side\\Harness_agent");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
   const [runningTask, setRunningTask] = useState<string | null>(null);
@@ -41,7 +43,6 @@ export function SupervisePanel({ onStarted }: Props) {
           if (code != null && code !== 0) {
             setError(`任务失败（退出码 ${code}），详见下方日志`);
           }
-          onStarted(workDir);
         },
       );
     })();
@@ -49,7 +50,6 @@ export function SupervisePanel({ onStarted }: Props) {
       unLog?.();
       unDone?.();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -73,6 +73,9 @@ export function SupervisePanel({ onStarted }: Props) {
         level,
         mock,
       });
+      // 启动即上报目录（非 done 时）：闭包取的是当前 props，避免过期值；
+      // 审查看板从任务运行起就指向正确目录
+      onStarted(workDir.trim());
       setRunningTask(taskId);
       setLogs([]);
     } catch (e) {
@@ -98,7 +101,7 @@ export function SupervisePanel({ onStarted }: Props) {
         multiple: false,
         title: "选择项目工作目录",
       });
-      if (typeof dir === "string") setWorkDir(dir);
+      if (typeof dir === "string") onWorkDirChange(dir);
     } catch (e) {
       setError(String(e));
     }
@@ -121,7 +124,7 @@ export function SupervisePanel({ onStarted }: Props) {
           <div className="dir-row">
             <input
               value={workDir}
-              onChange={(e) => setWorkDir(e.currentTarget.value)}
+              onChange={(e) => onWorkDirChange(e.currentTarget.value)}
               placeholder="Claude 干活的项目目录（可点击浏览选择）"
             />
             <button type="button" className="browse" onClick={browseDir} title="打开资源管理器选择目录">

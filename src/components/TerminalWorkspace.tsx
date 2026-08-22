@@ -9,9 +9,8 @@ import { buildXtermOptions, CODEX_CURSOR_PIN, createOutputStabilizer, loadXtermR
 import type { TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
 import { Icon, IconButton } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
-import { useElementSize, useStoredNumber } from "../lib/layoutPreferences";
+import { useElementSize, useStoredNumber, useStoredString } from "../lib/layoutPreferences";
 
-const DEFAULT_WORK_DIR = "F:\\project\\workspace-side\\Harness_agent";
 const TERMINAL_STACK_WIDTH = 720;
 const TERMINAL_MIN_WIDTH = 320;
 const TERMINAL_MIN_HEIGHT = 220;
@@ -25,14 +24,12 @@ interface PaneState {
   session: TerminalSessionInfo | null;
   status: TerminalStatus;
   error: string;
-  workDir: string;
 }
 
 const initialPane = (): PaneState => ({
   session: null,
   status: "idle",
   error: "",
-  workDir: DEFAULT_WORK_DIR,
 });
 
 const AGENTS: { id: TerminalAgent; label: string; description: string }[] = [
@@ -77,13 +74,18 @@ function listenWhileMounted<T>(
 interface Props {
   active: boolean;
   onRunningChange?: (count: number) => void;
+  /** 项目工作目录（Claude pane 的共享上下文，由 App 持有，监督闭环同源） */
+  projectWorkDir?: string;
+  onProjectWorkDirChange?: (dir: string) => void;
 }
 
 /**
  * Two persistent local CLI panes. The browser only renders xterm; the Rust side
  * owns the PTY, child process and lifecycle so switching workspaces is harmless.
+ * The Claude pane's work dir is the shared project context (App-owned); the
+ * Codex pane keeps its own persisted dir for side-by-side review.
  */
-export function TerminalWorkspace({ active, onRunningChange }: Props) {
+export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onProjectWorkDirChange }: Props) {
   const [panes, setPanes] = useState<Record<TerminalAgent, PaneState>>({
     claude: initialPane(),
     codex: initialPane(),
@@ -97,6 +99,7 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
   const codexStabilizerRef = useRef(createOutputStabilizer());
   const pendingOutputRef = useRef(new Map<TerminalAgent, { sessionId: string; data: string }>());
   const outputFrameRef = useRef<number | null>(null);
+  const [codexWorkDir, setCodexWorkDir] = useStoredString("ha-workdir-codex", "");
   const gridRef = useRef<HTMLDivElement>(null);
   const gridSize = useElementSize(gridRef);
   const stacked = gridSize.width > 0 && gridSize.width < TERMINAL_STACK_WIDTH;
@@ -222,7 +225,7 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
     async (agent: TerminalAgent, cols: number, rows: number) => {
       const pane = panesRef.current[agent];
       if (["starting", "running", "stopping"].includes(pane.status)) return;
-      const workDir = pane.workDir.trim();
+      const workDir = (agent === "claude" ? projectWorkDir ?? "" : codexWorkDir).trim();
       if (!workDir) {
         patchPane(agent, { status: "error", error: "请输入工作目录" });
         return;
@@ -241,7 +244,7 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
         patchPane(agent, { status: "error", error: String(error) });
       }
     },
-    [patchPane],
+    [patchPane, projectWorkDir, codexWorkDir],
   );
 
   const handleStop = useCallback(
@@ -316,6 +319,7 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
               agent={agent}
               active={active}
               pane={panes[agent.id]}
+              workDir={agent.id === "claude" ? (projectWorkDir ?? "") : codexWorkDir}
               onMount={(terminal) => mountTerminal(agent.id, terminal)}
               onUnmount={() => unmountTerminal(agent.id)}
               onStart={handleStart}
@@ -328,7 +332,10 @@ export function TerminalWorkspace({ active, onRunningChange }: Props) {
                   patchPane(agent.id, { error: String(error) });
                 }
               }}
-              onWorkDirChange={(workDir) => patchPane(agent.id, { workDir })}
+              onWorkDirChange={(workDir) => {
+                if (agent.id === "claude") onProjectWorkDirChange?.(workDir);
+                else setCodexWorkDir(workDir);
+              }}
             />
           </Fragment>
         ))}
@@ -341,6 +348,7 @@ interface PaneProps {
   agent: { id: TerminalAgent; label: string; description: string };
   active: boolean;
   pane: PaneState;
+  workDir: string;
   onMount: (terminal: Terminal) => void;
   onUnmount: () => void;
   onStart: (agent: TerminalAgent, cols: number, rows: number) => void;
@@ -354,6 +362,7 @@ function TerminalPane({
   agent,
   active,
   pane,
+  workDir,
   onMount,
   onUnmount,
   onStart,
@@ -535,7 +544,7 @@ function TerminalPane({
         directory: true,
         multiple: false,
         title: `选择 ${agent.label} 工作目录`,
-        defaultPath: pane.workDir.trim() || undefined,
+        defaultPath: workDir.trim() || undefined,
       });
       if (typeof dir === "string") onWorkDirChange(dir);
     } catch {
@@ -577,7 +586,7 @@ function TerminalPane({
           <Icon name="folder" size={13} />
         </IconButton>
         <input
-          value={pane.workDir}
+          value={workDir}
           onChange={(event) => onWorkDirChange(event.currentTarget.value)}
           aria-label={`${agent.label} 工作目录`}
           title="工作目录（也可点左侧文件夹图标选择）"

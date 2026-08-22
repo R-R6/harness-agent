@@ -28,6 +28,27 @@ export function useStoredNumber(key: string, fallback: number): [number, Dispatc
   return [value, setValue];
 }
 
+/** 字符串版 useStoredNumber：localStorage 持久化的受控字符串状态 */
+export function useStoredString(key: string, fallback: string): [string, Dispatch<SetStateAction<string>>] {
+  const [value, setValue] = useState(() => {
+    try {
+      return localStorage.getItem(key) ?? fallback;
+    } catch {
+      return fallback;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      // Persistence is optional; editing remains available in memory.
+    }
+  }, [key, value]);
+
+  return [value, setValue];
+}
+
 export function useMediaQuery(query: string) {
   const getMatches = () => typeof window.matchMedia === "function" && window.matchMedia(query).matches;
   const [matches, setMatches] = useState(getMatches);

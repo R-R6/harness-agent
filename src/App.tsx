@@ -13,7 +13,7 @@ import { SplitHandle } from "./components/SplitHandle";
 import harnessMark from "./assets/harness-mark.svg";
 import { fetchSessions, fetchTranscript, searchSessions } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
-import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
+import { useElementSize, useMediaQuery, useStoredNumber, useStoredString } from "./lib/layoutPreferences";
 import type { SessionInfo, TranscriptEntry } from "./types";
 import "./App.css";
 
@@ -100,9 +100,10 @@ function App() {
   const activeFileRef = useRef<string | null>(null); // 翻页期间切走会话时丢弃过期结果
 
   // ---- 监督闭环状态（常驻 App）----
-  const [superviseWorkDir, setSuperviseWorkDir] = useState(
-    "F:\\project\\workspace-side\\Harness_agent",
-  );
+  // 项目工作目录单一来源（Claude 终端 pane 与监督表单共享，持久化）；
+  // superviseDir 记录最近一次启动监督的目录，审查看板跟随
+  const [projectWorkDir, setProjectWorkDir] = useStoredString("ha-project-work-dir", "");
+  const [superviseDir, setSuperviseDir] = useState<string | null>(null);
   const [terminalRunning, setTerminalRunning] = useState(0);
 
   // ---- 可调面板宽度（可拖动分割线控制内容密度）----
@@ -295,7 +296,7 @@ function App() {
   }, [selected, transcript, transcriptHasMore, loadingEarlier]);
 
   const handleSuperviseStarted = useCallback((workDir: string) => {
-    setSuperviseWorkDir(workDir);
+    setSuperviseDir(workDir);
   }, []);
 
   const handleMcpHealthChange = useCallback((health: McpHealth) => {
@@ -527,7 +528,12 @@ function App() {
         </section>
 
         <section className={`view ${tab === "terminals" ? "active" : ""}`} aria-hidden={tab !== "terminals"}>
-          <TerminalWorkspace active={tab === "terminals"} onRunningChange={setTerminalRunning} />
+          <TerminalWorkspace
+            active={tab === "terminals"}
+            onRunningChange={setTerminalRunning}
+            projectWorkDir={projectWorkDir}
+            onProjectWorkDirChange={setProjectWorkDir}
+          />
         </section>
 
         <section className={`view ${tab === "supervise" ? "active" : ""}`} aria-hidden={tab !== "supervise"}>
@@ -539,7 +545,11 @@ function App() {
               className="panel-container"
               style={compactSupervise ? { height: panelHeight } : { width: panelWidth }}
             >
-              <SupervisePanel onStarted={handleSuperviseStarted} />
+              <SupervisePanel
+                workDir={projectWorkDir}
+                onWorkDirChange={setProjectWorkDir}
+                onStarted={handleSuperviseStarted}
+              />
             </div>
             <SplitHandle
               orientation={compactSupervise ? "horizontal" : "vertical"}
@@ -551,7 +561,7 @@ function App() {
               className="supervise-split"
               valueText={`监督配置${compactSupervise ? "高度" : "宽度"} ${Math.round(compactSupervise ? panelHeight : panelWidth)} 像素`}
             />
-            <ReviewBoard workDir={superviseWorkDir} />
+            <ReviewBoard workDir={superviseDir ?? projectWorkDir} />
           </div>
         </section>
 
