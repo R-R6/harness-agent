@@ -51,6 +51,9 @@ pub fn strip_verbatim(p: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Windows 语义：\\?\ 前缀剥离。Unix 上 cfg!(windows) 为假，
+    /// strip_verbatim 原样返回，故只在 Windows 跑这对断言
+    #[cfg(windows)]
     #[test]
     fn strip_verbatim_removes_windows_prefix() {
         assert_eq!(
@@ -63,10 +66,30 @@ mod tests {
         );
     }
 
+    /// Unix 语义：无 verbatim 概念，原样返回
+    #[cfg(not(windows))]
+    #[test]
+    fn strip_verbatim_returns_unchanged_on_unix() {
+        assert_eq!(
+            strip_verbatim(PathBuf::from("/tmp/x/server.js")),
+            PathBuf::from("/tmp/x/server.js")
+        );
+    }
+
+    /// Windows 反斜杠路径的 .. 折叠（'\' 在 Unix 不是分隔符，整串成一个组件，
+    /// 无法折叠——只在 Windows 断言）
+    #[cfg(windows)]
     #[test]
     fn normalize_dev_path_collapses_parent_dirs() {
         let p = normalize_dev_path(r"F:\repo\src-tauri\crates\x\..\..\resources\s.js");
         assert_eq!(p, PathBuf::from(r"F:\repo\src-tauri\resources\s.js"));
+    }
+
+    /// 正斜杠路径的 .. 折叠（Windows 的 Path 解析同样接受 '/'，双平台通用）
+    #[test]
+    fn normalize_dev_path_collapses_parent_dirs_posix() {
+        let p = normalize_dev_path("/repo/src-tauri/crates/x/../../resources/s.js");
+        assert_eq!(p, PathBuf::from("/repo/src-tauri/resources/s.js"));
     }
 
     /// 环境变量优先级最高，其次注入值，最后兜底

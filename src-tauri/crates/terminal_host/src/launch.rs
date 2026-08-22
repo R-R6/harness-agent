@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+// Windows npm 目录勘察工具：调用方全在 cfg(windows) 分支，Unix 构建下为死代码
+#[cfg_attr(not(windows), allow(dead_code))]
 const NATIVE_BINARY_MIN_BYTES: u64 = 4096;
 
 pub fn terminal_command(agent: &str) -> Result<(String, Vec<String>), String> {
@@ -65,6 +67,7 @@ fn windows_claude_from_prefix(prefix: &Path) -> Result<(String, Vec<String>), St
     windows_cmd_agent("claude")
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn looks_like_windows_pe(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
@@ -79,6 +82,7 @@ fn looks_like_windows_pe(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(windows)]
 fn find_claude_native_exe(prefix: &Path) -> Option<PathBuf> {
     let candidates = [
         prefix.join(r"node_modules\@anthropic-ai\claude-code\bin\claude.exe"),
@@ -107,6 +111,7 @@ fn find_claude_native_exe(prefix: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn find_on_path(file_name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).find_map(|dir| {
@@ -162,6 +167,9 @@ mod tests {
         let _ = fs::remove_dir_all(prefix);
     }
 
+    // fixture 用反斜杠拼 Windows npm 目录布局：'\' 在 Unix 不是路径分隔符，
+    // 整串塌缩成单文件名，vendor 目录扫描必失败——只在 Windows 跑
+    #[cfg(windows)]
     #[test]
     fn finds_native_binary_in_interrupted_npm_extract() {
         let prefix = temp_prefix();
