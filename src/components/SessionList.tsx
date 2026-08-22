@@ -3,7 +3,7 @@ import { formatShort } from "../lib/formatTime";
 import { exportTranscriptMd } from "../lib/api";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { save } from "@tauri-apps/plugin-dialog";
-import type { SessionInfo } from "../types";
+import type { SessionInfo, TerminalAgent } from "../types";
 import { Icon, type IconName } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
 import { useElementSize, useStoredNumber } from "../lib/layoutPreferences";
@@ -42,6 +42,22 @@ function fileName(file: string): string {
 export function sessionId(file: string): string {
   const base = fileName(file);
   return base.endsWith(".jsonl") ? base.slice(0, -6) : base;
+}
+
+/** 「在终端中续聊」的启动参数：按 agent 生成 resume 命令行；
+ *  会话带原始 cwd（Claude）则还原启动目录，否则用 pane 当前目录 */
+export function resumeStart(s: SessionInfo): {
+  agent: TerminalAgent;
+  args: string[];
+  workDir?: string;
+} {
+  const agent: TerminalAgent = s.agent === "codex" ? "codex" : "claude";
+  const id = sessionId(s.file);
+  return {
+    agent,
+    args: agent === "claude" ? ["--resume", id] : ["resume", id],
+    workDir: s.cwd?.trim() || undefined,
+  };
 }
 
 /** 续聊命令（按 agent 生成，可直接粘贴到终端） */

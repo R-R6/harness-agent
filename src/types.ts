@@ -4,6 +4,8 @@ export interface SessionInfo {
   agentLabel: string;
   file: string;
   title?: string; // 会话标题，空则回退文件名
+  /** 会话的原始工作目录（Claude JSONL 记录；Codex 无则缺省） */
+  cwd?: string;
   updated: string;
 }
 

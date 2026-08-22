@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { SessionList, sessionId } from "./components/SessionList";
+import { SessionList, resumeStart } from "./components/SessionList";
 import { TranscriptView } from "./components/TranscriptView";
 import { SearchBox } from "./components/SearchBox";
 import { SupervisePanel } from "./components/SupervisePanel";
@@ -113,14 +113,12 @@ function App() {
 
   const terminalRef = useRef<TerminalWorkspaceHandle>(null);
 
-  /** 会话列表「在终端中续聊」：切到终端工作台，以对应 CLI 的 resume 参数启动。
-   *  工作目录还原（会话 cwd）在阶段 1.5 接入，现阶段用 pane 当前目录。 */
+  /** 会话列表「在终端中续聊」：切到终端工作台，以对应 CLI 的 resume 参数启动；
+   *  会话带原始 cwd（Claude JSONL 记录）则还原该会话的工作目录 */
   const handleResumeInTerminal = useCallback((s: SessionInfo) => {
-    const agent = s.agent === "codex" ? "codex" : "claude";
-    const id = sessionId(s.file);
-    const args = agent === "claude" ? ["--resume", id] : ["resume", id];
+    const start = resumeStart(s);
     setTab("terminals");
-    terminalRef.current?.startWith(agent, { args });
+    terminalRef.current?.startWith(start.agent, { args: start.args, workDir: start.workDir });
   }, []);
 
   // ---- 可调面板宽度（可拖动分割线控制内容密度）----

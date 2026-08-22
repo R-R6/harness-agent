@@ -174,13 +174,15 @@ function listSessions(params) {
     const a = adapters[name];
     if (!a) continue;
     for (const f of a.files().slice(0, n)) {
+      const meta = extractHeadMeta(f.file);
       rows.push({
         agent: name,
         agentLabel: a.label,
         file: f.file,
         // Codex 标题不在 rollout 正文里（桌面端存独立索引），正文取不到时查索引；
         // 仅限 codex——Claude 文件名也是 UUID.jsonl，不能拿去查 Codex 索引
-        title: extractTitle(f.file) || (name === 'codex' ? codexIndexTitle(f.file) : ''),
+        title: meta.title || (name === 'codex' ? codexIndexTitle(f.file) : ''),
+        cwd: meta.cwd,
         updated: localISO(new Date(f.mtime)),
       });
     }
@@ -189,14 +191,17 @@ function listSessions(params) {
   return rows.slice(0, n * 2);
 }
 
-/// 从会话文件头部提取标题（Claude: ai-title/custom-title；Codex 正文从不写标题，
-/// 由 codexIndexTitle 从会话索引反查）。只读文件前 64KB，避免大文件开销；读不到返回空串。
-function extractTitle(file) {
+/// 从会话文件头部提取标题与原始工作目录（只读前 64KB，避免大文件开销）。
+/// cwd 在 Claude 每行 JSONL 都有记录——项目 slug 是有损编码（下划线变连字符）
+/// 无法从路径反解原始目录，续聊/重开必须用它；Codex rollout 正文无 cwd。
+function extractHeadMeta(file) {
   try {
     const fd = fs.openSync(file, 'r');
     const buf = Buffer.alloc(64 * 1024);
     const n = fs.readSync(fd, buf, 0, buf.length, 0);
     fs.closeSync(fd);
+    let title = '';
+    let cwd = '';
     for (const raw of buf.slice(0, n).toString('utf8').split('\n')) {
       if (!raw.trim()) continue;
       let obj;
@@ -206,13 +211,17 @@ function extractTitle(file) {
         continue;
       }
       const t = obj && obj.type;
-      if (t === 'ai-title' && obj.aiTitle) return String(obj.aiTitle).slice(0, 120);
-      if (t === 'custom-title' && obj.customTitle) return String(obj.customTitle).slice(0, 120);
-      if (t === 'session_meta' && obj.title) return String(obj.title).slice(0, 120);
+      if (!title) {
+        if (t === 'ai-title' && obj.aiTitle) title = String(obj.aiTitle).slice(0, 120);
+        else if (t === 'custom-title' && obj.customTitle) title = String(obj.customTitle).slice(0, 120);
+        else if (t === 'session_meta' && obj.title) title = String(obj.title).slice(0, 120);
+      }
+      if (!cwd && obj && typeof obj.cwd === 'string' && obj.cwd) cwd = obj.cwd;
+      if (title && cwd) break;
     }
-    return '';
+    return { title, cwd };
   } catch {
-    return '';
+    return { title: '', cwd: '' };
   }
 }
 
@@ -310,6 +319,7 @@ function searchSessions(params) {
         // 原始全文 includes 会把 custom_tool_call_output（脚本 stdout）、
         // system 提示等搜进来，导致"无关会话"命中（2026-08-13 用户反馈修正）
         let hit = false;
+        let cwd = '';
         for (const raw of text.split('\n')) {
           if (!raw.trim()) continue;
           let obj;
@@ -318,6 +328,7 @@ function searchSessions(params) {
           } catch {
             continue;
           }
+          if (!cwd && obj && typeof obj.cwd === 'string' && obj.cwd) cwd = obj.cwd;
           if (!isSearchableContent(obj)) continue;
           const item = parseEither(obj);
           if (item && item.text && item.text.toLowerCase().includes(kw)) {
@@ -326,8 +337,8 @@ function searchSessions(params) {
           }
         }
         if (!hit) continue;
-        // 与 list_sessions 保持一致：返回 agentLabel（契约一致，2026-08-13 补）
-        hits.push({ agent: name, agentLabel: adapters[name].label, file: f.file, updated: localISO(new Date(f.mtime)) });
+        // 与 list_sessions 保持一致：返回 agentLabel/cwd（契约一致）
+        hits.push({ agent: name, agentLabel: adapters[name].label, file: f.file, cwd, updated: localISO(new Date(f.mtime)) });
         if (hits.length >= n * 2) return hits;
       } catch { /* 跳过读不了的文件 */ }
     }

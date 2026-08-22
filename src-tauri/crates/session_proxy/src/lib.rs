@@ -34,6 +34,10 @@ pub struct SessionInfo {
     /// 会话标题（ai-title/custom-title/session_meta.title），空则前端回退文件名
     #[serde(default)]
     pub title: String,
+    /// 会话的原始工作目录（Claude JSONL 每行记录，续聊时还原启动目录；
+    /// Codex rollout 正文无 cwd 则为空）
+    #[serde(default)]
+    pub cwd: String,
     pub updated: String,
 }
 
@@ -195,12 +199,12 @@ mod tests {
         std::fs::create_dir_all(&claude_dir).unwrap();
         std::fs::create_dir_all(&codex_dir).unwrap();
 
-        // Claude 会话：user + assistant + ai-title
+        // Claude 会话：user + assistant + ai-title（cwd 记录在每行 JSONL）
         let claude_file = claude_dir.join("session-abc.jsonl");
         std::fs::write(
             &claude_file,
-            "{\"type\":\"ai-title\",\"aiTitle\":\"写计算器\"}\n\
-             {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"写个计算器\"}}\n\
+            "{\"type\":\"ai-title\",\"aiTitle\":\"写计算器\",\"cwd\":\"F:\\\\work\\\\proj\"}\n\
+             {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"写个计算器\"},\"cwd\":\"F:\\\\work\\\\proj\"}\n\
              {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"好的，我写一个\"}]}}\n",
         )
         .unwrap();
@@ -316,6 +320,22 @@ mod tests {
             let rows = list_sessions(Some("claude".into()), None).expect("应成功");
             assert!(!rows.is_empty());
             assert!(rows.iter().all(|r| r.agent == "claude"));
+        });
+    }
+
+    /// Claude 会话从 JSONL 头部透出原始工作目录（slug 有损不可反解），
+    /// Codex rollout 正文无 cwd 则为空
+    #[test]
+    fn list_sessions_returns_claude_cwd() {
+        with_fake_sessions(|| {
+            let rows = list_sessions(Some("claude".into()), None).unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r.file.ends_with("session-abc.jsonl"))
+                .expect("找到 claude 会话");
+            assert_eq!(row.cwd, "F:\\work\\proj", "应透出 JSONL 记录的原始 cwd");
+            let codex = list_sessions(Some("codex".into()), None).unwrap();
+            assert!(codex.iter().all(|r| r.cwd.is_empty()));
         });
     }
 

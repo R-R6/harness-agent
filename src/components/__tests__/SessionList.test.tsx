@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { SessionList } from "../SessionList";
+import { SessionList, resumeStart } from "../SessionList";
 import type { SessionInfo } from "../../types";
 
 const mocks = vi.hoisted(() => ({
@@ -314,5 +314,28 @@ describe("SessionList", () => {
     fireEvent.contextMenu(screen.getByText("aaa.jsonl"));
     expect(screen.queryByRole("button", { name: "在终端中续聊" })).not.toBeInTheDocument();
     fireEvent.click(document.body);
+  });
+
+  it("resumeStart：按 agent 生成 resume 参数，有 cwd 还原原始目录", () => {
+    const claudeWithCwd: SessionInfo = {
+      ...sessions[0],
+      cwd: "F:\\proj\\my_skils",
+    };
+    expect(resumeStart(claudeWithCwd)).toEqual({
+      agent: "claude",
+      args: ["--resume", "aaa"],
+      workDir: "F:\\proj\\my_skils",
+    });
+    // 无 cwd：workDir 缺省（回落到 pane 当前目录）
+    expect(resumeStart(sessions[0])).toEqual({
+      agent: "claude",
+      args: ["--resume", "aaa"],
+      workDir: undefined,
+    });
+    expect(resumeStart(sessions[2])).toEqual({
+      agent: "codex",
+      args: ["resume", "rollout-2026-08-13T15-04-04-abc"],
+      workDir: undefined,
+    });
   });
 });
