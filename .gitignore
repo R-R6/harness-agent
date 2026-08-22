@@ -20,6 +20,8 @@ dist-ssr
 /.demo-mock/
 /.demo-real/
 /.supervise/
+# supervise.ps1 -Mock 在脚本旁生成的伪会话数据
+src-tauri/resources/supervise-loop-script/.mock-data/
 __pycache__/
 *.pyc
 

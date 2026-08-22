@@ -35,7 +35,10 @@ param(
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
 
 $ErrorActionPreference = "Stop"
-$script:CLAUDE_PROJECTS = Join-Path $env:USERPROFILE ".claude\projects"
+# $HOME 是 pwsh/PS 内建自动变量，跨平台：Windows 取 %USERPROFILE%，Unix 取 $env:HOME。
+# 不能用 $env:USERPROFILE——Unix pwsh 无此变量，Join-Path $null 直接抛错。
+# 路径分段用嵌套 Join-Path，两平台分隔符都正确。
+$script:CLAUDE_PROJECTS = Join-Path (Join-Path $HOME ".claude") "projects"
 $script:HOOK = "=" * 60
 
 # 任务分级模型常量（Codex #13：默认全 luna；terra 需真实冒烟 `codex exec -m gpt-5.6-terra` 确认可用后启用）
