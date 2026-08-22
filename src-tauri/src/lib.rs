@@ -5,6 +5,7 @@ use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read};
+#[cfg(windows)]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -21,6 +22,46 @@ struct SuperviseState {
     running: Mutex<HashMap<String, std::process::Child>>,
     /// 正在跑监督任务的工作目录（并发锁：同目录只能跑一个）
     busy_workdirs: Mutex<Vec<String>>,
+}
+
+impl SuperviseState {
+    /// 窗口关闭/退出前终止全部监督任务，防止遗留 pwsh/claude/codex 孤儿进程
+    fn stop_all(&self) {
+        let children: Vec<std::process::Child> = {
+            let Ok(mut running) = self.running.lock() else { return };
+            running.drain().map(|(_, c)| c).collect()
+        };
+        for mut child in children {
+            terminate_supervise_child(&mut child);
+        }
+    }
+}
+
+/// 终止一个监督子进程及其全部子孙。
+/// Unix：spawn 时已设独立进程组 → 组 SIGTERM → 宽限 → 组 SIGKILL 扫尾；
+/// Windows：维持既有顺序（杀父 → taskkill /T 收树）
+fn terminate_supervise_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        supervise_runner::terminate_supervise(child);
+    }
+    #[cfg(windows)]
+    {
+        let pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        // 级联清理子进程：taskkill /T（失败无妨——主进程已杀，且某些环境无 taskkill）
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 // ---------------- 本机 CLI 终端状态（ConPTY） ----------------
@@ -116,6 +157,7 @@ fn emit_terminal_output(
 /// taskkill /T /F 杀掉整棵进程树（含 PTY 主进程）。
 /// 必须在父进程还活着时调用——父进程先死后 taskkill 枚举不到子树，
 /// 子孙进程会变成孤儿继续存活。目标进程已退出（taskkill 报"没有找到进程"）视为成功。
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn kill_process_tree(pid: Option<u32>) -> Result<(), String> {
     let Some(pid) = pid else { return Ok(()) };
     #[cfg(windows)]
@@ -392,20 +434,20 @@ async fn run_supervise(
 #[tauri::command]
 async fn cancel_supervise(app: AppHandle, task_id: String) -> Result<(), String> {
     let state = app.state::<SuperviseState>();
-    let mut running = state.running.lock().unwrap();
-    if let Some(mut c) = running.remove(&task_id) {
-        let pid = c.id();
-        let _ = c.kill();
-        let _ = c.wait();
-        // 级联清理子进程：taskkill /T（失败无妨——主进程已杀，且某些环境无 taskkill）
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        return Ok(());
+    // 短锁：只摘除 entry。终止流程含最多数秒的宽限等待，持锁做会卡死
+    // run_supervise 的 insert 与 reader 线程的收尾清理
+    let mut child = state
+        .running
+        .lock()
+        .map_err(|_| "监督状态锁已损坏")?
+        .remove(&task_id);
+    match child.as_mut() {
+        Some(c) => {
+            terminate_supervise_child(c);
+            Ok(())
+        }
+        None => Err("任务不存在或已结束".into()),
     }
-    Err("任务不存在或已结束".into())
 }
 
 /// 读取监督闭环产物（.supervise 目录）
@@ -506,6 +548,8 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 window.state::<TerminalState>().stop_all();
+                // 监督任务同样清理：不清理会留 pwsh/claude/codex 孤儿继续烧 API 额度
+                window.state::<SuperviseState>().stop_all();
             }
         })
         .run(tauri::generate_context!())
