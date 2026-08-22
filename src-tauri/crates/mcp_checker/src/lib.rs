@@ -82,8 +82,15 @@ fn server_js_path() -> PathBuf {
     )
 }
 
-/// codex-code-mode-host.exe 定位：环境变量 HARNESS_CODEX_HOST_EXE 覆盖 →
-/// 任一 codex CLI（where/which 可能返回多个：npm shim 与真实安装）所在目录的同名文件
+/// codex 宿主二进制文件名：Windows 带 .exe 后缀，Unix 无（同一 npm 包的平台差异）
+const CODEX_HOST_BIN: &str = if cfg!(windows) {
+    "codex-code-mode-host.exe"
+} else {
+    "codex-code-mode-host"
+};
+
+/// codex 宿主二进制定位：环境变量 HARNESS_CODEX_HOST_EXE 覆盖 →
+/// 逐个检查 which/where 返回的 codex CLI 所在位置（npm shim 与真实安装）旁的同名文件
 /// （Codex ≥0.147 需要）
 fn locate_host_exe() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("HARNESS_CODEX_HOST_EXE") {
@@ -99,11 +106,56 @@ fn locate_host_exe() -> Option<PathBuf> {
     text.lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter_map(|codex| {
-            let exe = Path::new(codex).parent()?.join("codex-code-mode-host.exe");
-            exe.exists().then_some(exe)
-        })
+        .filter_map(|codex| host_exe_near(Path::new(codex)))
         .next()
+}
+
+/// 在 codex 可执行文件旁定位宿主二进制：
+/// ① 同目录同名文件；② Unix 的 npm bin 是指向包内脚本的符号链接，宿主实际在
+/// 平台子包 node_modules/@openai/codex-*/vendor/<target>/bin/ 下（canonicalize 后搜包根）
+fn host_exe_near(codex: &Path) -> Option<PathBuf> {
+    if let Some(dir) = codex.parent() {
+        let sibling = dir.join(CODEX_HOST_BIN);
+        if sibling.exists() {
+            return Some(sibling);
+        }
+    }
+    host_exe_via_symlink(codex)
+}
+
+/// Unix 布局：shim → <pkg>/bin/<脚本>，宿主在平台子包 vendor 目录；
+/// Windows npm 布局同目录即命中，走不到这里
+#[cfg(not(windows))]
+fn host_exe_via_symlink(codex: &Path) -> Option<PathBuf> {
+    let real = codex.canonicalize().ok()?;
+    // real = <pkg>/bin/<脚本> → 包根 = 上两级
+    let pkg_root = real.parent().and_then(|bin| bin.parent())?;
+    host_exe_in_platform_vendor(pkg_root)
+}
+
+#[cfg(windows)]
+fn host_exe_via_symlink(_codex: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// 平台子包（codex-darwin-arm64 / codex-win32-x64 等）的 vendor/<target>/bin/ 里找宿主二进制
+fn host_exe_in_platform_vendor(pkg_root: &Path) -> Option<PathBuf> {
+    let scope = pkg_root.join("node_modules").join("@openai");
+    for entry in std::fs::read_dir(scope).ok()?.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("codex-") {
+            continue;
+        }
+        let Ok(platforms) = std::fs::read_dir(entry.path().join("vendor")) else {
+            continue;
+        };
+        for plat in platforms.flatten() {
+            let candidate = plat.path().join("bin").join(CODEX_HOST_BIN);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 // ---------------- 检查 ----------------
@@ -227,11 +279,11 @@ pub fn check_mcp(config_path: &str) -> McpStatus {
         },
     });
 
-    // 7. 宿主 exe 存在（0.147 需 codex-code-mode-host.exe；从 codex CLI 同目录定位）
+    // 7. 宿主二进制存在（0.147 需 codex-code-mode-host[.exe]；从 codex CLI 同目录定位）
     let host_exe = locate_host_exe();
     let host_exe_exists = host_exe.is_some();
     items.push(CheckItem {
-        name: "codex-code-mode-host.exe 在位".into(),
+        name: format!("{CODEX_HOST_BIN} 在位"),
         ok: host_exe_exists,
         detail: match &host_exe {
             Some(p) => p.to_string_lossy().to_string(),
