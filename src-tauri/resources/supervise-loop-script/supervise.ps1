@@ -29,6 +29,11 @@ param(
   [string]$ReviewPrompt = ""
 )
 
+# 中文 Windows 默认 OEM 代码页(936)：管道 stdout 会编码成 GBK，宿主侧按 UTF-8 解码
+# 即失败丢行。进程一启动就强制 stdout 走 UTF-8（无 BOM）。无控制台句柄时 setter
+# 可能抛异常（GUI 宿主直接 spawn），降级为系统默认，行为与旧版一致。
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
+
 $ErrorActionPreference = "Stop"
 $script:CLAUDE_PROJECTS = Join-Path $env:USERPROFILE ".claude\projects"
 $script:HOOK = "=" * 60

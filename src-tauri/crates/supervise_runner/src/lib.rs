@@ -322,9 +322,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let fake_script = tmp.join("fake-supervise.ps1");
+        // fake 脚本必须与真实 supervise.ps1 契约对齐：stdout 走 UTF-8（真实脚本
+        // 头部已强制 [Console]::OutputEncoding=UTF8）。缺这行中文会按 OEM 代码页
+        // 936 编码，Rust 侧 UTF-8 解码失败、中文行丢失
         std::fs::write(
             &fake_script,
             "param([string]$Task,[string]$WorkDir,[switch]$Mock,[string]$Level)\n\
+             try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}\n\
              Write-Output \"TASK=$Task\"\n\
              Write-Output \"WORKDIR=$WorkDir\"\n\
              Write-Output \"MOCK=$Mock\"\n\
