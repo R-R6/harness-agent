@@ -261,6 +261,55 @@ mod tests {
         });
     }
 
+    /// Codex 标题不在 rollout 正文里，由 server.js 从 CODEX_ROOT 父目录的
+    /// session_index.jsonl 反查（文件名 UUID ↔ 索引 id ↔ thread_name）
+    #[test]
+    fn list_sessions_uses_codex_index_title() {
+        with_fake_sessions(|| {
+            let codex_root =
+                std::env::var("AGENT_SESSIONS_CODEX_ROOT").expect("闭包内 env 已设置");
+            // 索引文件在 CODEX_ROOT 的父目录（模拟 ~/.codex/session_index.jsonl 布局）
+            let index = std::path::Path::new(&codex_root)
+                .parent()
+                .unwrap()
+                .join("session_index.jsonl");
+            std::fs::write(
+                &index,
+                concat!(
+                    "{\"id\":\"0199abcd-0000-7000-8000-00000000abcd\",\"thread_name\":\"索引旧名\"}\n",
+                    "坏行不是 JSON\n",
+                    "{\"id\":\"0199abcd-0000-7000-8000-00000000abcd\",\"thread_name\":\"索引标题-重命名后\"}\n",
+                ),
+            )
+            .unwrap();
+            let rollout = std::path::Path::new(&codex_root)
+                .join("2026")
+                .join("08")
+                .join("13")
+                .join("rollout-2026-08-13T00-00-00-0199abcd-0000-7000-8000-00000000abcd.jsonl");
+            std::fs::write(
+                &rollout,
+                "{\"type\":\"session_meta\",\"payload\":{}}\n",
+            )
+            .unwrap();
+
+            let rows = list_sessions(Some("codex".into()), Some(50)).expect("应成功");
+            let uuid_row = rows
+                .iter()
+                .find(|r| r.file.contains("0199abcd"))
+                .expect("找到 UUID 命名的 codex 会话");
+            assert_eq!(
+                uuid_row.title, "索引标题-重命名后",
+                "标题应取索引里最新 thread_name"
+            );
+            let plain = rows
+                .iter()
+                .find(|r| r.file.ends_with("rollout-test.jsonl"))
+                .expect("找到无 UUID 的 codex 会话");
+            assert_eq!(plain.title, "", "无 UUID 文件不查索引，回退空标题");
+        });
+    }
+
     #[test]
     fn list_sessions_filters_by_agent() {
         with_fake_sessions(|| {

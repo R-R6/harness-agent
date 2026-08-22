@@ -178,7 +178,9 @@ function listSessions(params) {
         agent: name,
         agentLabel: a.label,
         file: f.file,
-        title: extractTitle(f.file),   // 会话标题（列表展示用，空则前端回退文件名）
+        // Codex 标题不在 rollout 正文里（桌面端存独立索引），正文取不到时查索引；
+        // 仅限 codex——Claude 文件名也是 UUID.jsonl，不能拿去查 Codex 索引
+        title: extractTitle(f.file) || (name === 'codex' ? codexIndexTitle(f.file) : ''),
         updated: localISO(new Date(f.mtime)),
       });
     }
@@ -187,8 +189,8 @@ function listSessions(params) {
   return rows.slice(0, n * 2);
 }
 
-/// 从会话文件头部提取标题（Claude: ai-title/custom-title；Codex: session_meta.title）。
-/// 只读文件前 64KB，避免大文件开销；读不到返回空串。
+/// 从会话文件头部提取标题（Claude: ai-title/custom-title；Codex 正文从不写标题，
+/// 由 codexIndexTitle 从会话索引反查）。只读文件前 64KB，避免大文件开销；读不到返回空串。
 function extractTitle(file) {
   try {
     const fd = fs.openSync(file, 'r');
@@ -212,6 +214,52 @@ function extractTitle(file) {
   } catch {
     return '';
   }
+}
+
+/// Codex 桌面端的会话标题存在独立索引 ~/.codex/session_index.jsonl
+/// （每行 {"id":<会话UUID>,"thread_name":…}），rollout 正文里没有。
+/// 按 CODEX_ROOT 父目录推导索引路径，用文件名尾部的会话 UUID 反查标题。
+/// 索引缺失/坏行/无匹配均静默返回空串（老会话与非桌面端创建的会话本就不在索引里，
+/// 前端回退显示文件名是预期行为）。同一 id 出现多行（重命名）时后行覆盖——取最新名。
+
+// 一次 list_sessions 会对多个 rollout 反查标题，索引只读解析一次；
+// mtime+size 变化才重读（server 按 RPC 调用 spawn，缓存生命周期即单次调用）
+let codexIndexCache = null; // { mtimeMs, size, map: Map<id, thread_name> }
+
+function codexIndexMap() {
+  try {
+    const p = path.join(path.dirname(CODEX_ROOT), 'session_index.jsonl');
+    const st = fs.statSync(p);
+    if (codexIndexCache && codexIndexCache.mtimeMs === st.mtimeMs && codexIndexCache.size === st.size) {
+      return codexIndexCache.map;
+    }
+    let raw = fs.readFileSync(p, 'utf8');
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1); // 防 BOM 吞掉首行标题
+    const map = new Map();
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const o = JSON.parse(line);
+        if (o && typeof o.id === 'string' && typeof o.thread_name === 'string') {
+          map.set(o.id, String(o.thread_name)); // 顺序遍历，后行覆盖 → 重命名后取新名
+        }
+      } catch {
+        // 坏行跳过，与 extractTitle 同样的容错
+      }
+    }
+    codexIndexCache = { mtimeMs: st.mtimeMs, size: st.size, map };
+    return map;
+  } catch {
+    return new Map(); // 索引缺失（老版本 Codex / 测试伪造目录）：降级为空表
+  }
+}
+
+function codexIndexTitle(file) {
+  const m = path.basename(file).match(
+    /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/
+  );
+  if (!m) return '';
+  return (codexIndexMap().get(m[1]) || '').slice(0, 120);
 }
 
 function getTranscript(params) {
