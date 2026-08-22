@@ -5,5 +5,6 @@ description = "Codex MCP 注册健康检查：toml 结构化检查 + 最小侵�
 edition = "2021"
 
 [dependencies]
+path_util = { path = "../path_util" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

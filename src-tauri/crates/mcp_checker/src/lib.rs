@@ -8,9 +8,15 @@
 //! 2. `fix_mcp`：**最小侵入修复**（备份 + 行级插入缺失项 + 原子写），
 //!    保留用户 config.toml 里所有其他内容与注释（不用 toml::Value 往返，
 //!    因为序列化会丢注释/重排整个文件，破坏用户配置）
+//!
+//! 注意：本 crate 检查的是 **Codex 生态**在 ~/.codex/config.toml 里注册的
+//! agent-sessions MCP：检查以 config 实际注册内容为准；fix_mcp 写入的 server.js
+//! 默认取 Harness 内置副本（resources/agent-sessions-mcp/server.js，三级解析），
+//! 在只安装了 Harness、没有 mcp-lab 仓库的机器上也能完成修复。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -40,11 +46,65 @@ pub struct FixResult {
     pub message: String,
 }
 
-// ---------------- 常量 ----------------
+// ---------------- 路径定位 ----------------
 
-pub const DEFAULT_CONFIG: &str = "C:\\Users\\admin\\.codex\\config.toml";
-pub const SERVER_JS: &str = "F:\\project\\workspace-side\\mcp-lab\\agent-sessions-mcp\\server.js";
-pub const HOST_EXE: &str = "F:\\develop_soft\\IDE\\codex_cli\\codex-code-mode-host.exe";
+/// ~/.codex/config.toml 默认路径（跟随当前用户 home，不硬编码任何机器）
+pub fn default_config_path() -> String {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    Path::new(&home)
+        .join(".codex")
+        .join("config.toml")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// 修复时写入 args 的 server.js 路径（三级解析，与 session_proxy 同规则）：
+/// 1. 环境变量 HARNESS_MCP_SERVER（测试/调试覆盖）
+/// 2. tauri setup 注入的打包资源路径（发布/开发）
+/// 3. 兜底：仓库内副本（cargo test 无注入时的默认值）
+static SERVER_JS: OnceLock<PathBuf> = OnceLock::new();
+
+/// 由 tauri 启动时注入打包资源目录里的真实 server.js 路径
+pub fn set_server_js(path: PathBuf) {
+    let _ = SERVER_JS.set(path);
+}
+
+fn server_js_path() -> PathBuf {
+    path_util::resolve_script(
+        "HARNESS_MCP_SERVER",
+        SERVER_JS.get(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/agent-sessions-mcp/server.js"
+        ),
+    )
+}
+
+/// codex-code-mode-host.exe 定位：环境变量 HARNESS_CODEX_HOST_EXE 覆盖 →
+/// 任一 codex CLI（where/which 可能返回多个：npm shim 与真实安装）所在目录的同名文件
+/// （Codex ≥0.147 需要）
+fn locate_host_exe() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os("HARNESS_CODEX_HOST_EXE") {
+        let p = PathBuf::from(v);
+        return p.exists().then_some(p);
+    }
+    let which = if cfg!(windows) { "where" } else { "which" };
+    let out = Command::new(which).arg("codex").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|codex| {
+            let exe = Path::new(codex).parent()?.join("codex-code-mode-host.exe");
+            exe.exists().then_some(exe)
+        })
+        .next()
+}
 
 // ---------------- 检查 ----------------
 
@@ -69,6 +129,8 @@ pub fn check_mcp(config_path: &str) -> McpStatus {
     let mut type_ok = false;
     let mut cmd_ok = false;
     let mut args_ok = false;
+    // config 实际注册的 server.js 路径（第 6 项检查与握手都以它为准）
+    let mut registered_server: Option<String> = None;
     if cfg_exists {
         match std::fs::read_to_string(config_path) {
             Ok(raw) => match raw.parse::<toml::Value>() {
@@ -93,6 +155,16 @@ pub fn check_mcp(config_path: &str) -> McpStatus {
                             })
                         })
                         .unwrap_or(false);
+                    registered_server = section
+                        .and_then(|s| s.get("args"))
+                        .and_then(|a| a.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find_map(|x| {
+                                x.as_str()
+                                    .filter(|s| s.contains("server.js"))
+                                    .map(str::to_string)
+                            })
+                        });
                 }
                 Err(e) => items.push(CheckItem {
                     name: "config.toml 可解析".into(),
@@ -137,36 +209,38 @@ pub fn check_mcp(config_path: &str) -> McpStatus {
         detail: if args_ok {
             "server.js 在启动参数中".into()
         } else {
-            format!("缺失（应为 {SERVER_JS}）")
+            "缺失（修复将补上指向内置 server.js 的参数）".into()
         },
     });
 
-    // 6. server.js 存在
-    let server_js_exists = Path::new(SERVER_JS).exists();
+    // 6. server.js 存在（以 config 实际注册的路径为准，未注册则看内置副本）
+    let default_server = server_js_path().to_string_lossy().to_string();
+    let effective_server = registered_server.unwrap_or_else(|| default_server.clone());
+    let server_js_exists = Path::new(&effective_server).exists();
     items.push(CheckItem {
         name: "server.js 存在".into(),
         ok: server_js_exists,
         detail: if server_js_exists {
-            SERVER_JS.into()
+            effective_server.clone()
         } else {
-            format!("缺失: {SERVER_JS}")
+            format!("缺失: {effective_server}（修复将改指向内置副本 {default_server}）")
         },
     });
 
-    // 7. 宿主 exe 存在（0.147 需 codex-code-mode-host.exe）
-    let host_exe_exists = Path::new(HOST_EXE).exists();
+    // 7. 宿主 exe 存在（0.147 需 codex-code-mode-host.exe；从 codex CLI 同目录定位）
+    let host_exe = locate_host_exe();
+    let host_exe_exists = host_exe.is_some();
     items.push(CheckItem {
         name: "codex-code-mode-host.exe 在位".into(),
         ok: host_exe_exists,
-        detail: if host_exe_exists {
-            HOST_EXE.into()
-        } else {
-            format!("缺失: {HOST_EXE}")
+        detail: match &host_exe {
+            Some(p) => p.to_string_lossy().to_string(),
+            None => "未找到（可用环境变量 HARNESS_CODEX_HOST_EXE 指定路径）".into(),
         },
     });
 
-    // 8. 真实握手（spawn node server.js 发 initialize）
-    let handshake_ok = verify_handshake();
+    // 8. 真实握手（对实际生效的 server.js 发 initialize）
+    let handshake_ok = verify_handshake(&effective_server);
 
     McpStatus {
         config_path: config_path.to_string(),
@@ -178,11 +252,11 @@ pub fn check_mcp(config_path: &str) -> McpStatus {
 }
 
 /// 真实 MCP 握手：spawn node server.js，发 initialize，期待成功响应
-pub fn verify_handshake() -> bool {
+pub fn verify_handshake(server: &str) -> bool {
     let node = std::env::var("HARNESS_NODE_PATH").unwrap_or_else(|_| "node".to_string());
-    let server = std::env::var("HARNESS_MCP_SERVER").unwrap_or_else(|_| SERVER_JS.to_string());
+    let server = path_util::strip_verbatim(PathBuf::from(server));
     let mut child = match Command::new(node)
-        .arg(server)
+        .arg(&server)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -225,6 +299,8 @@ pub fn verify_handshake() -> bool {
 /// 修复缺失项：备份 → 行级插入缺失部分 → 原子写。
 /// 保留 config.toml 其他所有内容与注释（不用 toml 序列化往返）。
 pub fn fix_mcp(config_path: &str) -> FixResult {
+    // 修复时写入的 server.js：三级解析出的内置副本（用户机器上唯一保证存在的）
+    let server_js = server_js_path().to_string_lossy().to_string();
     let mut fixed = vec![];
     let raw = match std::fs::read_to_string(config_path) {
         Ok(r) => r,
@@ -283,7 +359,7 @@ pub fn fix_mcp(config_path: &str) -> FixResult {
                 "[mcp_servers.agent-sessions]".into(),
                 "type = \"stdio\"".into(),
                 "command = \"node\"".into(),
-                format!("args = ['{SERVER_JS}']"),
+                format!("args = ['{server_js}']"),
             ];
             // 找段内最后一个非空行（避免插到段中间）
             let mut insert_at = i + 1;
@@ -303,7 +379,7 @@ pub fn fix_mcp(config_path: &str) -> FixResult {
             lines.push("[mcp_servers.agent-sessions]".into());
             lines.push("type = \"stdio\"".into());
             lines.push("command = \"node\"".into());
-            lines.push(format!("args = ['{SERVER_JS}']"));
+            lines.push(format!("args = ['{server_js}']"));
             fixed.push("追加 [mcp_servers.agent-sessions] 注册段".into());
         }
     } else {
@@ -324,7 +400,7 @@ pub fn fix_mcp(config_path: &str) -> FixResult {
                 fixed.push("补 command".into());
             }
             if missing_args {
-                lines.insert(insert_at, format!("args = ['{SERVER_JS}']"));
+                lines.insert(insert_at, format!("args = ['{server_js}']"));
                 fixed.push("补 args".into());
             }
         }
@@ -400,7 +476,7 @@ mod tests {
              [mcp_servers.agent-sessions]\n\
              type = \"stdio\"\n\
              command = \"node\"\n\
-             args = ['F:\\project\\workspace-side\\mcp-lab\\agent-sessions-mcp\\server.js']\n",
+             args = ['C:\\tools\\agent-sessions-mcp\\server.js']\n",
         )
         .unwrap();
         let s = check_mcp(&cfg.to_string_lossy());
@@ -496,6 +572,76 @@ mod tests {
         .unwrap();
         let r = fix_mcp(&cfg.to_string_lossy());
         assert!(!r.ok, "健康时不应改动: {:?}", r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 默认 config 路径必须动态跟随当前用户 home（而非硬编码某台机器）
+    #[test]
+    fn default_config_follows_user_home() {
+        let fake = std::env::temp_dir().join("fake-home");
+        let old_userprofile = std::env::var("USERPROFILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("USERPROFILE", &fake);
+        std::env::remove_var("HOME");
+
+        let p = default_config_path();
+
+        match old_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let expected = fake.join(".codex").join("config.toml");
+        assert_eq!(p, expected.to_string_lossy());
+    }
+
+    /// fix 写入的必须是三级解析出的内置副本路径（无 mcp-lab 的机器也要可用）
+    #[test]
+    fn fix_registers_bundled_server_path() {
+        let (dir, cfg) = tmp_file("fixpath");
+        std::fs::write(&cfg, "[mcp_servers]\n").unwrap();
+        let r = fix_mcp(&cfg.to_string_lossy());
+        assert!(r.ok, "应修复: {:?}", r);
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        let bundled = server_js_path().to_string_lossy().to_string();
+        assert!(
+            after.contains(&bundled),
+            "args 应写入内置副本路径 {bundled}: {after}"
+        );
+        assert!(
+            Path::new(&bundled).exists(),
+            "内置副本在仓库中必须真实存在: {bundled}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// check 的 server.js 存在性以 config 实际注册路径为准（而非内置常量）
+    #[test]
+    fn check_uses_registered_server_path() {
+        let (dir, cfg) = tmp_file("regpath");
+        let missing = r"C:\definitely\not\here\server.js";
+        std::fs::write(
+            &cfg,
+            format!(
+                "[mcp_servers.agent-sessions]\n\
+                 type = \"stdio\"\n\
+                 command = \"node\"\n\
+                 args = ['{missing}']\n"
+            ),
+        )
+        .unwrap();
+        let s = check_mcp(&cfg.to_string_lossy());
+        let item = s.items.iter().find(|i| i.name.contains("server.js 存在")).unwrap();
+        assert!(!item.ok, "注册路径不存在必须检出: {:?}", item);
+        assert!(
+            item.detail.contains("definitely"),
+            "detail 应指向实际注册路径: {:?}",
+            item.detail
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

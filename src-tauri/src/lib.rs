@@ -1,4 +1,4 @@
-// 会话数据代理：复用 mcp-lab 的 agent-sessions-mcp (server.js)（独立 crate：crates/session_proxy）
+// 会话数据代理：内置 agent-sessions-mcp (server.js)，资源路径由 setup 注入（独立 crate：crates/session_proxy）
 use session_proxy::{SessionInfo, TranscriptEntry};
 use supervise_runner::{ReviewArtifact, SuperviseRequest};
 use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command, wait as wait_terminal_process, write_input as write_terminal_input};
@@ -403,13 +403,13 @@ async fn read_review_artifacts(work_dir: String) -> Result<Vec<ReviewArtifact>, 
 /// MCP 注册健康检查（toml 结构化解析 + 真实握手）
 #[tauri::command]
 async fn check_mcp() -> Result<mcp_checker::McpStatus, String> {
-    Ok(mcp_checker::check_mcp(mcp_checker::DEFAULT_CONFIG))
+    Ok(mcp_checker::check_mcp(&mcp_checker::default_config_path()))
 }
 
 /// MCP 一键修复（备份 + 最小侵入插入缺失项 + 原子写）
 #[tauri::command]
 async fn fix_mcp() -> Result<mcp_checker::FixResult, String> {
-    Ok(mcp_checker::fix_mcp(mcp_checker::DEFAULT_CONFIG))
+    Ok(mcp_checker::fix_mcp(&mcp_checker::default_config_path()))
 }
 
 /// 导出会话正文为 Markdown 文件（右键菜单功能）
@@ -456,6 +456,23 @@ pub fn run() {
         })
         .manage(TerminalState {
             sessions: Mutex::new(HashMap::new()),
+        })
+        .setup(|app| {
+            // 注入打包资源里的 server.js / supervise.ps1 路径（发布/开发均来自
+            // BaseDirectory::Resource，即 exe 同级目录；替代旧的 mcp-lab 绝对路径）
+            let server_js = app.path().resolve(
+                "resources/agent-sessions-mcp/server.js",
+                tauri::path::BaseDirectory::Resource,
+            )?;
+            session_proxy::set_server_js(server_js.clone());
+            // mcp_checker 修复注册时写入同一个内置副本路径
+            mcp_checker::set_server_js(server_js);
+            let supervise_ps1 = app.path().resolve(
+                "resources/supervise-loop-script/supervise.ps1",
+                tauri::path::BaseDirectory::Resource,
+            )?;
+            supervise_runner::set_supervise_script(supervise_ps1);
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
