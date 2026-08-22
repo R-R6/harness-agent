@@ -501,6 +501,46 @@ async fn export_transcript_md(file: String, dest: String) -> Result<String, Stri
 
 // ---------------- 入口 ----------------
 
+/// GUI 直启（Finder/Dock 启动 .app）继承的是 launchd 的最小 PATH（/usr/bin:/bin:…），
+/// 找不到 /opt/homebrew/bin 的 pwsh/node 与用户级 npm bin 的 claude/codex。
+/// 采集一次登录交互 shell 的 PATH（-i 补读 ~/.zshrc——nvm 等常把导出写在 zshrc），
+/// 把缺失条目追加进当前进程 PATH；此后所有子进程（PTY 终端 / session_proxy /
+/// mcp_checker / supervise）经环境继承全部生效。失败静默保持现状（dev 模式本就
+/// 继承开发 shell 的完整 PATH，合并幂等无害）。
+#[cfg(unix)]
+fn augment_path_from_login_shell() {
+    use std::process::{Command, Stdio};
+    let Ok(out) = Command::new("/bin/zsh")
+        .arg("-ilc")
+        .arg("printf %s \"$PATH\"")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let login_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if login_path.is_empty() {
+        return;
+    }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let have: Vec<_> = std::env::split_paths(&current).collect();
+    let mut merged = have.clone();
+    for dir in std::env::split_paths(&login_path) {
+        if !merged.contains(&dir) {
+            merged.push(dir);
+        }
+    }
+    if merged != have {
+        if let Ok(joined) = std::env::join_paths(merged) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -514,6 +554,9 @@ pub fn run() {
             sessions: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
+            // GUI 直启时 PATH 不含 homebrew/npm 全局 bin，先补齐（见函数注释）
+            #[cfg(unix)]
+            augment_path_from_login_shell();
             // 注入打包资源里的 server.js / supervise.ps1 路径（发布/开发均来自
             // BaseDirectory::Resource，即 exe 同级目录；替代旧的 mcp-lab 绝对路径）
             let server_js = app.path().resolve(
