@@ -202,6 +202,9 @@ pub fn read_artifacts(work_dir: &str) -> Result<Vec<ReviewArtifact>, String> {
 
 /// 解析 review-N.md 文本 → ReviewArtifact（容错：解析失败返回 None）
 fn parse_review_md(text: &str) -> Option<ReviewArtifact> {
+    // supervise.ps1 写 md 固定带 UTF-8 BOM（UTF8Encoding($true)）；不剥掉则
+    // 首行 "# 第 N 轮" 被 BOM 顶住，starts_with 匹配失败、整个解析返回 None
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let round = text
         .lines()
         .find(|l| l.starts_with("# 第"))
@@ -301,9 +304,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let sup = tmp.join(".supervise");
         std::fs::create_dir_all(&sup).unwrap();
+        // fixture 带 UTF-8 BOM，与 supervise.ps1 的真实产物一致（UTF8Encoding($true)）
         std::fs::write(
             sup.join("review-1.md"),
-            "# 第 1 轮审查意见\n\n- 判定：PASS\n- 审查模型：gpt-5.6-luna\n- 会话：mock-9\n\n## 意见\n\n一次通过。\n",
+            "\u{feff}# 第 1 轮审查意见\n\n- 判定：PASS\n- 审查模型：gpt-5.6-luna\n- 会话：mock-9\n\n## 意见\n\n一次通过。\n",
         )
         .unwrap();
         let arts = read_artifacts(&tmp.to_string_lossy()).expect("解析成功");
@@ -311,6 +315,17 @@ mod tests {
         assert_eq!(arts[0].verdict, "PASS");
         assert_eq!(arts[0].session_id, "mock-9");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// supervise.ps1 的 md 产物固定带 BOM；不剥掉时首行 "# 第 N 轮" 匹配失败，
+    /// final-report.json 缺失（脚本中途崩溃）时兜底解析会整体失效
+    #[test]
+    fn parse_review_md_strips_bom_from_real_artifact() {
+        let md = "\u{feff}# 第 2 轮审查意见\n\n- 判定：REVIEW\n- 审查模型：gpt-5.6-luna\n- 会话：mock-2\n\n## 意见\n\n缺少测试。\n";
+        let a = parse_review_md(md).expect("带 BOM 的真实产物必须可解析");
+        assert_eq!(a.round, 2);
+        assert_eq!(a.verdict, "REVIEW");
+        assert!(a.reason.contains("缺少测试"));
     }
 
     // ---- 进程桥（fake ps1 fixture） ----
