@@ -144,6 +144,22 @@ describe("SupervisePanel", () => {
     expect(req.mock).toBe(false);
   });
 
+  it("勾选「驱动 Claude 终端」→ 调用 run_supervise_terminal", async () => {
+    mocks.invoke.mockResolvedValue("task-8");
+    renderPanel("D:\\work");
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务B");
+    await userEvent.click(screen.getByLabelText("驱动 Claude 终端"));
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    expect(mocks.invoke).toHaveBeenCalledWith("run_supervise_terminal", {
+      request: {
+        task: "任务B",
+        work_dir: "D:\\work",
+        level: "L1",
+        mock: true,
+      },
+    });
+  });
+
   it("收到 supervise-log 事件 → 渲染日志行", async () => {
     // 捕获 listen 注册的回调
     let logHandler: ((e: { payload: { taskId: string; line: string } }) => void) | undefined;

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { cancelSupervise, runSupervise } from "../lib/api";
+import { cancelSupervise, runSupervise, runSuperviseTerminal } from "../lib/api";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -24,6 +24,7 @@ export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningC
   const [task, setTask] = useState("");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
+  const [driveTerminal, setDriveTerminal] = useState(false);
   const [runningTask, setRunningTask] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [error, setError] = useState("");
@@ -73,12 +74,15 @@ export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningC
       return;
     }
     try {
-      const taskId = await runSupervise({
+      const req = {
         task: task.trim(),
         work_dir: workDir.trim(),
         level,
         mock,
-      });
+      };
+      const taskId = driveTerminal
+        ? await runSuperviseTerminal(req)
+        : await runSupervise(req);
       // 启动即上报目录（非 done 时）：闭包取的是当前 props，避免过期值；
       // 审查看板从任务运行起就指向正确目录
       onStarted(workDir.trim());
@@ -154,6 +158,14 @@ export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningC
               onChange={(e) => setMock(e.currentTarget.checked)}
             />
             模拟模式（不花钱）
+          </label>
+          <label className="checkbox" title="任务注入运行中的 Claude 终端 pane：干活全程可见、可随时插手；需先在终端工作台以该目录启动 Claude CLI">
+            <input
+              type="checkbox"
+              checked={driveTerminal}
+              onChange={(e) => setDriveTerminal(e.currentTarget.checked)}
+            />
+            驱动 Claude 终端
           </label>
         </div>
         {error && <div className="error">{error}</div>}
