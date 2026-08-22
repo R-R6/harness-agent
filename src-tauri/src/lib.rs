@@ -331,6 +331,9 @@ async fn run_supervise(
     let mut child = supervise_runner::spawn_supervise(&request)?;
     let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
     let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
+    // stderr 必须有人消费：写满管道缓冲会挂死子进程（busy_workdirs 永不清理）。
+    // 逐行并入 supervise-log（带 [stderr] 前缀），诊断信息直接进 UI 日志流。
+    let stderr = child.stderr.take();
     {
         state.running.lock().unwrap().insert(task_id.clone(), child);
         state.busy_workdirs.lock().unwrap().push(work_dir.clone());
@@ -370,6 +373,17 @@ async fn run_supervise(
             serde_json::json!({ "taskId": task_id2, "exitCode": exit_code }),
         );
     });
+
+    if let Some(stderr) = stderr {
+        let app3 = app.clone();
+        let task_id3 = task_id.clone();
+        supervise_runner::drain_stderr(stderr, move |line| {
+            let _ = app3.emit(
+                "supervise-log",
+                serde_json::json!({ "taskId": task_id3, "line": format!("[stderr] {line}") }),
+            );
+        });
+    }
 
     Ok(task_id)
 }

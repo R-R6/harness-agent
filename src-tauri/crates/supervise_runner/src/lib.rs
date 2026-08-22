@@ -141,6 +141,23 @@ pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
         .map_err(|e| format!("spawn pwsh 失败（请确认 PowerShell 可用）: {e}"))
 }
 
+/// 后台线程消费子进程 stderr，逐行回调。
+/// stderr 管道若无人读取，子进程写满系统管道缓冲（Windows 4-64KB）后会阻塞在
+/// stderr 写入上——整个监督任务挂死、busy_workdirs 永不清理、该目录被永久锁死。
+pub fn drain_stderr<F>(stderr: std::process::ChildStderr, on_line: F)
+where
+    F: Fn(String) + Send + 'static,
+{
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines() {
+            if let Ok(l) = line {
+                on_line(l);
+            }
+        }
+    });
+}
+
 // ---------------- 产物解析 ----------------
 
 /// 读 .supervise 目录产物：
@@ -381,6 +398,91 @@ mod tests {
         assert!(out.contains("LEVEL=L2"), "含 Level: {out}");
         // Mock 是 switch：传了 -Mock 时输出 "MOCK=True"
         assert!(out.contains("MOCK=True"), "含 Mock: {out}");
+
+        match old_script {
+            Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),
+            None => std::env::remove_var("HARNESS_SUPERVISE_SCRIPT"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// stderr 管道必须有人消费：子进程写超过管道缓冲（4-64KB）的 stderr 时，
+    /// 无人读取会导致子进程阻塞在写入上永远不退出。drain_stderr 消费后子进程
+    /// 正常退出且逐行回调不丢首尾行。
+    #[test]
+    fn drain_stderr_consumes_more_than_pipe_buffer() {
+        let tmp = std::env::temp_dir().join(format!("sv-errdrain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 8192 行 × ~16 字节 ≈ 128KB，远超 Windows 管道缓冲
+        let fake_script = tmp.join("stderr-flood.ps1");
+        std::fs::write(
+            &fake_script,
+            "param()\n\
+             try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}\n\
+             for ($i = 1; $i -le 8192; $i++) { [Console]::Error.WriteLine(\"ERR-$i-padpadpadpad\") }\n\
+             Write-Output \"DONE\"\n",
+        )
+        .unwrap();
+
+        let old_script = std::env::var("HARNESS_SUPERVISE_SCRIPT").ok();
+        std::env::set_var("HARNESS_SUPERVISE_SCRIPT", &fake_script);
+        std::env::set_var("HARNESS_PWSH", "powershell");
+
+        let req = SuperviseRequest {
+            task: "t".into(),
+            work_dir: "D:\\work".into(),
+            level: None,
+            max_rounds: None,
+            model: None,
+            mock: true,
+        };
+        let mut child = spawn_supervise(&req).expect("spawn 成功");
+        let stderr = child.stderr.take().expect("stderr 管道");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        drain_stderr(stderr, move |line| {
+            let _ = tx.send(line);
+        });
+
+        // 只读 stdout（不读 stderr）：若 drain_stderr 没在消费，子进程会在写满
+        // 管道缓冲后阻塞，stdout 永远等不到 DONE，测试在此超时
+        use std::io::BufRead;
+        let stdout = child.stdout.take().expect("stdout 管道");
+        let saw_done = std::io::BufReader::new(stdout)
+            .lines()
+            .any(|l| l.map(|l| l.contains("DONE")).unwrap_or(false));
+        let _ = child.wait();
+
+        // wait 返回时 drain 线程可能还在收尾，用 recv_timeout 等它读完管道余量
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut count = 0usize;
+        let mut first = String::new();
+        let mut last = String::new();
+        while count < 8192 {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(line) => {
+                    if count == 0 {
+                        first = line.clone();
+                    }
+                    last = line;
+                    count += 1;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                }
+            }
+        }
+        for line in rx.try_iter() {
+            last = line;
+            count += 1;
+        }
+        assert!(saw_done, "子进程必须能写完 stderr 后正常退出");
+        assert_eq!(count, 8192, "8192 行 stderr 必须全部收到，实际 {count}");
+        assert!(first.starts_with("ERR-1-"), "首行: {first}");
+        assert!(last.starts_with("ERR-8192-"), "末行: {last}");
 
         match old_script {
             Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),
