@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": [
+      "resources/agent-sessions-mcp/package.json",
+      "resources/agent-sessions-mcp/server.js",
+      "resources/supervise-loop-script/supervise.ps1"
+    ]
+  }
+}
