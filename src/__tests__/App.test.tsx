@@ -63,6 +63,21 @@ describe("App 集成", () => {
     expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 });
   });
 
+  it("未开始监督任务时审查看板不读旧产物、显示空态", async () => {
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    // 切到监督闭环 tab（看板 active 触发加载）
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    await waitFor(() => {
+      expect(screen.getByText(/暂无审查记录/)).toBeInTheDocument();
+    });
+    // 关键断言：不回读磁盘上的上次产物（superviseDir 未设置时看板空置）
+    expect(mocks.invoke).not.toHaveBeenCalledWith(
+      "read_review_artifacts",
+      expect.anything(),
+    );
+  });
+
   it("应用主题同步到原生窗口标题栏", async () => {
     render(<App />);
 

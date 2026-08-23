@@ -600,7 +600,9 @@ function App() {
               valueText={`监督配置${compactSupervise ? "高度" : "宽度"} ${Math.round(compactSupervise ? panelHeight : panelWidth)} 像素`}
             />
             <ReviewBoard
-              workDir={superviseDir ?? projectWorkDir}
+              /* 只认本会话启动过的任务目录：没开始新任务时不回读磁盘上的
+                 上次产物（旧卡片误导"已有结论"）；任务启动即指向真实目录 */
+              workDir={superviseDir ?? ""}
               onViewSession={openTranscriptByFile}
               active={tab === "supervise"}
             />
