@@ -599,7 +599,11 @@ function App() {
               className="supervise-split"
               valueText={`监督配置${compactSupervise ? "高度" : "宽度"} ${Math.round(compactSupervise ? panelHeight : panelWidth)} 像素`}
             />
-            <ReviewBoard workDir={superviseDir ?? projectWorkDir} onViewSession={openTranscriptByFile} />
+            <ReviewBoard
+              workDir={superviseDir ?? projectWorkDir}
+              onViewSession={openTranscriptByFile}
+              active={tab === "supervise"}
+            />
           </div>
         </section>
 

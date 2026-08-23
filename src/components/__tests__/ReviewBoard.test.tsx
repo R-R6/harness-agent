@@ -89,4 +89,20 @@ describe("ReviewBoard", () => {
     await waitFor(() => expect(screen.getByText("第 1 轮")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "查看会话" })).not.toBeInTheDocument();
   });
+
+  it("切入监督 tab（active 翻 true）自动刷新，不再需要手点刷新", async () => {
+    mocks.invoke.mockResolvedValue(artifacts);
+    const { rerender } = render(<ReviewBoard workDir={"D:\\work"} active={false} />);
+    // 未激活时不加载（tab 常驻但隐藏，保持懒加载）
+    expect(mocks.invoke).not.toHaveBeenCalled();
+
+    rerender(<ReviewBoard workDir={"D:\\work"} active={true} />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText("第 1 轮")).toBeInTheDocument());
+
+    // 失活再切回 → 再刷一次（拿最新落盘的轮次卡片）
+    rerender(<ReviewBoard workDir={"D:\\work"} active={false} />);
+    rerender(<ReviewBoard workDir={"D:\\work"} active={true} />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(2));
+  });
 });

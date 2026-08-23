@@ -7,10 +7,13 @@ interface Props {
   workDir: string;
   /** 点击「查看会话」跳到会话浏览打开该轮的 transcript（file 为空时按钮隐藏） */
   onViewSession?: (file: string) => void;
+  /** 所在 tab 是否激活：切入时自动刷新（监督任务运行中逐轮落盘，切回即见
+   *  最新卡片，不必手点刷新；默认 true，独立使用保持挂载即加载） */
+  active?: boolean;
 }
 
 /** 审查看板：读 .supervise 产物，按轮次展示 verdict/reason */
-export function ReviewBoard({ workDir, onViewSession }: Props) {
+export function ReviewBoard({ workDir, onViewSession, active = true }: Props) {
   const [artifacts, setArtifacts] = useState<ReviewArtifact[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -28,9 +31,10 @@ export function ReviewBoard({ workDir, onViewSession }: Props) {
     }
   }, [workDir]);
 
+  // 挂载即加载 + workDir 变化加载 + tab 切回（active 翻 true）自动刷新
   useEffect(() => {
-    load();
-  }, [load]);
+    if (active) load();
+  }, [active, load]);
 
   return (
     <div className="review-board">
