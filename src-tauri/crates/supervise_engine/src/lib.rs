@@ -553,6 +553,12 @@ fn run_loop(
                 last_reason,
             };
         }
+        // 审查可能持续数分钟：开工前明示，否则用户面对静止的日志分不清
+        // "正在审查"和"卡住了"（真实反馈：截图问"这是在审查吗"）
+        on_log(&format!(
+            "[ENGINE] 第 {round} 轮审查中（{}），通常需要一到几分钟…",
+            opts.reviewer_label
+        ));
         let verdict = match reviewer.review(&transcript, round, cancel) {
             Ok(v) => v,
             Err(e) => {
