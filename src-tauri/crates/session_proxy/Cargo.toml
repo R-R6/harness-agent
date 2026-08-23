@@ -1,6 +1,6 @@
 [package]
 name = "session_proxy"
-version = "0.2.0"
+version.workspace = true
 description = "会话数据代理：内置 agent-sessions-mcp (server.js) 作为会话数据源"
 edition = "2021"
 

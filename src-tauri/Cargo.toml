@@ -1,6 +1,6 @@
 [package]
 name = "harness_agent"
-version = "0.2.0"
+version.workspace = true
 description = "Harness Agent - 驾驭 Claude 干活 + Codex 审查的桌面端监督闭环应用"
 authors = ["wuzhaoguo"]
 edition = "2021"
@@ -45,3 +45,9 @@ members = [
     "crates/supervise_engine",
 ]
 resolver = "2"
+
+# 版本单一来源：crate 用 version.workspace = true 继承；tauri.conf.json 不写
+# version 时也回退到这里。升级只改这一处 + 根 package.json（另有
+# scripts/check-versions.mjs 在构建前校验两处一致）
+[workspace.package]
+version = "0.2.0"
