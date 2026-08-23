@@ -5,17 +5,17 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-/// hook 追加 stdin 到 marker 文件的 PowerShell 命令。用 AppendAllText +
-/// UTF8Encoding($false)：Add-Content -Encoding UTF8 在 PS5.1 首次建文件时
-/// 会写 BOM，导致首个 marker 的 JSON 解析失败、第一轮丢失主信号。
-/// 换行用 [char]10 避开内层双引号（外层 -Command 已用双引号包裹）。
+/// hook 追加 stdin 到 marker 文件的 PowerShell 命令。
+/// 铁律：命令里不能出现任何 `$` 变量——真实事故：Claude Code 执行 hook 时
+/// 外层 shell 会做变量插值，`$in` 被吞成空，PowerShell 报 ParserError
+/// （"=" 后应为表达式），marker 永远写不出来，引擎只能靠静默兜底。
+/// 因此用内联表达式 + Add-Content（自动追加换行；BOM 由读取端剥掉兜底）。
 /// 路径单引号包裹，内部单引号加倍转义。
 pub fn hook_command(marker_file: &Path) -> String {
     let path = marker_file.to_string_lossy().replace('\'', "''");
     format!(
-        "powershell -NoProfile -Command \"$in=[Console]::In.ReadToEnd(); \
-         [System.IO.File]::AppendAllText('{path}', $in + [char]10, \
-         [System.Text.UTF8Encoding]::new($false))\""
+        "powershell -NoProfile -Command \"Add-Content -LiteralPath '{path}' \
+         -Value ([Console]::In.ReadToEnd())\""
     )
 }
 
@@ -157,9 +157,12 @@ mod tests {
         let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(cmd.contains("AppendAllText"), "{cmd}");
+        assert!(cmd.contains("Add-Content"), "{cmd}");
         // 外层 -Command "..." 允许恰好一对引号；内层再出现引号会破坏解析
         assert_eq!(cmd.matches('"').count(), 2, "引号只允许外层一对: {cmd}");
+        // 铁律：不能含 $ 变量（外层 shell 插值会吞掉它，真实事故为
+        // hook 每次触发每次 ParserError，marker 永远写不出来）
+        assert!(!cmd.contains('$'), "命令不得含 $ 变量: {cmd}");
         assert!(cmd.contains(marker.to_string_lossy().as_ref()), "{cmd}");
         let _ = std::fs::remove_dir_all(&dir);
     }

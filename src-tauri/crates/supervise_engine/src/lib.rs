@@ -504,6 +504,10 @@ fn run_loop(
             format!("上一轮审查未通过，请按要求返工：{}\r", last_reason)
         };
         first_inject = false;
+        // 先敲空回车唤醒 TUI：Claude Code 空闲/away 状态可能吞掉直接注入的
+        // 文本（真实事故：第 2/3 轮返工意见未进入会话，工人无动作被冤枉）
+        let _ = pane.write("\r");
+        std::thread::sleep(Duration::from_millis(300));
         if let Err(e) = pane.write(&inject) {
             let msg = format!("注入失败：{e}");
             on_log(&format!("[ENGINE] {msg}"));
@@ -777,8 +781,12 @@ mod tests {
         assert_eq!(outcome.rounds, 2, "一次审查失败不应烧轮");
         assert_eq!(outcome.last_reason, "校验已补齐");
         let writes = pane.writes.lock().unwrap();
-        assert!(writes[0].contains("写计算器"), "首轮注入任务: {}", writes[0]);
-        assert!(writes[1].contains("缺少输入校验"), "次轮注入返工意见: {}", writes[1]);
+        // writes[0] 是唤醒回车（防 away 吞输入），任务/返工从 writes[1] 起
+        assert!(writes.iter().any(|w| w.contains("写计算器")), "应有任务注入: {writes:?}");
+        assert!(
+            writes.iter().any(|w| w.contains("缺少输入校验")),
+            "应有返工意见注入: {writes:?}"
+        );
 
         // 产物：与 supervise_runner::read_artifacts 契约对齐
         let sup = dir.join(".supervise");
