@@ -105,7 +105,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
         "params": {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
-            "clientInfo": { "name": "harness-agent", "version": "0.1.0" }
+            "clientInfo": { "name": "harness-agent", "version": env!("CARGO_PKG_VERSION") }
         }
     });
     writeln!(stdin, "{init}").map_err(|e| format!("写入 initialize 失败: {e}"))?;

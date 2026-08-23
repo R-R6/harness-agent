@@ -22,6 +22,7 @@
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const PKG = require('./package.json'); // serverInfo 版本单一来源
 
 const HOME = process.env.USERPROFILE || process.env.HOME || '';
 const MAX_LINES = 200;                 // get_transcript 默认行数
@@ -409,7 +410,7 @@ function handle(req) {
     return {
       protocolVersion: typeof clientVersion === 'string' && clientVersion.length > 0 ? clientVersion : '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: 'agent-sessions-mcp', version: '0.1.0' },
+      serverInfo: { name: 'agent-sessions-mcp', version: PKG.version },
     };
   }
   if (method === 'tools/list') return { tools: TOOLS };

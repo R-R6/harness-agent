@@ -196,7 +196,9 @@ describe("App 集成", () => {
     expect(calls.length).toBe(0);
   });
 
-  it("加载更早 → 往前翻页合并更早消息并更新按钮状态", async () => {
+  // 400 条消息的 DOM 重组在机器高负载时超过 5s 默认限时（实测 1s~5.4s 波动），
+  // 放宽该用例限时防偶发超时
+  it("加载更早 → 往前翻页合并更早消息并更新按钮状态", { timeout: 20000 }, async () => {
     const tailPage: TranscriptEntry[] = Array.from({ length: 200 }, (_, i) => ({
       type: i % 2 ? "assistant" : "user",
       text: `近消息 ${i}`,

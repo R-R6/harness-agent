@@ -15,6 +15,7 @@ import { fetchSessions, fetchTranscript, searchSessions } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber, useStoredString } from "./lib/layoutPreferences";
 import type { SessionInfo, TranscriptEntry } from "./types";
+import pkg from "../package.json";
 import "./App.css";
 
 type Tab = "sessions" | "supervise" | "mcp" | "terminals";
@@ -409,7 +410,7 @@ function App() {
           >
             <Icon name={theme === "dark" ? "sun" : "moon"} size={15} />
           </IconButton>
-          {!navCollapsed && <span className="nav-version">v0.1 · local</span>}
+          {!navCollapsed && <span className="nav-version">v{pkg.version} · local</span>}
         </div>
       </nav>
 
