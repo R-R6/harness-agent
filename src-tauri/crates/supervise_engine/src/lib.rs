@@ -140,17 +140,20 @@ impl MarkerSource {
 }
 
 fn read_lines(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .map(|text| {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            // 容错解码：旧版 hook 或异常代码页可能写出非 UTF-8 字节；lossy
+            // 替换后 ASCII 字段（session_id/transcript_path）仍完好可解析
+            let text = String::from_utf8_lossy(&bytes);
             let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-            // PS5.1 的 Add-Content -Encoding UTF8 首次建文件带 BOM，不剥掉会
-            // 让首个 marker 的 JSON 解析失败、第一轮丢失主信号
+            // PS5.1 的 UTF8 首次建文件带 BOM，不剥掉会让首个 marker 解析失败
             if let Some(first) = lines.first_mut() {
                 *first = first.trim_start_matches('\u{feff}').to_string();
             }
             lines
-        })
-        .unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 // ---------------- 会话文件定位（marker 缺失时的兜底） ----------------
@@ -497,11 +500,19 @@ fn run_loop(
         }
 
         // 首次注入任务文本；此后每轮注入上一轮的返工意见。审查失败的重试
-        // 不重新注入（见下方审查重试循环），first_inject 只认第一次真正注入
+        // 不重新注入（见下方审查重试循环），first_inject 只认第一次真正注入。
+        // 反计划模式指令：真实事故——工人对"补测试"自作主张进入计划模式，
+        // 写完计划等确认卡死，静默判停把"等确认"当"干完"，白烧一轮
         let inject = if first_inject {
-            format!("{}\r", opts.task)
+            format!(
+                "{}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）\r",
+                opts.task
+            )
         } else {
-            format!("上一轮审查未通过，请按要求返工：{}\r", last_reason)
+            format!(
+                "上一轮审查未通过，请按要求返工：{}\r（直接动手修改文件并运行验证，禁止进入计划模式或等待确认；如已在计划模式请立即退出并执行）\r",
+                last_reason
+            )
         };
         first_inject = false;
         // 先敲空回车唤醒 TUI：Claude Code 空闲/away 状态可能吞掉直接注入的

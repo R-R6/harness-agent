@@ -5,17 +5,20 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-/// hook 追加 stdin 到 marker 文件的 PowerShell 命令。
-/// 铁律：命令里不能出现任何 `$` 变量——真实事故：Claude Code 执行 hook 时
-/// 外层 shell 会做变量插值，`$in` 被吞成空，PowerShell 报 ParserError
-/// （"=" 后应为表达式），marker 永远写不出来，引擎只能靠静默兜底。
-/// 因此用内联表达式 + Add-Content（自动追加换行；BOM 由读取端剥掉兜底）。
+/// hook 追加 stdin 到 marker 文件的 PowerShell 命令。两条铁律：
+/// 1. 命令里不能出现任何 `$` 变量——Claude Code 执行 hook 时外层 shell 会做
+///    变量插值，`$in` 被吞成空导致 ParserError（真实事故一）。
+/// 2. stdin/写盘必须显式 UTF-8——默认按控制台代码页(GBK)解码 UTF-8 字节，
+///    中文变乱码后整文件对读取端是非法 UTF-8，marker 等于没写（真实事故二：
+///    marker 落盘了但引擎读不出，三轮全靠静默兜底）。
+///
 /// 路径单引号包裹，内部单引号加倍转义。
 pub fn hook_command(marker_file: &Path) -> String {
     let path = marker_file.to_string_lossy().replace('\'', "''");
     format!(
-        "powershell -NoProfile -Command \"Add-Content -LiteralPath '{path}' \
-         -Value ([Console]::In.ReadToEnd())\""
+        "powershell -NoProfile -Command \"[System.IO.File]::AppendAllText('{path}', \
+         (New-Object System.IO.StreamReader([Console]::OpenStandardInput(), \
+         [System.Text.Encoding]::UTF8)).ReadToEnd(), [System.Text.Encoding]::UTF8)\""
     )
 }
 
@@ -157,7 +160,8 @@ mod tests {
         let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(cmd.contains("Add-Content"), "{cmd}");
+        assert!(cmd.contains("AppendAllText"), "{cmd}");
+        assert!(cmd.contains("UTF8"), "stdin/写盘必须显式 UTF-8（GBK 乱码事故）: {cmd}");
         // 外层 -Command "..." 允许恰好一对引号；内层再出现引号会破坏解析
         assert_eq!(cmd.matches('"').count(), 2, "引号只允许外层一对: {cmd}");
         // 铁律：不能含 $ 变量（外层 shell 插值会吞掉它，真实事故为
