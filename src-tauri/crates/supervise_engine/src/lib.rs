@@ -38,7 +38,8 @@ pub struct EngineOptions {
     /// pane 必须绑定的目录（绑定校验用，注入前逐轮检查）
     pub work_dir: String,
     pub max_rounds: i64,
-    /// JSONL 静默兜底阈值（默认 120s：工具执行期间文件不动是常态）
+    /// JSONL 静默兜底阈值（默认 180s。实测 Claude 跑长工具/测试时 2 分钟
+    /// 不写会话文件是常态，120s 会把还在干活的轮次误判成"已完成"）
     pub silence: Duration,
     /// 单轮硬超时（默认 15min）
     pub round_timeout: Duration,
@@ -57,7 +58,7 @@ impl Default for EngineOptions {
             task: String::new(),
             work_dir: String::new(),
             max_rounds: 3,
-            silence: Duration::from_secs(120),
+            silence: Duration::from_secs(180),
             round_timeout: Duration::from_secs(15 * 60),
             poll_interval: Duration::from_millis(500),
             artifacts_dir: None,
@@ -361,6 +362,9 @@ pub fn run(
             "status": status,
             "task": opts.task,
             "rounds": outcome.rounds,
+            // 结束原因（accepted=通过理由 / rejected=最后返工意见 / aborted=失败原因）。
+            // 真实事故：aborted 时报告只有状态没有原因，用户无法得知为何失败
+            "reason": outcome.last_reason,
             "sessionId": stem(&last),
             "sessionFile": path_str(&last),
             "verdicts": verdicts,
@@ -916,8 +920,10 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let on_log: OnLog = Arc::new(|_: &str| {});
         let src = MarkerSource::new(marker_file);
+        let mut opts = quick_opts(&dir, 5);
+        opts.artifacts_dir = Some(dir.join(".supervise"));
         let outcome = run(
-            &quick_opts(&dir, 5),
+            &opts,
             pane,
             Arc::new(reviewer),
             &src,
@@ -927,6 +933,18 @@ mod tests {
         );
         assert!(matches!(outcome.status, EngineStatus::Aborted(_)), "{:?}", outcome.status);
         assert_eq!(outcome.rounds, 1, "硬失败应立即中止而非烧完轮次");
+        // aborted 的失败原因必须落进最终报告（真实事故：报告只有状态没原因，
+        // 用户无从得知为何失败）
+        let report: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".supervise").join("final-report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["status"], "aborted");
+        assert!(
+            report["reason"].as_str().unwrap_or("").contains("codex 挂了"),
+            "reason 应带失败原因: {}",
+            report["reason"]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -467,14 +467,17 @@ async fn cancel_supervise(app: AppHandle, task_id: String) -> Result<(), String>
 
 // ---------------- 终端驱动监督引擎（阶段 2） ----------------
 
-/// Level → 轮数/模型推导（与 supervise.ps1 Get-LevelDefaults 同语义）
-fn level_defaults(level: Option<&str>, max_rounds: Option<i64>) -> (i64, &'static str) {
+/// Level → 轮数推导（与 supervise.ps1 Get-LevelDefaults 同语义）。
+/// 模型不在这里推导：审查模型直接取 request.model（默认空 = 跟随 codex
+/// 配置的默认模型）——硬编码模型名会随中转服务分组变更而 404
+/// （真实事故：gpt-5.6-luna 不被当前账号支持）
+fn level_rounds(level: Option<&str>, max_rounds: Option<i64>) -> i64 {
     let base = match level {
         Some("L0") => 1,
         Some("L2") => 5,
         _ => 3, // L1 与未知值：默认 3 轮
     };
-    (max_rounds.filter(|m| *m > 0).unwrap_or(base), "gpt-5.6-luna")
+    max_rounds.filter(|m| *m > 0).unwrap_or(base)
 }
 
 /// 引擎与终端 pane 的桥：注入走 pane 的 PTY writer；绑定校验查会话表
@@ -569,7 +572,8 @@ async fn run_supervise_terminal(
         }
     }
 
-    let (rounds, model) = level_defaults(request.level.as_deref(), request.max_rounds);
+    let rounds = level_rounds(request.level.as_deref(), request.max_rounds);
+    let model = request.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
     let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
     let cancel = Arc::new(AtomicBool::new(false));
     state
@@ -584,7 +588,11 @@ async fn run_supervise_terminal(
         max_rounds: rounds,
         // 产物落 .supervise（审查看板与「查看会话」跳转消费同一套格式）
         artifacts_dir: Some(supervise_dir.clone()),
-        reviewer_label: if request.mock { "mock" } else { model }.to_string(),
+        reviewer_label: match (request.mock, model) {
+            (true, _) => "mock".to_string(),
+            (false, Some(m)) => m.to_string(),
+            (false, None) => "codex 默认模型".to_string(),
+        },
         ..Default::default()
     };
     let reviewer: Arc<dyn Reviewer> = if request.mock {
@@ -594,8 +602,7 @@ async fn run_supervise_terminal(
             Ok(Verdict { pass: true, reason: "（模拟）校验已补齐，验收通过。".into() }),
         ]))
     } else {
-        Arc::new(CodexReviewer::new(model, &request.task))
-    };
+        Arc::new(CodexReviewer::new(model, &request.task))    };
 
     let app2 = app.clone();
     let task_id2 = task_id.clone();

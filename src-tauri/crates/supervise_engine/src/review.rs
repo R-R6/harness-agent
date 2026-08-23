@@ -23,16 +23,18 @@ pub trait Reviewer: Send + Sync {
 // ---------------- codex exec 审查（移植自 supervise.ps1 Invoke-CodexReview） ----------------
 
 pub struct CodexReviewer {
-    pub model: String,
+    /// 审查模型。None = 不传 -m，用 codex 自己配置的默认模型——硬编码模型名
+    /// 在中转服务/账号分组变更时会 404（真实事故：gpt-5.6-luna 不被支持）
+    pub model: Option<String>,
     pub task: String,
     pub retries: u32,
     pub retry_wait_secs: u64,
 }
 
 impl CodexReviewer {
-    pub fn new(model: &str, task: &str) -> Self {
+    pub fn new(model: Option<&str>, task: &str) -> Self {
         Self {
-            model: model.to_string(),
+            model: model.filter(|m| !m.trim().is_empty()).map(String::from),
             task: task.to_string(),
             retries: 5,
             retry_wait_secs: 8,
@@ -51,6 +53,40 @@ impl CodexReviewer {
     }
 }
 
+/// 构造 codex exec 命令行。Windows 上 npm 安装的 codex 是 .cmd 垫片，裸名
+/// spawn 找不到（CreateProcessW 不解析 PATHEXT，只会找 codex.exe）——必须走
+/// cmd.exe /c 转发（与 terminal_host::launch 启动 CLI 同款方案）。
+/// 真实事故：裸名 spawn 连续 5 次 os error 2，整场监督以"审查失败"中止。
+/// model 为 None 时不传 -m：跟随 codex 配置的默认模型（硬编码模型名遇
+/// 中转分组不支持时报 404）。
+pub fn build_codex_command(model: Option<&str>, prompt: &str) -> (String, Vec<String>) {
+    let mut base = vec![
+        "exec".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "--dangerously-bypass-approvals-and-sandbox".to_string(),
+    ];
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        base.push("-m".to_string());
+        base.push(model.to_string());
+    }
+    base.push(prompt.to_string());
+    if cfg!(windows) {
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let mut args = vec!["/d".into(), "/s".into(), "/c".into(), "codex".into()];
+        args.extend(base);
+        (comspec, args)
+    } else {
+        ("codex".to_string(), base)
+    }
+}
+
+/// 保留字符串尾部 n 个字符（诊断信息用）
+fn tail(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(n);
+    chars[start..].iter().collect()
+}
+
 impl Reviewer for CodexReviewer {
     fn review(&self, transcript: &Path, _round: i64, cancel: &AtomicBool) -> Result<Verdict, String> {
         let prompt = self.prompt(transcript);
@@ -60,23 +96,46 @@ impl Reviewer for CodexReviewer {
                 return Err("已取消".into());
             }
             // stdin 置 null：codex 在非 TTY 环境会读 stdin 附加输入而挂起；
-            // stderr 置 null：无人消费的管道写满会挂死子进程；
-            // CREATE_NO_WINDOW：发布版 GUI 子系统不弹控制台
-            let mut command = Command::new("codex");
+            // CREATE_NO_WINDOW：发布版 GUI 子系统不弹控制台；
+            // 命令走 build_codex_command（Windows 需 cmd.exe 垫片解析 codex.cmd）
+            let (program, args) = build_codex_command(self.model.as_deref(), &prompt);
+            let mut command = Command::new(&program);
             path_util::no_console_window(&mut command);
             let mut child = command
-                .args([
-                    "exec",
-                    "--skip-git-repo-check",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                ])
-                .args(["-m", &self.model])
-                .arg(&prompt)
+                .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                // stderr 后台消费（防写满挂死）并留尾部：审查失败时能看到
+                // codex 到底报了什么，而不是只有一个退出码
+                .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|e| format!("spawn codex 失败（请确认 codex CLI 已安装）: {e}"))?;
+                .map_err(|e| format!("spawn codex 失败（{program}，请确认 codex CLI 已安装）: {e}"))?;
+
+            let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            {
+                let buf = stderr_buf.clone();
+                let pipe = child.stderr.take();
+                std::thread::spawn(move || {
+                    if let Some(mut pipe) = pipe {
+                        use std::io::Read;
+                        let mut sink = String::new();
+                        let mut chunk = [0u8; 1024];
+                        while let Ok(n) = pipe.read(&mut chunk) {
+                            if n == 0 {
+                                break;
+                            }
+                            sink.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                            // 只留尾部 4KB
+                            if sink.len() > 8192 {
+                                sink = tail(&sink, 4096);
+                            }
+                        }
+                        if let Ok(mut b) = buf.lock() {
+                            *b = sink;
+                        }
+                    }
+                });
+            }
 
             // 轮询等待而非 output()：取消能在 200ms 内 kill 子进程退出
             loop {
@@ -95,9 +154,19 @@ impl Reviewer for CodexReviewer {
                         if let Some(v) = parse_verdict(&out) {
                             return Ok(v);
                         }
+                        let stderr_tail = stderr_buf
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
                         last_err = match status.code() {
-                            Some(0) => format!("第 {attempt} 次未解析到 VERDICT"),
-                            Some(code) => format!("codex 退出码 {code}（第 {attempt} 次）"),
+                            Some(0) => format!(
+                                "第 {attempt} 次未解析到 VERDICT。codex 输出尾部: {}",
+                                tail(&out, 200)
+                            ),
+                            Some(code) => format!(
+                                "codex 退出码 {code}（第 {attempt} 次）。stderr 尾部: {}",
+                                tail(&stderr_tail, 200)
+                            ),
                             None => format!("codex 被信号终止（第 {attempt} 次）"),
                         };
                         break;
@@ -204,5 +273,41 @@ mod tests {
     #[test]
     fn parse_verdict_none_when_absent() {
         assert!(parse_verdict("没有任何结论的输出").is_none());
+    }
+
+    /// Windows 必须走 cmd.exe 垫片：裸名 spawn 找不到 npm 的 codex.cmd
+    /// （CreateProcessW 不解析 PATHEXT），真实事故为连续 5 次 os error 2
+    #[cfg(windows)]
+    #[test]
+    fn codex_command_goes_through_cmd_shim_on_windows() {
+        let (program, args) = build_codex_command(Some("gpt-x"), "审查提示词");
+        assert!(program.to_lowercase().ends_with("cmd.exe"), "program: {program}");
+        assert_eq!(
+            &args[..4],
+            &[
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "codex".to_string()
+            ]
+        );
+        assert_eq!(args[4], "exec");
+        assert_eq!(args[args.len() - 3], "-m");
+        assert_eq!(args[args.len() - 2], "gpt-x");
+        assert_eq!(args.last().unwrap(), "审查提示词", "提示词必须是最后一个参数");
+    }
+
+    /// 默认不传 -m：跟随 codex 配置的默认模型（硬编码模型名 404 事故）
+    #[test]
+    fn codex_command_omits_model_flag_when_none() {
+        let (_program, args) = build_codex_command(None, "提示词");
+        assert!(!args.contains(&"-m".to_string()), "None 时不传 -m: {args:?}");
+        assert_eq!(args.last().unwrap(), "提示词");
+    }
+
+    #[test]
+    fn tail_keeps_last_chars() {
+        assert_eq!(tail("abcdefghij", 3), "hij");
+        assert_eq!(tail("ab", 5), "ab");
     }
 }
