@@ -186,6 +186,18 @@ impl Reviewer for CodexReviewer {
     }
 }
 
+/// 清理裁决理由：剥掉 codex 输出携带的 Markdown 列表前缀（"+ / - / *"）——
+/// 真实输出出现过 "需返工：+ 请在 …"（列表符直接拼进理由）
+fn clean_reason(raw: &str) -> String {
+    let r = raw.trim();
+    let r = r
+        .strip_prefix("+ ")
+        .or_else(|| r.strip_prefix("- "))
+        .or_else(|| r.strip_prefix("* "))
+        .unwrap_or(r);
+    r.trim().to_string()
+}
+
 /// 从 codex 输出解析 [VERDICT]。取最后一个匹配且跳过提示词回显行
 /// （codex 非 TTY 会回显 prompt，其中含指令模板本身）。
 pub fn parse_verdict(raw: &str) -> Option<Verdict> {
@@ -201,12 +213,12 @@ pub fn parse_verdict(raw: &str) -> Option<Verdict> {
         if let Some(reason) = rest.strip_prefix("PASS") {
             found = Some(Verdict {
                 pass: true,
-                reason: reason.trim().to_string(),
+                reason: clean_reason(reason),
             });
         } else if let Some(reason) = rest.strip_prefix("REVIEW") {
             found = Some(Verdict {
                 pass: false,
-                reason: reason.trim().to_string(),
+                reason: clean_reason(reason),
             });
         }
     }
@@ -273,6 +285,15 @@ mod tests {
     #[test]
     fn parse_verdict_none_when_absent() {
         assert!(parse_verdict("没有任何结论的输出").is_none());
+    }
+
+    /// codex 输出会把 Markdown 列表符拼进理由（真实输出："REVIEW + 请在 …"）
+    #[test]
+    fn parse_verdict_strips_list_marker_prefix() {
+        let v = parse_verdict("[VERDICT] REVIEW + 请补充边界测试\n").expect("应解析");
+        assert_eq!(v.reason, "请补充边界测试");
+        let v2 = parse_verdict("[VERDICT] PASS - 一次通过\n").expect("应解析");
+        assert_eq!(v2.reason, "一次通过");
     }
 
     /// Windows 必须走 cmd.exe 垫片：裸名 spawn 找不到 npm 的 codex.cmd

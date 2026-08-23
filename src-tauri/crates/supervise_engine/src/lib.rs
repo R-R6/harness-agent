@@ -44,6 +44,9 @@ pub struct EngineOptions {
     /// 单轮硬超时（默认 15min）
     pub round_timeout: Duration,
     pub poll_interval: Duration,
+    /// 注入送达确认窗口（默认 15s）：注入后在会话文件里等它变成新的用户行，
+    /// 超时则重发一次（真实事故：空闲/away 的 TUI 吞掉注入文本，工人整轮空转）
+    pub delivery_confirm: Duration,
     /// 产物目录（.supervise）：逐轮 review-N.md + 结束 final-report.json。
     /// None 则不落盘（纯测试用）。注意只清 review-*.md/final-report.json，
     /// 不能整目录删——stop-markers.jsonl 也在这里，MarkerSource 正快照着它
@@ -61,6 +64,7 @@ impl Default for EngineOptions {
             silence: Duration::from_secs(180),
             round_timeout: Duration::from_secs(15 * 60),
             poll_interval: Duration::from_millis(500),
+            delivery_confirm: Duration::from_secs(15),
             artifacts_dir: None,
             reviewer_label: String::new(),
         }
@@ -139,8 +143,46 @@ impl MarkerSource {
     }
 }
 
-fn read_lines(path: &Path) -> Vec<String> {
-    match std::fs::read(path) {
+/// 数会话文件中的"用户文本行"（type=user 且 message.content 为非空字符串——
+/// 注入的任务/返工文本正是这种形态；工具结果行 content 是数组，不计入）。
+/// 用于注入送达确认：注入生效必然让计数 +1。
+fn count_user_inputs(path: &Path) -> Option<usize> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut n = 0usize;
+    for line in text.lines() {
+        // 廉价预筛避免整文件逐行 JSON 解析
+        if !line.contains("\"type\":\"user\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let is_user_text = v.get("type").and_then(|t| t.as_str()) == Some("user")
+            && v.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+        if is_user_text {
+            n += 1;
+        }
+    }
+    Some(n)
+}
+
+/// 等 path 的用户行计数超过 before（截止 deadline 前轮询）
+fn wait_user_input_grown(path: &Path, before: usize, deadline: Instant, poll: Duration) -> bool {
+    let grown = || count_user_inputs(path).is_some_and(|n| n > before);
+    while Instant::now() < deadline {
+        if grown() {
+            return true;
+        }
+        std::thread::sleep(poll);
+    }
+    grown()
+}
+
+fn read_lines(path: &Path) -> Vec<String> {    match std::fs::read(path) {
         Ok(bytes) => {
             // 容错解码：旧版 hook 或异常代码页可能写出非 UTF-8 字节；lossy
             // 替换后 ASCII 字段（session_id/transcript_path）仍完好可解析
@@ -470,6 +512,10 @@ fn run_loop(
     let mut last_reason = String::new();
     let mut first_inject = true;
     let mut session_pin: Option<String> = None;
+    // 上一轮的会话文件（供下一轮注入送达确认）；上一轮审查时的文件指纹
+    // （大小+mtime，供复读守卫判定"会话无变化"）
+    let mut known_transcript: Option<PathBuf> = None;
+    let mut last_review_stat: Option<(u64, Option<SystemTime>)> = None;
     let mut round: i64 = 0;
     while round < opts.max_rounds {
         if cancel.load(Ordering::Relaxed) {
@@ -515,11 +561,15 @@ fn run_loop(
             )
         };
         first_inject = false;
-        // 先敲空回车唤醒 TUI：Claude Code 空闲/away 状态可能吞掉直接注入的
-        // 文本（真实事故：第 2/3 轮返工意见未进入会话，工人无动作被冤枉）
-        let _ = pane.write("\r");
-        std::thread::sleep(Duration::from_millis(300));
-        if let Err(e) = pane.write(&inject) {
+        // 唤醒回车 + 正文一起封装：确认失败重发时复用同一序列
+        let send_inject = |pane: &Arc<dyn PaneIo>| -> Result<(), String> {
+            // 先敲空回车唤醒 TUI：Claude Code 空闲/away 状态可能吞掉直接注入的
+            // 文本（真实事故：第 2/3 轮返工意见未进入会话，工人无动作被冤枉）
+            let _ = pane.write("\r");
+            std::thread::sleep(Duration::from_millis(300));
+            pane.write(&inject)
+        };
+        if let Err(e) = send_inject(&pane) {
             let msg = format!("注入失败：{e}");
             on_log(&format!("[ENGINE] {msg}"));
             return EngineOutcome {
@@ -527,6 +577,23 @@ fn run_loop(
                 rounds: round - 1,
                 last_reason,
             };
+        }
+        // 注入送达确认：已知会话文件时，确认注入真的变成会话里的新用户行。
+        // 失败重发一次；仍失败只告警不中止——保守保留旧行为超集（首轮没有
+        // 已知会话文件，跳过确认）
+        if let (Some(path), Some(before)) = (
+            known_transcript.as_deref(),
+            known_transcript.as_deref().and_then(count_user_inputs),
+        ) {
+            let deadline = Instant::now() + opts.delivery_confirm;
+            if !wait_user_input_grown(path, before, deadline, opts.poll_interval) {
+                on_log("[ENGINE] 注入未在会话中确认，重发一次…");
+                let _ = send_inject(&pane);
+                let deadline = Instant::now() + opts.delivery_confirm;
+                if !wait_user_input_grown(path, before, deadline, opts.poll_interval) {
+                    on_log("[ENGINE] 警告：注入疑似被终端空闲状态吞掉，工人本轮可能空转");
+                }
+            }
         }
         on_log(&format!(
             "[ENGINE] 第 {round}/{} 轮已注入，等待干活完成…",
@@ -557,6 +624,33 @@ fn run_loop(
             on_log(&format!("[ENGINE] {last_reason}"));
             continue;
         };
+        known_transcript = Some(transcript.clone());
+
+        // 复读守卫（确定性，防假 PASS）：会话文件与上轮审查时完全相同
+        // （大小+mtime）说明工人未响应返工（注入可能被吞）——直接维持 REVIEW，
+        // 不调审查。真实事故：审查者复读一份未变化的会话却放行 PASS，
+        // 而返工意见一条都没落实（re 导入还在、测试文件不存在）
+        let stat_now = std::fs::metadata(&transcript)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()));
+        if last_review_stat.is_some() && stat_now == last_review_stat {
+            last_reason =
+                "会话自上轮审查后无任何变化：工人未响应返工（注入可能被终端吞掉），维持 REVIEW"
+                    .into();
+            on_log(&format!(
+                "[ENGINE] 第 {round} 轮会话无变化，维持 REVIEW（跳过重复审查）"
+            ));
+            records.push(RoundRecord {
+                round,
+                pass: false,
+                reason: last_reason.clone(),
+                transcript: Some(transcript.clone()),
+            });
+            if let Some(dir) = &opts.artifacts_dir {
+                write_round_artifact(dir, &opts.reviewer_label, records.last().expect("刚 push"));
+            }
+            continue;
+        }
 
         // 审查：Reviewer 内部自带重试（CodexReviewer 5 次 × 8s），引擎层不再
         // 叠加重试——两层嵌套最坏 15 次 codex exec、单轮可拖约 20 分钟，
@@ -586,6 +680,10 @@ fn run_loop(
                 };
             }
         };
+        // 审查后的文件指纹作为下一轮复读守卫的基线
+        last_review_stat = std::fs::metadata(&transcript)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()));
 
         // 产物：逐轮落盘（运行中即可在看板刷新看到），报告在 run() 收尾统一写
         records.push(RoundRecord {
@@ -677,9 +775,12 @@ mod tests {
                     round = wrote;
                     std::fs::create_dir_all(&slug_dir).unwrap();
                     std::thread::sleep(Duration::from_millis(150));
+                    // 写"用户文本行"（注入送达确认靠 count_user_inputs 计数它）
                     std::fs::write(
                         &transcript,
-                        format!("{{\"type\":\"user\",\"message\":{{}}}}\nround {round}\n"),
+                        format!(
+                            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"round {round}\"}}}}\n"
+                        ),
                     )
                     .unwrap();
                     let marker = per_round
@@ -710,6 +811,7 @@ mod tests {
             silence: Duration::from_millis(400),
             round_timeout: Duration::from_secs(20),
             poll_interval: Duration::from_millis(30),
+            delivery_confirm: Duration::from_millis(200),
             artifacts_dir: None,
             reviewer_label: "mock".into(),
         }
@@ -1005,11 +1107,20 @@ mod tests {
                     let delay = if seen_rounds == 0 {
                         Duration::from_millis(150) // 第 1 轮：很快写 marker
                     } else {
-                        Duration::from_millis(1500) // 第 2 轮：故意延迟
+                        // 第 2 轮：故意延迟 2.5s——需大于 V2 送达确认+重发的
+                        // 开销（约 1s：200ms 窗口 + 300ms 唤醒 + 200ms 窗口），
+                        // 否则注入日志到 marker 的可测窗口会被开销吃掉
+                        Duration::from_millis(2500)
                     };
                     seen_rounds = writes;
                     std::thread::sleep(delay);
-                    std::fs::write(&transcript2, format!("round {seen_rounds}\n")).unwrap();
+                    std::fs::write(
+                        &transcript2,
+                        format!(
+                            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"round {seen_rounds}\"}}}}\n"
+                        ),
+                    )
+                    .unwrap();
                     // 必须用 json! 序列化：路径反斜杠不转义会产出非法 JSON 被跳过
                     let marker = serde_json::json!({
                         "session_id": "s1",
@@ -1078,17 +1189,139 @@ mod tests {
         assert_eq!(outcome.status, EngineStatus::Accepted);
         assert!(
             round2_by_marker.load(Ordering::Relaxed),
-            "第 2 轮应等到新 marker（Stop hook 信号）才结束，而非旧 marker 短路或静默兜底；日志: {:?}",
-            all_logs.lock().unwrap()
+            "第 2 轮应等到新 marker（Stop hook 信号）才结束，而非旧 marker 短路或静默兜底"
         );
-        // 第 2 轮从注入到结束必须 ≥ 1.2s（worker 延迟 1.5s 写新 marker），
-        // 旧 marker 若被重复消费会在首次轮询（30ms）内短路
         let start = round2_start.lock().unwrap();
         let end = round2_end.lock().unwrap();
         let duration = end.zip(start.as_ref().copied()).map(|(e, s)| e - s);
         assert!(
             duration.is_some_and(|d| d >= Duration::from_millis(1200)),
             "第 2 轮耗时应 ≥ 1.2s（等新 marker），实际 {duration:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V1+V2 联合回归：第 2 轮工人不响应（注入被终端吞掉的场景）——
+    /// 复读守卫不得再调审查（杜绝"复读假 PASS"），注入确认失败须重发一次。
+    /// 复刻真实事故：工人未动、审查者复读同一份会话却放行 PASS
+    #[test]
+    fn unchanged_transcript_round_skips_reviewer_and_retries_injection() {
+        let dir = tmp_dir("unchanged");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("s.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"种子\"}}\n",
+        )
+        .unwrap();
+        let marker_file = dir.join("markers.jsonl");
+
+        let pane = Arc::new(FakePane {
+            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
+            writes: Mutex::new(vec![]),
+            fail_write: AtomicBool::new(false),
+        });
+        // worker：只响应第一次注入（写一次用户行 + marker），此后沉默——
+        // 模拟第 2 轮注入被终端空闲状态吞掉
+        {
+            let pane2 = pane.clone();
+            let t2 = transcript.clone();
+            let m2 = marker_file.clone();
+            std::thread::spawn(move || {
+                let mut fired = false;
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(15) {
+                    let writes = pane2.writes.lock().unwrap().len();
+                    if !fired && writes >= 2 {
+                        fired = true;
+                        std::thread::sleep(Duration::from_millis(100));
+                        std::fs::write(
+                            &t2,
+                            concat!(
+                                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"种子\"}}\n",
+                                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"round 1\"}}\n"
+                            ),
+                        )
+                        .unwrap();
+                        let marker = serde_json::json!({
+                            "session_id": "s1",
+                            "transcript_path": t2.to_string_lossy(),
+                        });
+                        use std::io::Write;
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&m2)
+                            .unwrap();
+                        writeln!(f, "{marker}").unwrap();
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+        }
+
+        // 计数审查器：内层脚本化为 REVIEW（若引擎错误地复读审查，计数会 >1
+        // 且理由是"缺校验"而非"无变化"）
+        struct CountingReviewer {
+            inner: MockReviewer,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl Reviewer for CountingReviewer {
+            fn review(
+                &self,
+                t: &Path,
+                r: i64,
+                c: &AtomicBool,
+            ) -> Result<Verdict, String> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.review(t, r, c)
+            }
+        }
+        let reviewer = Arc::new(CountingReviewer {
+            inner: MockReviewer::scripted(vec![Ok(Verdict {
+                pass: false,
+                reason: "缺校验".into(),
+            })]),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let cancel = AtomicBool::new(false);
+        let on_log: OnLog = Arc::new(|_: &str| {});
+        let src = MarkerSource::new(marker_file);
+        let outcome = run(
+            &quick_opts(&dir, 2),
+            pane.clone(),
+            reviewer.clone(),
+            &src,
+            &projects_root,
+            &cancel,
+            &on_log,
+        );
+
+        assert_eq!(outcome.status, EngineStatus::Rejected, "{:?}", outcome.status);
+        assert_eq!(
+            reviewer.calls.load(Ordering::Relaxed),
+            1,
+            "会话无变化的轮次必须跳过审查（复读=假 PASS 温床）"
+        );
+        assert!(
+            outcome.last_reason.contains("无任何变化"),
+            "应以'会话无变化'收尾而非审查者理由: {}",
+            outcome.last_reason
+        );
+        let rework_sends = pane
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.contains("请按要求返工"))
+            .count();
+        assert!(
+            rework_sends >= 2,
+            "注入确认失败应重发一次（V2），实际返工注入 {rework_sends} 次"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
