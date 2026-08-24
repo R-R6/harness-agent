@@ -285,7 +285,7 @@ pub fn verify_handshake(server: &str) -> bool {
         None => return false,
     };
     let mut ok = false;
-    for l in std::io::BufReader::new(stdout).lines().flatten() {
+    for l in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
         if l.contains("\"serverInfo\"") {
             ok = true;
             break;
