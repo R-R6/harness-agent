@@ -472,6 +472,7 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
   .terminal-intro { align-items: flex-start; flex-direction: column; }
   .terminal-intro__note { white-space: normal; }
   .supervise-layout { padding: 12px; }
+  .workspace-sidebar { width: 170px; }
 }
 @media (max-width: 620px) {
   .topbar { padding: 12px; }
@@ -491,3 +492,47 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* ========== 阶段 C：监督闭环两级 UI 样式 ========== */
+
+/* 左：空间侧栏 + 右：任务/表单/看板 */
+.supervise-closed-loop { display: flex; min-height: 0; flex: 1; overflow: hidden; }
+.supervise-closed-loop__main { display: flex; min-width: 0; flex: 1; flex-direction: column; overflow: hidden; }
+
+/* 左侧空间栏 */
+.workspace-sidebar { width: 220px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--bg); overflow: hidden; }
+.workspace-sidebar__head { display: flex; align-items: center; gap: 8px; padding: 16px 14px 10px; }
+.workspace-sidebar__head h3 { margin: 0; font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
+.workspace-sidebar__head .icon-button { margin-left: auto; }
+.workspace-sidebar__empty { padding: 14px; color: var(--text-faint); font-size: 12px; text-align: center; }
+.workspace-sidebar__list { list-style: none; margin: 0; padding: 4px 8px; overflow: auto; }
+.workspace-sidebar__list li { margin: 0; padding: 2px 0; }
+.workspace-item { width: 100%; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--text-secondary); font-size: 13px; cursor: pointer; text-align: left; }
+.workspace-item:hover { background: var(--hover); color: var(--text); }
+.workspace-item.is-active { border-color: var(--codex-soft); background: var(--codex-soft); color: var(--text); font-weight: 600; }
+.workspace-item__name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-item__remove { display: flex; align-items: center; padding: 2px; border-radius: 3px; color: var(--text-faint); opacity: 0; }
+.workspace-item:hover .workspace-item__remove { opacity: 1; }
+.workspace-item__remove:hover { color: var(--danger); background: var(--danger-soft); opacity: 1; }
+.workspace-item__rename-input { min-width: 0; flex: 1; height: 26px; padding: 0 6px; border: 1px solid var(--codex); border-radius: 3px; outline: 0; background: var(--surface); color: var(--text); font-size: 13px; }
+
+/* 任务列表区域 */
+.supervise-tasks { padding: 12px 20px 0; border-bottom: 1px solid var(--border); }
+.supervise-tasks__head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.supervise-tasks__head h4 { margin: 0; font-size: 13px; font-weight: 650; }
+.task-list { list-style: none; margin: 0; padding: 0 0 8px; max-height: 200px; overflow: auto; }
+.task-list--empty { padding: 14px 0; color: var(--text-faint); font-size: 12px; }
+.task-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-sm); }
+.task-row:hover { background: var(--hover); }
+.task-badge { display: inline-flex; min-width: 48px; height: 20px; align-items: center; justify-content: center; padding: 0 6px; border-radius: 999px; font-size: 10px; font-weight: 650; white-space: nowrap; }
+.task-badge--running { background: var(--codex-soft); color: var(--codex); }
+.task-badge--accepted { background: var(--success-soft); color: var(--success); }
+.task-badge--rejected { background: var(--warn-soft); color: var(--warn); }
+.task-badge--cancelled { background: var(--surface); color: var(--text-muted); }
+.task-badge--aborted { background: var(--danger-soft); color: var(--danger); }
+.task-row__meta { min-width: 0; flex: 1; }
+.task-row__dir { display: flex; align-items: center; gap: 4px; color: var(--text); font-size: 12px; }
+.task-row__sub { color: var(--text-muted); font-size: 11px; }
+.task-row__reason { display: inline-block; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; margin-left: 4px; color: var(--text-faint); }
+.task-row__cancel { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
+.task-row__cancel:hover { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }

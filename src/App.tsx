@@ -8,7 +8,7 @@ import { ReviewBoard } from "./components/ReviewBoard";
 import { TaskList } from "./components/TaskList";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { MCPStatusPanel } from "./components/MCPStatusPanel";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, confirm } from "@tauri-apps/plugin-dialog";
 import { Icon, IconButton, type IconName } from "./components/Icon";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalWorkspace, type TerminalWorkspaceHandle } from "./components/TerminalWorkspace";
@@ -142,6 +142,13 @@ function App() {
         title: "选择项目工作目录作为工作空间",
       });
       if (typeof dir !== "string" || !dir.trim()) return;
+      // 信任确认（Codex 精神：说明该目录将被注入任务/写产物）
+      const trusted = await confirm(
+        `目录 "${dir}" 将被用于注入监督任务和执行代码审查，` +
+        "并会在其中写入审查产物（.supervise/）。确认添加此项目目录作为工作空间吗？",
+        { title: "添加工作空间", kind: "info" },
+      );
+      if (!trusted) return;
       const next = resolveDirChange(workspaces.list, workspaces.activeId, dir.trim());
       if (next.changed || next.activeId !== workspaces.activeId) {
         setWorkspaces(next);
@@ -158,6 +165,14 @@ function App() {
       const newActive = prev.activeId === id ? (filtered[0]?.id ?? null) : prev.activeId;
       return { list: filtered, activeId: newActive };
     });
+  }, []);
+
+  /** 重命名工作空间 */
+  const handleRenameWorkspace = useCallback((id: string, name: string) => {
+    setWorkspaces((prev) => ({
+      ...prev,
+      list: prev.list.map((w) => (w.id === id ? { ...w, name } : w)),
+    }));
   }, []);
 
   /** 加载任务列表（从后端任务注册表） */
@@ -655,6 +670,7 @@ function App() {
               onSelect={handleSelectWorkspace}
               onAdd={handleAddWorkspace}
               onRemove={handleRemoveWorkspace}
+              onRename={handleRenameWorkspace}
             />
             <div className="supervise-closed-loop__main">
               {!activeWorkspace ? (

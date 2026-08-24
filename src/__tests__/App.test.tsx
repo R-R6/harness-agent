@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   listen: vi.fn(),
   setWindowTheme: vi.fn(),
+  dialogOpen: vi.fn(),
+  dialogConfirm: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
@@ -16,7 +18,10 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ setTheme: mocks.setWindowTheme }),
 }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: mocks.dialogOpen,
+  confirm: mocks.dialogConfirm,
+}));
 
 const sessions: SessionInfo[] = [
   {
@@ -44,8 +49,11 @@ describe("App 集成", () => {
     mocks.invoke.mockReset();
     mocks.listen.mockReset();
     mocks.setWindowTheme.mockReset();
+    mocks.dialogOpen.mockReset();
+    mocks.dialogConfirm.mockReset();
     mocks.listen.mockResolvedValue(() => {});
     mocks.setWindowTheme.mockResolvedValue(undefined);
+    mocks.dialogConfirm.mockResolvedValue(true);
     mocks.invoke.mockImplementation((cmd: string) => {
       if (cmd === "list_sessions") return Promise.resolve(sessions);
       if (cmd === "get_transcript") return Promise.resolve(transcript);
@@ -312,5 +320,40 @@ describe("App 集成", () => {
     expect(dirInput).toHaveValue("D:\\my-project");
     // 无浏览按钮（readOnly 隐藏浏览按钮，但导航「会话浏览」仍在）
     expect(screen.queryByTitle("打开资源管理器选择目录")).not.toBeInTheDocument();
+  });
+
+  it("添加工作空间需信任确认；确认后创建空间并持久化", async () => {
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    // 切到监督 tab，点击「+」添加空间
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "添加工作空间" })).toBeInTheDocument());
+    mocks.dialogOpen.mockResolvedValue("C:\\trusted-proj");
+    await userEvent.click(screen.getByRole("button", { name: "添加工作空间" }));
+    // 触发 confirm 对话框
+    await waitFor(() => expect(mocks.dialogConfirm).toHaveBeenCalledTimes(1));
+    expect(mocks.dialogConfirm).toHaveBeenCalledWith(expect.stringContaining(".supervise"), expect.anything());
+    // 确认返回 true → 空间创建并持久化
+    await waitFor(() => {
+      const list = JSON.parse(localStorage.getItem("ha-workspaces") ?? "[]");
+      expect(list.length).toBe(1);
+      expect(list[0].path).toBe("C:\\trusted-proj");
+    });
+  });
+
+  it("添加空间被拒绝（confirm=false）→ 不创建空间", async () => {
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "添加工作空间" })).toBeInTheDocument());
+    mocks.dialogOpen.mockResolvedValue("C:\\denied-proj");
+    mocks.dialogConfirm.mockResolvedValue(false);
+    await userEvent.click(screen.getByRole("button", { name: "添加工作空间" }));
+    await waitFor(() => expect(mocks.dialogConfirm).toHaveBeenCalledTimes(1));
+    // 确认拒绝 → 不建空间（列表仍为空）
+    await waitFor(() => {
+      const list = JSON.parse(localStorage.getItem("ha-workspaces") ?? "[]");
+      expect(list.length).toBe(0);
+    });
   });
 });
