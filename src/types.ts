@@ -26,6 +26,21 @@ export interface SuperviseRequest {
   mock?: boolean;
 }
 
+// ---- 任务注册表（阶段 B）----
+
+export type TaskStatus = "running" | "accepted" | "rejected" | "cancelled" | "aborted";
+export type TaskKind = "ps1" | "engine";
+
+export interface TaskInfo {
+  id: string;
+  work_dir: string;
+  kind: TaskKind;
+  status: TaskStatus;
+  rounds: number;
+  last_reason: string;
+  started_at_ms: number;
+}
+
 // ---- MCP 健康检查（阶段 3） ----
 
 export interface McpCheckItem {

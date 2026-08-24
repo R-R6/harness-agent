@@ -6,6 +6,7 @@ import type {
   ReviewArtifact,
   SessionInfo,
   SuperviseRequest,
+  TaskInfo,
   TranscriptEntry,
 } from "../types";
 
@@ -51,6 +52,11 @@ export async function cancelSupervise(taskId: string): Promise<void> {
 /** 读 .supervise 产物（审查看板数据） */
 export async function fetchReviewArtifacts(workDir: string): Promise<ReviewArtifact[]> {
   return invoke("read_review_artifacts", { workDir });
+}
+
+/** 列出全部监督任务（含历史终态；重启后清空） */
+export async function fetchTasks(): Promise<TaskInfo[]> {
+  return invoke<TaskInfo[]>("list_supervise_tasks");
 }
 
 // ---- MCP 健康检查 ----

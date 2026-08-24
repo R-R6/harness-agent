@@ -17,6 +17,58 @@ use tauri::{AppHandle, Emitter, Manager, State};
 static TASK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static TERMINAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+// ---------------- 任务注册表（阶段 B：多任务状态管理） ----------------
+
+/// 任务状态（复用 EngineStatus 语义；ps1 无头模式由退出码推导）
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskStatus {
+    Running,
+    Accepted,
+    Rejected,
+    Cancelled,
+    Aborted,
+}
+
+/// 任务类型
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskKind {
+    Ps1,
+    Engine,
+}
+
+/// 任务注册表条目（应用退出即清，v1 不落盘）
+#[derive(Debug, Clone, serde::Serialize)]
+struct TaskInfo {
+    id: String,
+    work_dir: String,
+    kind: TaskKind,
+    status: TaskStatus,
+    rounds: i64,
+    last_reason: String,
+    started_at_ms: u64,
+}
+
+/// 毫秒级时间戳（用于 started_at）
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// ps1 无头模式的退出码 → 任务终态映射（与引擎模式由 EngineStatus 直推不同）：
+/// 0=通过、1=驳回、其它=中止、None=取消（进程被 kill 掉时 wait 返回 None）
+fn ps1_exit_to_status(code: Option<i64>) -> TaskStatus {
+    match code {
+        Some(0) => TaskStatus::Accepted,
+        Some(1) => TaskStatus::Rejected,
+        Some(_) => TaskStatus::Aborted,
+        None => TaskStatus::Cancelled,
+    }
+}
+
 // ---------------- 监督进程状态（并发锁 + 进程表） ----------------
 
 struct SuperviseState {
@@ -26,6 +78,8 @@ struct SuperviseState {
     busy_workdirs: Mutex<Vec<String>>,
     /// task_id → 终端驱动引擎（阶段 2）的取消标志
     engine_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 任务注册表（含历史终态；应用退出即清，重启后历史消失属预期）
+    tasks: Mutex<HashMap<String, TaskInfo>>,
 }
 
 impl SuperviseState {
@@ -392,6 +446,16 @@ async fn run_supervise(
     // 逐行并入 supervise-log（带 [stderr] 前缀），诊断信息直接进 UI 日志流。
     let stderr = child.stderr.take();
     state.running.lock().unwrap().insert(task_id.clone(), child);
+    // 登记任务注册表（Running 态）
+    state.tasks.lock().unwrap().insert(task_id.clone(), TaskInfo {
+        id: task_id.clone(),
+        work_dir: work_dir.clone(),
+        kind: TaskKind::Ps1,
+        status: TaskStatus::Running,
+        rounds: 0,
+        last_reason: String::new(),
+        started_at_ms: now_ms(),
+    });
 
     // 后台线程读 stdout → 逐行 emit 到前端；进程结束后清理 State 并 emit done
     let app2 = app.clone();
@@ -417,6 +481,13 @@ async fn run_supervise(
                 None // 已被 cancel 提前移除（进程是 kill 掉的）
             }
         };
+        // 更新任务注册表终态
+        {
+            let mut tasks = running.tasks.lock().unwrap();
+            if let Some(t) = tasks.get_mut(&task_id2) {
+                t.status = ps1_exit_to_status(exit_code);
+            }
+        }
         running
             .busy_workdirs
             .lock()
@@ -581,6 +652,16 @@ async fn run_supervise_terminal(
         .lock()
         .unwrap()
         .insert(task_id.clone(), cancel.clone());
+    // 登记任务注册表（Running 态）
+    state.tasks.lock().unwrap().insert(task_id.clone(), TaskInfo {
+        id: task_id.clone(),
+        work_dir: work_dir.clone(),
+        kind: TaskKind::Engine,
+        status: TaskStatus::Running,
+        rounds: 0,
+        last_reason: String::new(),
+        started_at_ms: now_ms(),
+    });
 
     let opts = EngineOptions {
         task: request.task.clone(),
@@ -671,6 +752,20 @@ async fn run_supervise_terminal(
             supervise_engine::EngineStatus::Rejected => 1,
             supervise_engine::EngineStatus::Aborted(_) => 2,
         };
+        // 更新任务注册表终态
+        {
+            let mut tasks = app_state.tasks.lock().unwrap();
+            if let Some(t) = tasks.get_mut(&task_id2) {
+                t.status = match outcome.status {
+                    supervise_engine::EngineStatus::Accepted => TaskStatus::Accepted,
+                    supervise_engine::EngineStatus::Rejected => TaskStatus::Rejected,
+                    supervise_engine::EngineStatus::Cancelled => TaskStatus::Cancelled,
+                    supervise_engine::EngineStatus::Aborted(_) => TaskStatus::Aborted,
+                };
+                t.rounds = outcome.rounds;
+                t.last_reason = outcome.last_reason.clone();
+            }
+        }
         let _ = app2.emit(
             "supervise-done",
             serde_json::json!({ "taskId": task_id2, "exitCode": code, "reason": outcome.last_reason }),
@@ -684,6 +779,20 @@ async fn run_supervise_terminal(
 #[tauri::command]
 async fn read_review_artifacts(work_dir: String) -> Result<Vec<ReviewArtifact>, String> {
     supervise_runner::read_artifacts(&work_dir)
+}
+
+/// 列出全部监督任务（含历史终态；应用退出即清，重启后历史消失属预期）
+#[tauri::command]
+fn list_supervise_tasks(state: State<'_, SuperviseState>) -> Vec<TaskInfo> {
+    state
+        .tasks
+        .lock()
+        .map(|tasks| {
+            let mut out: Vec<TaskInfo> = tasks.values().cloned().collect();
+            out.sort_by(|a, b| b.started_at_ms.cmp(&a.started_at_ms)); // 最新在前
+            out
+        })
+        .unwrap_or_default()
 }
 
 /// MCP 注册健康检查（toml 结构化解析 + 真实握手）
@@ -740,6 +849,7 @@ pub fn run() {
             running: Mutex::new(HashMap::new()),
             busy_workdirs: Mutex::new(vec![]),
             engine_cancels: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
         })
         .manage(TerminalState {
             sessions: Mutex::new(HashMap::new()),
@@ -773,6 +883,7 @@ pub fn run() {
             cancel_supervise,
             run_supervise_terminal,
             read_review_artifacts,
+            list_supervise_tasks,
             check_mcp,
             fix_mcp,
             export_transcript_md,
@@ -785,4 +896,57 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ---------------- 测试 ----------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ps1_exit_to_status_maps_all_cases() {
+        assert_eq!(ps1_exit_to_status(Some(0)), TaskStatus::Accepted);
+        assert_eq!(ps1_exit_to_status(Some(1)), TaskStatus::Rejected);
+        assert_eq!(ps1_exit_to_status(Some(2)), TaskStatus::Aborted);
+        assert_eq!(ps1_exit_to_status(Some(137)), TaskStatus::Aborted);
+        // 进程被 kill（cancel）时 wait 返回 None → 取消
+        assert_eq!(ps1_exit_to_status(None), TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn engine_status_maps_to_task_status() {
+        use supervise_engine::EngineStatus;
+        let case = |s: &EngineStatus| -> TaskStatus {
+            match s {
+                EngineStatus::Accepted => TaskStatus::Accepted,
+                EngineStatus::Rejected => TaskStatus::Rejected,
+                EngineStatus::Cancelled => TaskStatus::Cancelled,
+                EngineStatus::Aborted(_) => TaskStatus::Aborted,
+            }
+        };
+        assert_eq!(case(&EngineStatus::Accepted), TaskStatus::Accepted);
+        assert_eq!(case(&EngineStatus::Rejected), TaskStatus::Rejected);
+        assert_eq!(case(&EngineStatus::Cancelled), TaskStatus::Cancelled);
+        assert!(matches!(
+            case(&EngineStatus::Aborted("".into())),
+            TaskStatus::Aborted
+        ));
+    }
+
+    #[test]
+    fn task_info_serializes_to_snake_case() {
+        let info = TaskInfo {
+            id: "task-1".into(),
+            work_dir: "D:\\work".into(),
+            kind: TaskKind::Engine,
+            status: TaskStatus::Running,
+            rounds: 0,
+            last_reason: String::new(),
+            started_at_ms: now_ms(),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["kind"], "engine");
+        assert_eq!(json["status"], "running");
+    }
 }
