@@ -1,0 +1,103 @@
+# 交接文档：工作空间与多任务管理改造（接续执行指南）
+
+> 交接时间：2026-08-24。接手者请先通读本文档 + `docs/workspace-plan.md`，
+> 再动手。工作树干净，main 分支，最新提交 `35d2455`。
+
+## 一、任务是什么
+
+用户要求学习 Codex 源码（`F:\project\workspace-side\Amazing\codex`）的工作空间设计，
+把 harness_agent 从「全局单目录 + 单任务」升级为 Codex 同款的
+「**工作空间（一级实体）→ 每空间任务列表（跨空间并发）**」两级模型。
+
+- **总计划（必读）**：`docs/workspace-plan.md` —— 四阶段 TODO、Codex 设计证据
+  （含文件:行号）、适配映射表、明确不做清单。按它执行，不要重新设计。
+- **现状**：阶段 A 完成了一半（见下），B/C/D 未开始。
+
+## 二、进度快照
+
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| A 前端空间数据模型 | **1/2 完成** | `src/lib/workspaces.ts` 已提交（35d2455）；**未接线**、无单测 |
+| B 后端任务注册表 | 未开始 | |
+| C 监督页两级 UI | 未开始 | |
+| D 信任确认 + 打磨 | 未开始 | |
+
+### 阶段 A 剩余工作（接手后第一件事）
+
+1. **App.tsx 接线**（当前 `src/App.tsx:106` 是 `useStoredString("ha-project-work-dir", "")`）：
+   - 换成 `useState(() => initWorkspaces())`；派生
+     `activeWorkspace = list.find(id) ?? list[0]`、`projectWorkDir = activeWorkspace?.path ?? ""`
+   - 变更入口统一走 `resolveDirChange(list, activeId, newDir)`（workspaces.ts 已写好，
+     含旧单目录迁移和"输入匹配既有空间则激活"的桥接语义），再 `setWorkspaces` + `saveWorkspaces`
+   - `useEffect` 持久化 list + activeId；`useStoredString` 旧键不要再写（initWorkspaces 已做一次性迁移）
+2. **单测** `src/lib/__tests__/workspaces.test.ts`：迁移（旧值→首个空间+激活）、
+   samePath 归一、resolveDirChange 三分支（命中切换/空表新建/更新激活路径）、nextPosition
+3. 回归：`npx tsc --noEmit` + `npm test`（当前基线 **93 个前端测试全绿**，新增后只增不减）
+
+## 三、阶段 B/C/D 要点（细节见 plan 文档）
+
+- **B（后端）**：`src-tauri/src/lib.rs` 的 `SuperviseState` 加
+  `tasks: Mutex<HashMap<String, TaskInfo>>`（字段见 plan）；`run_supervise` 与
+  `run_supervise_terminal` 的启动/收尾两处登记+终态回写；新 command
+  `list_supervise_tasks`。注意 ps1 模式收尾线程在 lib.rs `run_supervise` 的
+  spawn 线程里（supervise-done emit 之前），引擎模式收尾在
+  `run_supervise_terminal` 的 catch_unwind 之后——两处都要写终态。
+- **C（UI）**：监督闭环 tab 重构为 左空间栏 + 右[任务列表/表单/看板]。
+  ReviewBoard 的绑定注意：`a3103df` 已改为 `workDir={superviseDir ?? ""}`
+  （未启动任务显示空态，不回退旧目录）——改造时保持这个语义，改为
+  按激活空间取"该空间最近一次任务的目录"。
+- **D**：添加空间时信任确认对话框（Codex 文案精神：说明该目录将被注入任务/写产物）。
+
+## 四、项目运行/验证环境（有坑，必读）
+
+- **Rust 工具链**：`export PATH="/f/develop_soft/IDE/AI_tools/Rust_env/cargo/bin:$PATH"`
+  （Git Bash），否则 cargo 不在 PATH
+- **主 crate 编译检查有文件锁坑**：`src-tauri/target/debug` 的 WebView2Loader.dll
+  常被占用（os error 32）。用独立目录检查：
+  `cd src-tauri && CARGO_TARGET_DIR=target-check cargo check -p harness_agent`
+  用完 `rm -rf target-check`（**绝不能 git add 它**——历史上误提交过一次）
+- **发布构建前必须关应用**：`tasklist | grep harness_agent` → `taskkill //PID xxx //F`，
+  等 2-3 秒再 `npm run tauri build`（exe 锁释放有延迟；`//IM` 通配杀有时不彻底，按 PID 杀）
+- **测试命令**：前端 `npm test`（vitest，93 个）；Rust `cd src-tauri && cargo test -p supervise_engine -p supervise_runner -p session_proxy -p mcp_checker -p path_util -p terminal_host`（52 个）；`cargo clippy` 同批 crate 须 0 警告
+- **控制台是 GBK**：Python/命令输出中文可能乱码（显示问题，非数据问题）；
+  给 python 传 Windows 路径用 `cygpath -w`
+
+## 五、协作约定（用户的工作习惯，务必遵守）
+
+1. **每完成一个独立单元就 commit + push 到 main**（用户明确要求过），
+   中文 Conventional Commits（`feat(scope): 中文摘要` + 正文写为什么/事故证据），
+   **禁止任何 AI 署名尾注**
+2. **测试先行**：每个行为改动配回归测试；修 bug 前先用磁盘证据/测试复现
+3. **用户会做真机测试并把日志发回来**——每次交付后说明"下一轮验证看点"
+4. **版本号单一来源**：只改根 `package.json` 与 `src-tauri/Cargo.toml` 的
+   `[workspace.package]`（两处必须一致，`scripts/check-versions.mjs` 会在构建时强制校验）
+5. 监督引擎的调试方法论：**磁盘考古**——`.supervise/`（final-report.json 带 reason、
+   review-N.md、stop-markers.jsonl）、`~/.claude/projects/<slug>/会话.jsonl`、
+   `~/.claude/settings.json.bak-*` 时间戳，可完整还原每轮任务发生了什么
+
+## 六、领域知识（避免重踩已修过的坑）
+
+- 引擎（`src-tauri/crates/supervise_engine`）已有机制：Stop hook marker 主信号
+  （**hook 命令零 `$` 变量 + 强制 UTF-8**，否则被外层 shell 插值/GBK 编码破坏）、
+  静默兜底 180s、会话复读守卫（大小+mtime 无变化→不调审查直接 REVIEW）、
+  注入送达确认+重发、注入文本带反计划模式指令、审查走 cmd.exe 垫片 spawn codex
+  且**默认不传 `-m`（跟随用户 codex 配置的模型，硬编码模型名会 404）**
+- 无头模式（supervise.ps1）仍有硬编码模型问题，在册未修（用户主用终端驱动模式）
+- Codex 设计分析要点已浓缩在 `docs/workspace-plan.md` 第一节；如需更深细节，
+  关键源码位置：`codex-rs/state/src/model/project.rs`（Project 实体）、
+  `codex-rs/core/src/thread_manager.rs:336-359`（并发容器）、
+  `codex-rs/app-server-protocol/src/protocol/common.rs`（桌面 API 面）
+
+## 七、建议技能（skills）
+
+- `karpathy-guidelines`：用户偏好保守、手术式改动（明确要求过"保守的优化，注意边界"）
+- `commit`：提交时遵循其安全门（main 直提是本仓库惯例，用户已授权）
+- `tdd` / 测试编写惯例：先复现再修复
+
+## 八、下一步行动清单（按序执行）
+
+1. 完成阶段 A 接线 + 单测 → commit/push（`feat(workspaces): 阶段 A(2/2)`）
+2. 阶段 B 后端注册表 + command + 状态流转测试 → commit/push
+3. 阶段 C 监督页两级 UI + 组件测试 → commit/push
+4. 阶段 D 信任确认 + 重命名 + README 更新 → commit/push
+5. 每阶段后跑第四节的全量验证；C 完成后重建发布包（关应用）并告知用户验证看点
