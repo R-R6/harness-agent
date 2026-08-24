@@ -38,7 +38,12 @@ Harness_agent/
 │   │   ├── mcp_checker/          # MCP 注册健康检查/修复
 │   │   └── path_util/            # 共享路径/进程工具
 │   └── resources/                # 随包分发的 server.js / supervise.ps1
-└── docs/spike-findings.md        # 阶段 1.5 spike 结论（Stop hook 等）
+└── docs/                         # 文档（按类归档）
+    ├── 使用指南/                 # 安装与使用指南
+    ├── 计划/                     # 工作空间与多任务管理改造计划
+    ├── 交接文档/                 # 工作空间改造接续指南、现状与 Codex 差距
+    ├── 研究调研/                 # LangChain 评估、阶段 1.5 spike 结论
+    └── 设计规格/                 # 工作台 UI / 布局设计规格
 ```
 
 ## 开发命令

@@ -1,4 +1,4 @@
-// 工作空间模型（学习 Codex 的 Project 一级实体设计，见 docs/workspace-plan.md）：
+// 工作空间模型（学习 Codex 的 Project 一级实体设计，见 docs/计划/工作空间与多任务管理改造计划.md）：
 // 空间是持久化实体（路径为身份），任务/表单/看板都挂在"激活空间"上；
 // 换目录 = 切换/新建空间，而不是原地改某个全局字符串。
 import type { Dispatch, SetStateAction } from "react";
