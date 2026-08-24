@@ -14,6 +14,8 @@ dist-ssr
 
 # Rust / Tauri
 /src-tauri/target/
+# 独立编译检查目录（WebView2Loader.dll 被占用时的避坑方案，绝不能提交）
+/src-tauri/target-check/
 *.rs.bk
 
 # 演示/临时产物（监督闭环演示目录 + 监督产物）
