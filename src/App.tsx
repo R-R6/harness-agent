@@ -13,7 +13,8 @@ import { SplitHandle } from "./components/SplitHandle";
 import harnessMark from "./assets/harness-mark.svg";
 import { fetchSessions, fetchTranscript, searchSessions } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
-import { useElementSize, useMediaQuery, useStoredNumber, useStoredString } from "./lib/layoutPreferences";
+import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
+import { initWorkspaces, resolveDirChange, saveWorkspaces } from "./lib/workspaces";
 import type { SessionInfo, TranscriptEntry } from "./types";
 import pkg from "../package.json";
 import "./App.css";
@@ -101,12 +102,29 @@ function App() {
   const activeFileRef = useRef<string | null>(null); // 翻页期间切走会话时丢弃过期结果
 
   // ---- 监督闭环状态（常驻 App）----
-  // 项目工作目录单一来源（Claude 终端 pane 与监督表单共享，持久化）；
-  // superviseDir 记录最近一次启动监督的目录，审查看板跟随
-  const [projectWorkDir, setProjectWorkDir] = useStoredString("ha-project-work-dir", "");
+  // 工作空间一级实体（Codex Project 精神）：path 为身份、position 保序；
+  // 项目工作目录 = 激活空间的 path（Claude 终端 pane 与监督表单共享）。
+  // superviseDir 记录最近一次启动监督的目录，审查看板跟随（未启动任务时空置）
+  const [workspaces, setWorkspaces] = useState(() => initWorkspaces());
+  const activeWorkspace = workspaces.list.find((w) => w.id === workspaces.activeId) ?? workspaces.list[0] ?? null;
+  const projectWorkDir = activeWorkspace?.path ?? "";
   const [superviseDir, setSuperviseDir] = useState<string | null>(null);
   const [terminalRunning, setTerminalRunning] = useState(0);
   const [superviseRunning, setSuperviseRunning] = useState(0);
+
+  // 目录输入桥接：命中既有空间 → 切换激活；空表 → 建首个空间；否则更新激活空间路径。
+  // 换目录 = 切换/新建空间（Codex 同款心智），不再原地改某个全局字符串。
+  const handleWorkDirChange = useCallback((rawDir: string) => {
+    const next = resolveDirChange(workspaces.list, workspaces.activeId, rawDir);
+    if (next.changed || next.activeId !== workspaces.activeId) {
+      setWorkspaces(next);
+    }
+  }, [workspaces]);
+
+  // 持久化 workspaces 列表 + 激活 id；旧单目录键已由 initWorkspaces 一次性迁移并清除
+  useEffect(() => {
+    saveWorkspaces(workspaces.list, workspaces.activeId);
+  }, [workspaces]);
 
   const handleSuperviseRunningChange = useCallback((running: boolean) => {
     setSuperviseRunning(running ? 1 : 0);
@@ -568,7 +586,7 @@ function App() {
             active={tab === "terminals"}
             onRunningChange={setTerminalRunning}
             projectWorkDir={projectWorkDir}
-            onProjectWorkDirChange={setProjectWorkDir}
+            onProjectWorkDirChange={handleWorkDirChange}
           />
         </section>
 
@@ -583,7 +601,7 @@ function App() {
             >
               <SupervisePanel
                 workDir={projectWorkDir}
-                onWorkDirChange={setProjectWorkDir}
+                onWorkDirChange={handleWorkDirChange}
                 onStarted={handleSuperviseStarted}
                 onRunningChange={handleSuperviseRunningChange}
                 onDriveStarted={handleDriveStarted}

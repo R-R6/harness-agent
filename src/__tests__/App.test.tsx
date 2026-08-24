@@ -278,4 +278,35 @@ describe("App 集成", () => {
     fireEvent.keyDown(splitter, { key: "Home" });
     expect(sidebar).toHaveStyle({ width: "260px" });
   });
+
+  it("旧单目录迁移：挂载时 ha-project-work-dir 非空 → 写进 workspaces 列表并清除旧键", async () => {
+    localStorage.setItem("ha-project-work-dir", "D:\\legacy-project");
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("aaa.jsonl")).toBeInTheDocument());
+    // 旧键已清除
+    expect(localStorage.getItem("ha-project-work-dir")).toBeNull();
+    // 新列表已写入
+    const list = JSON.parse(localStorage.getItem("ha-workspaces") ?? "[]");
+    expect(list.length).toBe(1);
+    expect(list[0].path).toBe("D:\\legacy-project");
+    // 激活 id 指向该空间
+    const activeId = localStorage.getItem("ha-active-workspace");
+    expect(activeId).toBe(list[0].id);
+  });
+
+  it("监督表单修改目录 → 更新激活空间的路径并持久化", async () => {
+    render(<App />);
+    // 先切到监督 tab
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    await waitFor(() => expect(screen.getByPlaceholderText(/浏览选择/)).toBeInTheDocument());
+    // 使用 fireEvent.change 一次性设值，避免逐字符触发中间路径
+    const dirInput = screen.getByPlaceholderText(/浏览选择/) as HTMLInputElement;
+    fireEvent.change(dirInput, { target: { value: "D:\\new-workspace" } });
+    // 验证持久化
+    await waitFor(() => {
+      const list = JSON.parse(localStorage.getItem("ha-workspaces") ?? "[]");
+      expect(list.length).toBe(1);
+      expect(list[0].path).toBe("D:\\new-workspace");
+    });
+  });
 });
