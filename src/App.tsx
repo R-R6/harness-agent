@@ -18,7 +18,7 @@ import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSuper
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
 import { listenWhileMounted } from "./lib/listenWhileMounted";
-import { addWorkspace, initWorkspaces, resolveDirChange, saveWorkspaces } from "./lib/workspaces";
+import { addWorkspace, initWorkspaces, saveWorkspaces } from "./lib/workspaces";
 import type { SessionInfo, TaskInfo, TranscriptEntry } from "./types";
 import pkg from "../package.json";
 import "./App.css";
@@ -115,10 +115,11 @@ function App() {
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const superviseRunning = tasks.filter((t) => t.status === "running").length;
 
-  // 目录输入桥接（非 readOnly 场景：终端 pane 或鼠标输入）
+  // 目录上报（终端 pane 输入/续聊）：与侧栏「+」同语义——命中既有空间→激活；
+  // 不命中→新建空间并激活；绝不原地改写既有空间路径（杜绝覆盖事故）
   const handleWorkDirChange = useCallback((rawDir: string) => {
-    const next = resolveDirChange(workspaces.list, workspaces.activeId, rawDir);
-    if (next.changed || next.activeId !== workspaces.activeId) {
+    const next = addWorkspace(workspaces.list, workspaces.activeId, rawDir);
+    if (next.changed) {
       setWorkspaces(next);
     }
   }, [workspaces]);
@@ -151,7 +152,7 @@ function App() {
       if (!trusted) return;
       // 追加语义（不是改目录）：命中既有空间→激活；否则新建，绝不覆盖既有空间
       const next = addWorkspace(workspaces.list, workspaces.activeId, dir.trim());
-      if (next.changed || next.activeId !== workspaces.activeId) {
+      if (next.changed) {
         setWorkspaces(next);
       }
     } catch {

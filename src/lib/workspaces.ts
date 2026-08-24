@@ -104,47 +104,9 @@ export function samePath(a: string, b: string): boolean {
 }
 
 /**
- * 目录输入桥接（阶段 A 过渡：旧 UI 仍是"输入目录"，新模型是空间列表）。
- * 语义：输入的目录匹配既有空间 → 激活它（Codex 的"切目录=切空间"心智）；
- * 否则若有激活空间 → 更新其路径（保留 id/位置）；列表为空 → 建第一个空间。
- * 纯函数，便于单测；App 侧 setState + saveWorkspaces。
- */
-export function resolveDirChange(
-  list: Workspace[],
-  activeId: string | null,
-  rawDir: string,
-): { list: Workspace[]; activeId: string | null; changed: boolean } {
-  const dir = rawDir.trim();
-  if (dir === "") {
-    // 清空输入不销毁空间模型（表单校验会拦空目录）
-    return { list, activeId, changed: false };
-  }
-  const hit = list.find((w) => samePath(w.path, dir));
-  if (hit) {
-    return { list, activeId: hit.id, changed: hit.id !== activeId };
-  }
-  if (list.length === 0) {
-    const first = makeWorkspace(dir, 0);
-    return { list: [first], activeId: first.id, changed: true };
-  }
-  const active = list.find((w) => w.id === activeId);
-  if (!active) {
-    // 无激活空间（异常态）：作为新空间追加并激活
-    const added = makeWorkspace(dir, nextPosition(list));
-    return { list: [...list, added], activeId: added.id, changed: true };
-  }
-  if (samePath(active.path, dir)) {
-    return { list, activeId, changed: false };
-  }
-  const updated = list.map((w) =>
-    w.id === active.id ? { ...w, path: dir, name: basenameOf(dir) } : w,
-  );
-  return { list: updated, activeId, changed: true };
-}
-
-/**
- * 添加工作空间（侧栏「+」专用语义，区别于 resolveDirChange 的"改目录"桥接）。
- * 命中既有空间 → 激活它（幂等）；否则**追加**新空间并激活——绝不覆盖既有空间。
+ * 目录变更统一语义（侧栏「+」/终端 pane 目录上报共用）：
+ * 命中既有空间 → 激活它（幂等）；否则**追加**新空间并激活——绝不覆盖既有空间
+ * （真实事故：曾复用"改目录"桥接导致添加新空间时覆盖激活空间路径）。
  * 纯函数，便于单测；App 侧 setState + saveWorkspaces。
  */
 export function addWorkspace(

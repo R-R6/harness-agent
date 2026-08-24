@@ -5,7 +5,6 @@ import {
   saveWorkspaces,
   nextPosition,
   samePath,
-  resolveDirChange,
   addWorkspace,
   basenameOf,
   type Workspace,
@@ -201,89 +200,6 @@ describe("saveWorkspaces", () => {
     saveWorkspaces([ws], ws.id);
     expect(getStoredActive()).toBe(ws.id);
     // 此时 activeId 不应为 null（initWorkspaces 会补上）
-  });
-});
-
-describe("resolveDirChange", () => {
-  let list: Workspace[];
-  let activeId: string;
-
-  beforeEach(() => {
-    list = [
-      makeWorkspace("C:\\project-a", 0),
-      makeWorkspace("C:\\project-b", 1),
-    ];
-    activeId = list[0].id;
-  });
-
-  it("空目录输入 → noop", () => {
-    const result = resolveDirChange(list, activeId, "");
-    expect(result.changed).toBe(false);
-    expect(result.list).toEqual(list);
-    expect(result.activeId).toBe(activeId);
-  });
-
-  it("空格目录输入 → noop（trim 后为空）", () => {
-    const result = resolveDirChange(list, activeId, "  ");
-    expect(result.changed).toBe(false);
-  });
-
-  // ---- 分支一：命中既有空间（按路径匹配）→ 激活切换 ----
-  it("命中既有空间 → 切换到该空间（changed=true）", () => {
-    const result = resolveDirChange(list, activeId, "C:\\project-b");
-    expect(result.changed).toBe(true);
-    expect(result.activeId).toBe(list[1].id);
-    expect(result.list).toEqual(list);
-  });
-
-  it("命中当前激活空间 → changed=false（已激活，无变化）", () => {
-    const result = resolveDirChange(list, activeId, "C:\\project-a");
-    expect(result.changed).toBe(false);
-    expect(result.activeId).toBe(activeId);
-  });
-
-  it("路径匹配大小写不敏感 → 命中并切换", () => {
-    const result = resolveDirChange(list, activeId, "c:\\PROJECT-B");
-    expect(result.changed).toBe(true);
-    expect(result.activeId).toBe(list[1].id);
-  });
-
-  // ---- 分支二：空列表 → 新建第一个空间 ----
-  it("空列表 → 建第一个空间并激活", () => {
-    const result = resolveDirChange([], null, "D:\\new-project");
-    expect(result.changed).toBe(true);
-    expect(result.list.length).toBe(1);
-    expect(result.list[0].path).toBe("D:\\new-project");
-    expect(result.list[0].position).toBe(0);
-    expect(result.activeId).toBe(result.list[0].id);
-  });
-
-  // ---- 分支三：更新激活空间的路径 ----
-  it("未命中已有空间、有激活空间 → 更新激活空间路径和名称", () => {
-    const result = resolveDirChange(list, activeId, "C:\\project-a-renamed");
-    expect(result.changed).toBe(true);
-    expect(result.activeId).toBe(activeId);
-    const updated = result.list.find((w) => w.id === activeId);
-    expect(updated?.path).toBe("C:\\project-a-renamed");
-    expect(updated?.name).toBe("project-a-renamed");
-    // 另一个空间未受影响
-    const other = result.list.find((w) => w.id === list[1].id);
-    expect(other?.path).toBe("C:\\project-b");
-  });
-
-  it("未命中、无激活空间 → 追加新空间并激活", () => {
-    const result = resolveDirChange(list, null, "D:\\orphan-dir");
-    expect(result.changed).toBe(true);
-    expect(result.list.length).toBe(3);
-    const added = result.list.find((w) => w.path === "D:\\orphan-dir");
-    expect(added).toBeDefined();
-    expect(added?.position).toBe(2); // nextPosition = 2
-    expect(result.activeId).toBe(added?.id);
-  });
-
-  it("更新路径与激活空间当前路径相同时 → changed=false", () => {
-    const result = resolveDirChange(list, activeId, "C:\\project-a");
-    expect(result.changed).toBe(false);
   });
 });
 
