@@ -16,6 +16,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ setTheme: mocks.setWindowTheme }),
 }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 const sessions: SessionInfo[] = [
   {
@@ -50,6 +51,7 @@ describe("App 集成", () => {
       if (cmd === "get_transcript") return Promise.resolve(transcript);
       if (cmd === "search_sessions") return Promise.resolve([sessions[0]]);
       if (cmd === "read_review_artifacts") return Promise.resolve([]);
+      if (cmd === "list_supervise_tasks") return Promise.resolve([]);
       return Promise.resolve(null);
     });
   });
@@ -63,15 +65,15 @@ describe("App 集成", () => {
     expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 });
   });
 
-  it("未开始监督任务时审查看板不读旧产物、显示空态", async () => {
+  it("无工作空间时监督 tab 显示空态，不读产物", async () => {
     render(<App />);
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
-    // 切到监督闭环 tab（看板 active 触发加载）
+    // 切到监督闭环 tab
     await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
     await waitFor(() => {
-      expect(screen.getByText(/暂无审查记录/)).toBeInTheDocument();
+      expect(screen.getByText(/尚无工作空间/)).toBeInTheDocument();
     });
-    // 关键断言：不回读磁盘上的上次产物（superviseDir 未设置时看板空置）
+    // 关键断言：无工作空间时不读磁盘产物
     expect(mocks.invoke).not.toHaveBeenCalledWith(
       "read_review_artifacts",
       expect.anything(),
@@ -294,19 +296,21 @@ describe("App 集成", () => {
     expect(activeId).toBe(list[0].id);
   });
 
-  it("监督表单修改目录 → 更新激活空间的路径并持久化", async () => {
+  it("有工作空间时监督 tab 显示侧栏 + 任务列表 + 表单（只读目录）", async () => {
+    localStorage.setItem("ha-project-work-dir", "D:\\my-project");
     render(<App />);
-    // 先切到监督 tab
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    // 切到监督 tab
     await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
-    await waitFor(() => expect(screen.getByPlaceholderText(/浏览选择/)).toBeInTheDocument());
-    // 使用 fireEvent.change 一次性设值，避免逐字符触发中间路径
+    // 左侧空间栏
+    await waitFor(() => expect(screen.getByText("my-project")).toBeInTheDocument());
+    // 任务列表空态
+    expect(screen.getByText("暂无任务记录。填写下方表单启动监督闭环。")).toBeInTheDocument();
+    // 表单目录只读展示（input disabled），显示激活空间路径
     const dirInput = screen.getByPlaceholderText(/浏览选择/) as HTMLInputElement;
-    fireEvent.change(dirInput, { target: { value: "D:\\new-workspace" } });
-    // 验证持久化
-    await waitFor(() => {
-      const list = JSON.parse(localStorage.getItem("ha-workspaces") ?? "[]");
-      expect(list.length).toBe(1);
-      expect(list[0].path).toBe("D:\\new-workspace");
-    });
+    expect(dirInput).toBeDisabled();
+    expect(dirInput).toHaveValue("D:\\my-project");
+    // 无浏览按钮（readOnly 隐藏浏览按钮，但导航「会话浏览」仍在）
+    expect(screen.queryByTitle("打开资源管理器选择目录")).not.toBeInTheDocument();
   });
 });

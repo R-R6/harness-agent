@@ -21,6 +21,7 @@ export type IconName =
   | "more"
   | "play"
   | "plug"
+  | "plus"
   | "refresh"
   | "search"
   | "send"
@@ -75,6 +76,7 @@ export function Icon({ name, size = 16, strokeWidth = 1.8, ...props }: Props) {
     more: <><circle cx="5" cy="12" r=".8" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r=".8" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r=".8" fill="currentColor" stroke="none" /></>,
     play: <path d="m8 5 11 7-11 7z" />,
     plug: <><path d="M9 7V3M15 7V3M7 7h10v3a5 5 0 0 1-10 0zM12 15v6" /></>,
+    plus: <><path d="M12 5v14M5 12h14" /></>,
     refresh: <><path d="M20 11a8 8 0 0 0-14.8-4L3 10" /><path d="M3 5v5h5M4 13a8 8 0 0 0 14.8 4L21 14" /><path d="M21 19v-5h-5" /></>,
     search: <><circle cx="10.8" cy="10.8" r="6.5" /><path d="m16 16 4.5 4.5" /></>,
     send: <><path d="m21 3-7.2 18-3.2-7.6L3 10.2z" /><path d="M10.6 13.4 21 3" /></>,

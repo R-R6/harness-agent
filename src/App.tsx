@@ -5,17 +5,21 @@ import { TranscriptView } from "./components/TranscriptView";
 import { SearchBox } from "./components/SearchBox";
 import { SupervisePanel } from "./components/SupervisePanel";
 import { ReviewBoard } from "./components/ReviewBoard";
+import { TaskList } from "./components/TaskList";
+import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { MCPStatusPanel } from "./components/MCPStatusPanel";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Icon, IconButton, type IconName } from "./components/Icon";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalWorkspace, type TerminalWorkspaceHandle } from "./components/TerminalWorkspace";
 import { SplitHandle } from "./components/SplitHandle";
 import harnessMark from "./assets/harness-mark.svg";
-import { fetchSessions, fetchTranscript, searchSessions } from "./lib/api";
+import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSupervise } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
+import { listenWhileMounted } from "./lib/listenWhileMounted";
 import { initWorkspaces, resolveDirChange, saveWorkspaces } from "./lib/workspaces";
-import type { SessionInfo, TranscriptEntry } from "./types";
+import type { SessionInfo, TaskInfo, TranscriptEntry } from "./types";
 import pkg from "../package.json";
 import "./App.css";
 
@@ -104,16 +108,14 @@ function App() {
   // ---- 监督闭环状态（常驻 App）----
   // 工作空间一级实体（Codex Project 精神）：path 为身份、position 保序；
   // 项目工作目录 = 激活空间的 path（Claude 终端 pane 与监督表单共享）。
-  // superviseDir 记录最近一次启动监督的目录，审查看板跟随（未启动任务时空置）
   const [workspaces, setWorkspaces] = useState(() => initWorkspaces());
   const activeWorkspace = workspaces.list.find((w) => w.id === workspaces.activeId) ?? workspaces.list[0] ?? null;
   const projectWorkDir = activeWorkspace?.path ?? "";
-  const [superviseDir, setSuperviseDir] = useState<string | null>(null);
   const [terminalRunning, setTerminalRunning] = useState(0);
-  const [superviseRunning, setSuperviseRunning] = useState(0);
+  const [tasks, setTasks] = useState<TaskInfo[]>([]);
+  const superviseRunning = tasks.filter((t) => t.status === "running").length;
 
-  // 目录输入桥接：命中既有空间 → 切换激活；空表 → 建首个空间；否则更新激活空间路径。
-  // 换目录 = 切换/新建空间（Codex 同款心智），不再原地改某个全局字符串。
+  // 目录输入桥接（非 readOnly 场景：终端 pane 或鼠标输入）
   const handleWorkDirChange = useCallback((rawDir: string) => {
     const next = resolveDirChange(workspaces.list, workspaces.activeId, rawDir);
     if (next.changed || next.activeId !== workspaces.activeId) {
@@ -126,11 +128,70 @@ function App() {
     saveWorkspaces(workspaces.list, workspaces.activeId);
   }, [workspaces]);
 
-  const handleSuperviseRunningChange = useCallback((running: boolean) => {
-    setSuperviseRunning(running ? 1 : 0);
+  /** 切换激活空间 */
+  const handleSelectWorkspace = useCallback((id: string) => {
+    setWorkspaces((prev) => ({ ...prev, activeId: id }));
   }, []);
 
-  /** 终端驱动监督启动后切到终端 tab：监督的核心体验是干活全程可见 */
+  /** 添加工作空间：打开系统目录选择器，创建新空间并激活 */
+  const handleAddWorkspace = useCallback(async () => {
+    try {
+      const dir = await open({
+        directory: true,
+        multiple: false,
+        title: "选择项目工作目录作为工作空间",
+      });
+      if (typeof dir !== "string" || !dir.trim()) return;
+      const next = resolveDirChange(workspaces.list, workspaces.activeId, dir.trim());
+      if (next.changed || next.activeId !== workspaces.activeId) {
+        setWorkspaces(next);
+      }
+    } catch {
+      // 用户取消选择或无权限
+    }
+  }, [workspaces]);
+
+  /** 移除工作空间 */
+  const handleRemoveWorkspace = useCallback((id: string) => {
+    setWorkspaces((prev) => {
+      const filtered = prev.list.filter((w) => w.id !== id);
+      const newActive = prev.activeId === id ? (filtered[0]?.id ?? null) : prev.activeId;
+      return { list: filtered, activeId: newActive };
+    });
+  }, []);
+
+  /** 加载任务列表（从后端任务注册表） */
+  const loadTasks = useCallback(async () => {
+    try {
+      setTasks(await fetchTasks());
+    } catch {
+      // 列表加载失败不阻断 UI
+    }
+  }, []);
+
+  // 切入监督 tab 时刷新任务列表
+  useEffect(() => {
+    if (tab === "supervise") void loadTasks();
+  }, [tab, loadTasks]);
+
+  // 监听 supervise-done 事件自动刷新任务列表（运行中→终态更新）
+  useEffect(() => {
+    const stop = listenWhileMounted("supervise-done", () => {
+      void loadTasks();
+    });
+    return stop;
+  }, [loadTasks]);
+
+  /** 取消运行中的监督任务 */
+  const handleCancelTask = useCallback(async (taskId: string) => {
+    try {
+      await cancelSupervise(taskId);
+    } catch {
+      // 取消失败静默
+    }
+  }, []);
+
+  /** 终端驱动监督启动后切到终端 tab */
   const handleDriveStarted = useCallback(() => {
     setTab("terminals");
   }, []);
@@ -346,10 +407,6 @@ function App() {
       setLoadingEarlier(false);
     }
   }, [selected, transcript, transcriptHasMore, loadingEarlier]);
-
-  const handleSuperviseStarted = useCallback((workDir: string) => {
-    setSuperviseDir(workDir);
-  }, []);
 
   const handleMcpHealthChange = useCallback((health: McpHealth) => {
     setMcpHealth(health);
@@ -591,39 +648,69 @@ function App() {
         </section>
 
         <section className={`view ${tab === "supervise" ? "active" : ""}`} aria-hidden={tab !== "supervise"}>
-          <div
-            className={`supervise-layout ${compactSupervise ? "supervise-layout--stacked" : ""}`}
-            ref={superviseLayoutRef}
-          >
-            <div
-              className="panel-container"
-              style={compactSupervise ? { height: panelHeight } : { width: panelWidth }}
-            >
-              <SupervisePanel
-                workDir={projectWorkDir}
-                onWorkDirChange={handleWorkDirChange}
-                onStarted={handleSuperviseStarted}
-                onRunningChange={handleSuperviseRunningChange}
-                onDriveStarted={handleDriveStarted}
-              />
+          <div className="supervise-closed-loop">
+            <WorkspaceSidebar
+              workspaces={workspaces.list}
+              activeId={workspaces.activeId}
+              onSelect={handleSelectWorkspace}
+              onAdd={handleAddWorkspace}
+              onRemove={handleRemoveWorkspace}
+            />
+            <div className="supervise-closed-loop__main">
+              {!activeWorkspace ? (
+                <div className="empty-state">
+                  <div className="empty-state__icon"><Icon name="folder-open" size={20} /></div>
+                  <div className="empty-state__copy">
+                    <strong>尚无工作空间</strong>
+                    <span>点击左侧「+」添加一个项目目录，开始监督闭环。</span>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="supervise-tasks">
+                    <div className="supervise-tasks__head">
+                      <span className="eyebrow">ACTIVE</span>
+                      <h4>任务记录</h4>
+                      <span className="count-pill">{tasks.length}</span>
+                    </div>
+                    <TaskList tasks={tasks} onCancel={handleCancelTask} />
+                  </div>
+                  <div
+                    className={`supervise-layout ${compactSupervise ? "supervise-layout--stacked" : ""}`}
+                    ref={superviseLayoutRef}
+                  >
+                    <div
+                      className="panel-container"
+                      style={compactSupervise ? { height: panelHeight } : { width: panelWidth }}
+                    >
+                      <SupervisePanel
+                        workDir={projectWorkDir}
+                        onWorkDirChange={handleWorkDirChange}
+                        readOnly
+                        onStarted={() => void loadTasks()}
+                        onRunningChange={() => {}}
+                        onDriveStarted={handleDriveStarted}
+                      />
+                    </div>
+                    <SplitHandle
+                      orientation={compactSupervise ? "horizontal" : "vertical"}
+                      label={compactSupervise ? "调整监督配置高度" : "调整监督配置宽度"}
+                      value={compactSupervise ? panelHeight : panelWidth}
+                      min={compactSupervise ? SUPERVISE_HEIGHT_MIN : SUPERVISE_WIDTH_MIN}
+                      max={getSupervisePanelMax}
+                      onChange={compactSupervise ? setPanelHeight : setPanelWidth}
+                      className="supervise-split"
+                      valueText={`监督配置${compactSupervise ? "高度" : "宽度"} ${Math.round(compactSupervise ? panelHeight : panelWidth)} 像素`}
+                    />
+                    <ReviewBoard
+                      workDir={projectWorkDir}
+                      onViewSession={openTranscriptByFile}
+                      active={tab === "supervise"}
+                    />
+                  </div>
+                </>
+              )}
             </div>
-            <SplitHandle
-              orientation={compactSupervise ? "horizontal" : "vertical"}
-              label={compactSupervise ? "调整监督配置高度" : "调整监督配置宽度"}
-              value={compactSupervise ? panelHeight : panelWidth}
-              min={compactSupervise ? SUPERVISE_HEIGHT_MIN : SUPERVISE_WIDTH_MIN}
-              max={getSupervisePanelMax}
-              onChange={compactSupervise ? setPanelHeight : setPanelWidth}
-              className="supervise-split"
-              valueText={`监督配置${compactSupervise ? "高度" : "宽度"} ${Math.round(compactSupervise ? panelHeight : panelWidth)} 像素`}
-            />
-            <ReviewBoard
-              /* 只认本会话启动过的任务目录：没开始新任务时不回读磁盘上的
-                 上次产物（旧卡片误导"已有结论"）；任务启动即指向真实目录 */
-              workDir={superviseDir ?? ""}
-              onViewSession={openTranscriptByFile}
-              active={tab === "supervise"}
-            />
           </div>
         </section>
 

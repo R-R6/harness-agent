@@ -8,7 +8,9 @@ interface Props {
   /** 工作目录（受控：由 App 持有的项目上下文，与 Claude 终端 pane 同源） */
   workDir: string;
   onWorkDirChange: (dir: string) => void;
-  /** 启动成功后回调（携带启动时的目录，供审查看板定位 .supervise 产物） */
+  /** 只读模式（阶段 C）：目录 = 激活空间，只读展示；换目录=侧栏切空间 */
+  readOnly?: boolean;
+  /** 启动成功后回调（携带启动时的目录，供审看看板定位 .supervise 产物） */
   onStarted: (workDir: string) => void;
   /** 运行状态变化（true=有监督任务在跑，供状态栏计数） */
   onRunningChange?: (running: boolean) => void;
@@ -22,7 +24,7 @@ interface LogLine {
 }
 
 /** 闭环启动器：任务表单 + 启动/取消 + 实时日志流 */
-export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningChange, onDriveStarted }: Props) {
+export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onStarted, onRunningChange, onDriveStarted }: Props) {
   const [task, setTask] = useState("");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
@@ -138,10 +140,14 @@ export function SupervisePanel({ workDir, onWorkDirChange, onStarted, onRunningC
               value={workDir}
               onChange={(e) => onWorkDirChange(e.currentTarget.value)}
               placeholder="Claude 干活的项目目录（可点击浏览选择）"
+              disabled={readOnly}
+              readOnly={readOnly}
             />
-            <button type="button" className="browse" onClick={browseDir} title="打开资源管理器选择目录">
-              <Icon name="folder-open" size={14} /> 浏览
-            </button>
+            {!readOnly && (
+              <button type="button" className="browse" onClick={browseDir} title="打开资源管理器选择目录">
+                <Icon name="folder-open" size={14} /> 浏览
+              </button>
+            )}
           </div>
         </label>
         <div className="form-row">
