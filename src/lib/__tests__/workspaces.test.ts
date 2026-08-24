@@ -6,6 +6,7 @@ import {
   nextPosition,
   samePath,
   resolveDirChange,
+  addWorkspace,
   basenameOf,
   type Workspace,
 } from "../workspaces";
@@ -283,5 +284,59 @@ describe("resolveDirChange", () => {
   it("更新路径与激活空间当前路径相同时 → changed=false", () => {
     const result = resolveDirChange(list, activeId, "C:\\project-a");
     expect(result.changed).toBe(false);
+  });
+});
+
+describe("addWorkspace", () => {
+  let list: Workspace[];
+  let activeId: string;
+
+  beforeEach(() => {
+    list = [
+      makeWorkspace("C:\\project-a", 0),
+      makeWorkspace("C:\\project-b", 1),
+    ];
+    activeId = list[0].id;
+  });
+
+  it("空输入 → noop", () => {
+    const result = addWorkspace(list, activeId, "");
+    expect(result.changed).toBe(false);
+    expect(result.list).toEqual(list);
+  });
+
+  it("新增目录 → 追加新空间并激活，既有空间全部保留（回归：不覆盖激活空间）", () => {
+    const result = addWorkspace(list, activeId, "D:\\project-c");
+    expect(result.changed).toBe(true);
+    expect(result.list.length).toBe(3);
+    // 既有两个空间原封不动
+    expect(result.list[0].path).toBe("C:\\project-a");
+    expect(result.list[1].path).toBe("C:\\project-b");
+    // 新空间追加在尾部
+    const added = result.list[2];
+    expect(added.path).toBe("D:\\project-c");
+    expect(added.position).toBe(2);
+    expect(result.activeId).toBe(added.id);
+  });
+
+  it("新增目录 = 激活空间原路径 → 命中，不重复添加", () => {
+    const result = addWorkspace(list, activeId, "C:\\project-a");
+    expect(result.changed).toBe(false);
+    expect(result.list.length).toBe(2);
+    expect(result.activeId).toBe(activeId);
+  });
+
+  it("新增目录命中其他空间（大小写不敏感）→ 激活它，不新增", () => {
+    const result = addWorkspace(list, activeId, "c:\\PROJECT-B");
+    expect(result.changed).toBe(true);
+    expect(result.list.length).toBe(2);
+    expect(result.activeId).toBe(list[1].id);
+  });
+
+  it("空列表 → 建第一个空间", () => {
+    const result = addWorkspace([], null, "D:\\first");
+    expect(result.list.length).toBe(1);
+    expect(result.list[0].path).toBe("D:\\first");
+    expect(result.activeId).toBe(result.list[0].id);
   });
 });

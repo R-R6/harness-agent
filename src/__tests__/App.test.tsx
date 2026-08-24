@@ -356,4 +356,26 @@ describe("App 集成", () => {
       expect(list.length).toBe(0);
     });
   });
+
+  it("已有空间时添加第二个空间 → 追加而非覆盖（多空间回归）", async () => {
+    localStorage.setItem("ha-project-work-dir", "D:\\space-one");
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "添加工作空间" })).toBeInTheDocument());
+    // 添加第二个空间
+    mocks.dialogOpen.mockResolvedValue("D:\\space-two");
+    await userEvent.click(screen.getByRole("button", { name: "添加工作空间" }));
+    await waitFor(() => expect(mocks.dialogConfirm).toHaveBeenCalledTimes(1));
+    // 关键断言：两个空间都在，第一个没被覆盖
+    await waitFor(() => {
+      const list = JSON.parse(localStorage.getItem("ha-workspaces") ?? "[]");
+      expect(list.length).toBe(2);
+      expect(list.some((w: { path: string }) => w.path === "D:\\space-one")).toBe(true);
+      expect(list.some((w: { path: string }) => w.path === "D:\\space-two")).toBe(true);
+    });
+    // 激活的是新空间，且侧栏能看到两个
+    expect(screen.getByText("space-two")).toBeInTheDocument();
+    expect(screen.getByText("space-one")).toBeInTheDocument();
+  });
 });

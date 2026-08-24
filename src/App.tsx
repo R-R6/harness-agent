@@ -18,7 +18,7 @@ import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSuper
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
 import { listenWhileMounted } from "./lib/listenWhileMounted";
-import { initWorkspaces, resolveDirChange, saveWorkspaces } from "./lib/workspaces";
+import { addWorkspace, initWorkspaces, resolveDirChange, saveWorkspaces } from "./lib/workspaces";
 import type { SessionInfo, TaskInfo, TranscriptEntry } from "./types";
 import pkg from "../package.json";
 import "./App.css";
@@ -149,7 +149,8 @@ function App() {
         { title: "添加工作空间", kind: "info" },
       );
       if (!trusted) return;
-      const next = resolveDirChange(workspaces.list, workspaces.activeId, dir.trim());
+      // 追加语义（不是改目录）：命中既有空间→激活；否则新建，绝不覆盖既有空间
+      const next = addWorkspace(workspaces.list, workspaces.activeId, dir.trim());
       if (next.changed || next.activeId !== workspaces.activeId) {
         setWorkspaces(next);
       }

@@ -142,4 +142,26 @@ export function resolveDirChange(
   return { list: updated, activeId, changed: true };
 }
 
+/**
+ * 添加工作空间（侧栏「+」专用语义，区别于 resolveDirChange 的"改目录"桥接）。
+ * 命中既有空间 → 激活它（幂等）；否则**追加**新空间并激活——绝不覆盖既有空间。
+ * 纯函数，便于单测；App 侧 setState + saveWorkspaces。
+ */
+export function addWorkspace(
+  list: Workspace[],
+  activeId: string | null,
+  rawDir: string,
+): { list: Workspace[]; activeId: string | null; changed: boolean } {
+  const dir = rawDir.trim();
+  if (dir === "") {
+    return { list, activeId, changed: false };
+  }
+  const hit = list.find((w) => samePath(w.path, dir));
+  if (hit) {
+    return { list, activeId: hit.id, changed: hit.id !== activeId };
+  }
+  const added = makeWorkspace(dir, nextPosition(list));
+  return { list: [...list, added], activeId: added.id, changed: true };
+}
+
 export type WorkspacesSetter = Dispatch<SetStateAction<Workspace[]>>;
