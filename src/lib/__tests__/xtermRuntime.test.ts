@@ -20,6 +20,18 @@ describe("buildXtermOptions", () => {
     expect(options.windowsPty).toBeUndefined();
   });
 
+  it("uses a macOS font stack with CJK fallbacks on Mac", () => {
+    const options = buildXtermOptions({
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      platform: "MacIntel",
+    });
+    expect(options.fontFamily).toContain("SF Mono");
+    expect(options.fontFamily).toContain("PingFang SC");
+    expect(options.fontFamily).toContain("Hiragino Sans GB");
+    expect(options.fontFamily).not.toContain("NSimSun");
+    expect(options.lineHeight).toBe(1.15);
+  });
+
   it("enables ConPTY viewport compensation on Windows without faking a build number", () => {
     const options = buildXtermOptions({
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
