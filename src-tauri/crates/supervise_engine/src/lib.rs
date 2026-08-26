@@ -879,6 +879,10 @@ mod tests {
         std::fs::write(dir.join(".supervise").join("final-report.json"), "stale").unwrap();
         let marker_guard = dir.join(".supervise").join("stop-markers.jsonl");
         std::fs::write(&marker_guard, "keep").unwrap();
+        let isolated = dir.join(".supervise").join("tasks").join("task-1");
+        std::fs::create_dir_all(&isolated).unwrap();
+        let isolated_review = isolated.join("review-1.md");
+        std::fs::write(&isolated_review, "keep-headless").unwrap();
 
         let outcome = run(
             &opts,
@@ -920,8 +924,10 @@ mod tests {
             "verdicts 需带会话文件路径（看板跳转依赖）"
         );
         assert!(marker_guard.exists(), "stop-markers.jsonl 不能被清理误伤");
+        assert!(isolated_review.exists(), "引擎 reset 不得删除 tasks/ 子目录");
+        assert_eq!(std::fs::read_to_string(&isolated_review).unwrap(), "keep-headless");
         // 跨 crate 契约：看板数据链（read_artifacts）必须能消费引擎产物
-        let arts = supervise_runner::read_artifacts(&dir.to_string_lossy()).expect("read_artifacts 应解析引擎产物");
+        let arts = supervise_runner::read_artifacts(&dir.to_string_lossy(), None).expect("read_artifacts 应解析引擎产物");
         assert_eq!(arts.len(), 2);
         assert_eq!(arts[0].verdict, "REVIEW");
         assert_eq!(arts[1].verdict, "PASS");

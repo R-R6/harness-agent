@@ -231,15 +231,24 @@ function Invoke-MockRework {
 # 目录：$WorkDir\.supervise\（Mock 模式同样落盘，供 sim-test 断言）
 # 编码策略（Codex #7）：md 用 UTF-8 with BOM（PS 5.1 中文兼容）；json 用 UTF-8 无 BOM（Node JSON.parse 直接可读）
 
+function Get-ArtifactDir {
+  $id = $env:SUPERVISE_TASK_ID
+  if ([string]::IsNullOrWhiteSpace($id)) {
+    throw "SUPERVISE_TASK_ID 未设置：拒绝清理整个 .supervise（会误删其他任务产物和 stop-markers）"
+  }
+  Join-Path (Get-Location) (Join-Path ".supervise" (Join-Path "tasks" $id))
+}
+
 function Reset-ArtifactDir {
-  # 幂等（Codex #6）：启动时清空 .supervise，避免上次 5 轮跑完这次 1 轮时残留 review-2..5
-  $dir = Join-Path (Get-Location) ".supervise"
+  # 只清本任务子目录，禁止 Remove-Item .supervise -Recurse
+  $dir = Get-ArtifactDir
   if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
 
 function Write-ReviewArtifact {
   param([int]$Round, [string]$Verdict, [string]$Reason, [string]$Model, [string]$SessionId, [string]$File)
-  $dir = Join-Path (Get-Location) ".supervise"
+  $dir = Get-ArtifactDir
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
   $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
   $md = @"
