@@ -105,4 +105,22 @@ describe("ReviewBoard", () => {
     rerender(<ReviewBoard workDir={"D:\\work"} active={true} />);
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(2));
   });
+
+  it("传入 taskId 时请求带上该参数；省略时 payload 不含 taskId", async () => {
+    mocks.invoke.mockResolvedValue([]);
+    const { rerender } = render(<ReviewBoard workDir={"D:\\work"} taskId="task-9" />);
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("read_review_artifacts", {
+        workDir: "D:\\work",
+        taskId: "task-9",
+      });
+    });
+    mocks.invoke.mockClear();
+    rerender(<ReviewBoard workDir={"D:\\work"} />);
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("read_review_artifacts", {
+        workDir: "D:\\work",
+      });
+    });
+  });
 });

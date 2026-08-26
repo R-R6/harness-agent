@@ -1,22 +1,25 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { TerminalWorkspace, type TerminalWorkspaceHandle } from "../TerminalWorkspace";
 import { CODEX_CURSOR_PIN } from "../../lib/xtermRuntime";
 
 /** 与 App 中一致的受控宿主：Claude pane 的项目目录由父组件持有 */
 const PROJECT_DIR = "F:\\project\\workspace-side\\Harness_agent";
 
-function WorkspaceHost({ active = true }: { active?: boolean }) {
-  const [dir, setDir] = useState(PROJECT_DIR);
+function WorkspaceHost({ active = true, projectDir = PROJECT_DIR }: { active?: boolean; projectDir?: string }) {
+  const [dir, setDir] = useState(projectDir);
+  useEffect(() => {
+    setDir(projectDir);
+  }, [projectDir]);
   return (
     <TerminalWorkspace active={active} projectWorkDir={dir} onProjectWorkDirChange={setDir} />
   );
 }
 
-function renderHost(active = true) {
-  return render(<WorkspaceHost active={active} />);
+function renderHost(active = true, projectDir = PROJECT_DIR) {
+  return render(<WorkspaceHost active={active} projectDir={projectDir} />);
 }
 
 const mocks = vi.hoisted(() => {
@@ -420,6 +423,61 @@ describe("TerminalWorkspace", () => {
     expect(screen.getByLabelText("Codex CLI 工作目录")).toHaveValue(
       "F:\\project\\workspace-side\\Harness_agent",
     );
+  });
+
+  it("Claude 运行中切到不同目录时提示归属不符，不停止会话", async () => {
+    const { rerender } = renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+    await waitFor(() => expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument());
+
+    rerender(<WorkspaceHost projectDir="D:\\other-space" />);
+    const banner = await screen.findByRole("status");
+    expect(banner).toHaveTextContent("Harness_agent");
+    expect(banner).toHaveTextContent("other-space");
+    expect(banner).toHaveTextContent("停止后重新启动才会切到新空间");
+    expect(mocks.invoke.mock.calls.some((call) => call[0] === "stop_terminal")).toBe(false);
+    expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
+  });
+
+  it("Claude 运行中目录仍匹配时不提示；未启动时换目录也不提示", async () => {
+    const { rerender } = renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+    rerender(<WorkspaceHost projectDir="D:\\other-space" />);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+    rerender(<WorkspaceHost projectDir={PROJECT_DIR} />);
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+    await waitFor(() => expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument());
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("切空间横幅只出现在 Claude pane，不出现在 Codex pane", async () => {
+    mocks.invoke.mockImplementation((command: string, payload?: { request?: { agent: string } }) => {
+      if (command === "start_terminal") {
+        const agent = payload?.request?.agent ?? "claude";
+        return Promise.resolve({
+          id: `terminal-${agent}-1`,
+          agent,
+          work_dir: agent === "claude" ? PROJECT_DIR : PROJECT_DIR,
+          status: "running",
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+    const { rerender } = renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })).toHaveLength(2));
+    const startButtons = screen.getAllByRole("button", { name: "启动" });
+    await userEvent.click(startButtons[0]);
+    await userEvent.click(startButtons[1]);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "停止 Codex CLI" })).toBeInTheDocument();
+    });
+    rerender(<WorkspaceHost projectDir="D:\\other-space" />);
+    const banners = await screen.findAllByRole("status");
+    expect(banners).toHaveLength(1);
+    expect(banners[0]).toHaveTextContent("Claude");
   });
 
   it("目录选择器取消时保持当前工作目录不变", async () => {

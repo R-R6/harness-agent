@@ -7,6 +7,7 @@ import { resizeTerminal, startTerminal, stopTerminal, writeTerminal } from "../l
 import { buildXtermOptions, CODEX_CURSOR_PIN, createOutputStabilizer, loadXtermRuntime, pinCursorSteady } from "../lib/xtermRuntime";
 import { listenWhileMounted } from "../lib/listenWhileMounted";
 import type { TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
+import { basenameOf, samePath } from "../lib/workspaces";
 import { Icon, IconButton } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
 import { useElementSize, useStoredNumber, useStoredString } from "../lib/layoutPreferences";
@@ -567,6 +568,13 @@ function TerminalPane({
     error: "需要处理",
   }[pane.status];
 
+  const sessionDir = pane.session?.work_dir ?? "";
+  const claudeDirMismatch =
+    agent.id === "claude" &&
+    pane.status === "running" &&
+    Boolean(sessionDir) &&
+    !samePath(sessionDir, workDir);
+
   return (
     <article className={`terminal-pane terminal-pane--${agent.id}`}>
       <header className="terminal-pane__head">
@@ -626,6 +634,11 @@ function TerminalPane({
           </button>
         )}
       </div>
+      {claudeDirMismatch && (
+        <div className="terminal-pane__mismatch" role="status">
+          当前 Claude 终端对话属于「{basenameOf(sessionDir)}」，与激活空间「{basenameOf(workDir)}」不同。停止后重新启动才会切到新空间。
+        </div>
+      )}
       <div ref={hostRef} className="terminal-surface" aria-label={`${agent.label} 终端输出`} />
       {(pane.error || terminalError) && (
         <div className="terminal-pane__error" role="alert">

@@ -72,7 +72,6 @@ describe("TaskList", () => {
     }
   });
 
-
   it("已中止且有 session_file 时显示重试审查并回调", async () => {
     const onRetry = vi.fn();
     const tasks = [
@@ -104,5 +103,21 @@ describe("TaskList", () => {
       false,
     );
     expect(canRetryReview(makeTask({ status: "accepted", session_file: "/x" }))).toBe(false);
+  });
+
+  it("点击行选中任务；点取消不触发选中", async () => {
+    const onCancel = vi.fn();
+    const onSelect = vi.fn();
+    const tasks = [
+      makeTask({ id: "task-1", status: "running" }),
+      makeTask({ id: "task-2", status: "running", work_dir: "D:\\other" }),
+    ];
+    render(<TaskList tasks={tasks} onCancel={onCancel} selectedId="task-1" onSelect={onSelect} />);
+    await userEvent.click(screen.getByTitle("D:\\other"));
+    expect(onSelect).toHaveBeenCalledWith("task-2");
+    onSelect.mockClear();
+    await userEvent.click(screen.getAllByRole("button", { name: /取消/ })[1]);
+    expect(onCancel).toHaveBeenCalledWith("task-2");
+    expect(onSelect).not.toHaveBeenCalled();
   });
 });

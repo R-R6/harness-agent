@@ -7,7 +7,7 @@ use supervise_engine::{
 use supervise_runner::{ReviewArtifact, SuperviseRequest};
 use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command, wait as wait_terminal_process, write_input as write_terminal_input};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -83,12 +83,22 @@ fn ps1_exit_to_status(code: Option<i64>) -> TaskStatus {
 struct SuperviseState {
     /// task_id → 运行中的子进程（ps1 无头模式，用于取消）
     running: Mutex<HashMap<String, std::process::Child>>,
-    /// 正在跑监督任务的工作目录（并发锁：同目录只能跑一个）
-    busy_workdirs: Mutex<Vec<String>>,
+    /// 终端驱动引擎：同目录互斥（一个 Claude pane 同时只能注入一个任务）
+    engine_busy_dirs: Mutex<HashSet<String>>,
     /// task_id → 终端驱动引擎（阶段 2）的取消标志
     engine_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 任务注册表（含历史终态；应用退出即清，重启后历史消失属预期）
     tasks: Mutex<HashMap<String, TaskInfo>>,
+}
+
+fn engine_dir_available(busy: &HashSet<String>, dir: &str) -> bool {
+    !busy.contains(dir)
+}
+
+fn release_engine_dir(state: &SuperviseState, dir: &str) {
+    if let Ok(mut busy) = state.engine_busy_dirs.lock() {
+        busy.remove(dir);
+    }
 }
 
 impl SuperviseState {
@@ -451,30 +461,16 @@ async fn run_supervise(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
-    // 检查与登记必须同一次持锁完成：分成两段锁的话，并发启动同目录的两个
-    // 任务都能通过检查（TOCTOU）。spawn 失败时回滚登记。
-    {
-        let mut busy = state.busy_workdirs.lock().unwrap();
-        if busy.contains(&work_dir) {
-            return Err(format!("工作目录 {work_dir} 已有监督任务在运行"));
-        }
-        busy.push(work_dir.clone());
-    }
-
-    let mut child = match supervise_runner::spawn_supervise(&request) {
-        Ok(c) => c,
-        Err(e) => {
-            state
-                .busy_workdirs
-                .lock()
-                .unwrap()
-                .retain(|w| w != &work_dir);
-            return Err(e);
-        }
-    };
+    // 无头模式：同目录可并发（产物按 task_id 隔离）。先分配 id 再 spawn，
+    // 以便 SUPERVISE_TASK_ID 进入子进程环境。
     let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
+
+    let mut child = match supervise_runner::spawn_supervise(&request, Some(&task_id)) {
+        Ok(c) => c,
+        Err(e) => return Err(e),
+    };
     let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
-    // stderr 必须有人消费：写满管道缓冲会挂死子进程（busy_workdirs 永不清理）。
+    // stderr 必须有人消费：写满管道缓冲会挂死子进程（任务永不收尾）。
     // 逐行并入 supervise-log（带 [stderr] 前缀），诊断信息直接进 UI 日志流。
     let stderr = child.stderr.take();
     state.running.lock().unwrap().insert(task_id.clone(), child);
@@ -497,7 +493,6 @@ async fn run_supervise(
     // 后台线程读 stdout → 逐行 emit 到前端；进程结束后清理 State 并 emit done
     let app2 = app.clone();
     let task_id2 = task_id.clone();
-    let work_dir2 = work_dir.clone();
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(stdout);
         for line in reader.lines() {
@@ -525,11 +520,6 @@ async fn run_supervise(
                 t.status = ps1_exit_to_status(exit_code);
             }
         }
-        running
-            .busy_workdirs
-            .lock()
-            .unwrap()
-            .retain(|w| w != &work_dir2);
         let _ = app2.emit(
             "supervise-done",
             serde_json::json!({ "taskId": task_id2, "exitCode": exit_code }),
@@ -650,31 +640,34 @@ async fn run_supervise_terminal(
             })?
     };
 
-    // 目录占用登记（与 run_supervise 同款防竞态：同锁检查+登记）
+    // 目录占用登记（仅引擎：同 Claude pane 不能并行注入）
     {
-        let mut busy = state.busy_workdirs.lock().unwrap();
-        if busy.contains(&work_dir) {
-            return Err(format!("工作目录 {work_dir} 已有监督任务在运行"));
+        let mut busy = state.engine_busy_dirs.lock().unwrap();
+        if !engine_dir_available(&busy, &work_dir) {
+            return Err("该工作目录已有终端驱动任务在运行（同一 Claude 会话不能并行注入）".into());
         }
-        busy.push(work_dir.clone());
+        busy.insert(work_dir.clone());
     }
 
     // Stop hook 幂等安装 + marker 文件（.supervise/stop-markers.jsonl，随项目走）
     let supervise_dir = std::path::Path::new(&request.work_dir).join(".supervise");
     if let Err(e) = std::fs::create_dir_all(&supervise_dir) {
-        // 登记之后的所有失败路径都必须回滚，否则该目录被永久锁死
-        state.busy_workdirs.lock().unwrap().retain(|w| w != &work_dir);
+        release_engine_dir(&state, &work_dir);
         return Err(format!("创建 .supervise 失败: {e}"));
     }
     let marker_file = supervise_dir.join("stop-markers.jsonl");
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| "无法定位用户主目录（USERPROFILE/HOME 均缺失）".to_string())?;
+    let home = match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        Ok(h) => h,
+        Err(_) => {
+            release_engine_dir(&state, &work_dir);
+            return Err("无法定位用户主目录（USERPROFILE/HOME 均缺失）".into());
+        }
+    };
     let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
     let hook_installed = !request.mock;
     if hook_installed {
         if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
-            state.busy_workdirs.lock().unwrap().retain(|w| w != &work_dir);
+            release_engine_dir(&state, &work_dir);
             return Err(format!("安装 Stop hook 失败（可重试或改用无头模式）: {e}"));
         }
     }
@@ -780,10 +773,10 @@ async fn run_supervise_terminal(
             flags.len()
         };
         app_state
-            .busy_workdirs
+            .engine_busy_dirs
             .lock()
             .unwrap()
-            .retain(|w| w != &work_dir2);
+            .remove(&work_dir2);
         if hook_installed && remaining_engines == 0 {
             if let Err(e) = remove_stop_hook(&settings2, &marker_file2) {
                 eprintln!("[supervise] 卸载 Stop hook 失败（不影响任务结果）: {e}");
@@ -866,27 +859,33 @@ async fn retry_supervise_review(app: AppHandle, task_id: String) -> Result<Strin
     };
 
     {
-        let mut busy = state.busy_workdirs.lock().unwrap();
-        if busy.contains(&lock_key) {
-            return Err(format!("工作目录 {lock_key} 已有监督任务在运行"));
+        let mut busy = state.engine_busy_dirs.lock().unwrap();
+        if !engine_dir_available(&busy, &lock_key) {
+            return Err(format!(
+                "工作目录 {lock_key} 已有终端驱动任务在运行（同一 Claude 会话不能并行注入）"
+            ));
         }
-        busy.push(lock_key.clone());
+        busy.insert(lock_key.clone());
     }
 
     let supervise_dir = std::path::Path::new(&pane_work_dir).join(".supervise");
     if let Err(e) = std::fs::create_dir_all(&supervise_dir) {
-        state.busy_workdirs.lock().unwrap().retain(|w| w != &lock_key);
+        release_engine_dir(&state, &lock_key);
         return Err(format!("创建 .supervise 失败: {e}"));
     }
     let marker_file = supervise_dir.join("stop-markers.jsonl");
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| "无法定位用户主目录（USERPROFILE/HOME 均缺失）".to_string())?;
+    let home = match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        Ok(h) => h,
+        Err(_) => {
+            release_engine_dir(&state, &lock_key);
+            return Err("无法定位用户主目录（USERPROFILE/HOME 均缺失）".into());
+        }
+    };
     let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
     let hook_installed = !snapshot.mock;
     if hook_installed {
         if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
-            state.busy_workdirs.lock().unwrap().retain(|w| w != &lock_key);
+            release_engine_dir(&state, &lock_key);
             return Err(format!("安装 Stop hook 失败: {e}"));
         }
     }
@@ -977,10 +976,10 @@ async fn retry_supervise_review(app: AppHandle, task_id: String) -> Result<Strin
             flags.len()
         };
         app_state
-            .busy_workdirs
+            .engine_busy_dirs
             .lock()
             .unwrap()
-            .retain(|w| w != &work_dir2);
+            .remove(&work_dir2);
         if hook_installed && remaining_engines == 0 {
             if let Err(e) = remove_stop_hook(&settings2, &marker_file2) {
                 eprintln!("[supervise] 卸载 Stop hook 失败（不影响任务结果）: {e}");
@@ -1017,10 +1016,13 @@ async fn retry_supervise_review(app: AppHandle, task_id: String) -> Result<Strin
     Ok(task_id)
 }
 
-/// 读取监督闭环产物（.supervise 目录）
+/// 读取监督闭环产物（.supervise 目录；无头任务可指定 task_id 读子目录）
 #[tauri::command]
-async fn read_review_artifacts(work_dir: String) -> Result<Vec<ReviewArtifact>, String> {
-    supervise_runner::read_artifacts(&work_dir)
+async fn read_review_artifacts(
+    work_dir: String,
+    task_id: Option<String>,
+) -> Result<Vec<ReviewArtifact>, String> {
+    supervise_runner::read_artifacts(&work_dir, task_id.as_deref())
 }
 
 /// 列出全部监督任务（含历史终态；应用退出即清，重启后历史消失属预期）
@@ -1129,7 +1131,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(SuperviseState {
             running: Mutex::new(HashMap::new()),
-            busy_workdirs: Mutex::new(vec![]),
+            engine_busy_dirs: Mutex::new(HashSet::new()),
             engine_cancels: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
         })
@@ -1240,6 +1242,15 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["kind"], "engine");
         assert_eq!(json["status"], "running");
+    }
+
+    #[test]
+    fn engine_dir_available_same_dir_busy_other_dir_free() {
+        let mut busy = HashSet::new();
+        assert!(engine_dir_available(&busy, "D:\\a"));
+        busy.insert("D:\\a".into());
+        assert!(!engine_dir_available(&busy, "D:\\a"));
+        assert!(engine_dir_available(&busy, "D:\\b"));
     }
 }
 

@@ -103,6 +103,15 @@ export function samePath(a: string, b: string): boolean {
   return norm(a) === norm(b);
 }
 
+/** 任务从属于工作空间：只保留 work_dir 与空间 path 等价的条目。空 path → []。 */
+export function tasksForWorkspace<T extends { work_dir: string }>(
+  tasks: T[],
+  workspacePath: string,
+): T[] {
+  if (!workspacePath.trim()) return [];
+  return tasks.filter((t) => samePath(t.work_dir, workspacePath));
+}
+
 /**
  * 目录变更统一语义（侧栏「+」/终端 pane 目录上报共用）：
  * 命中既有空间 → 激活它（幂等）；否则**追加**新空间并激活——绝不覆盖既有空间

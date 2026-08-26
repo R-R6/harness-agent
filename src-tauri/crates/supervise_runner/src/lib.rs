@@ -33,6 +33,9 @@ pub struct SuperviseRequest {
     /// 模拟模式（不真调 claude/codex）
     #[serde(default)]
     pub mock: bool,
+    /// 终端驱动：绑定的 Claude PTY session id（一任务一进程）
+    #[serde(default)]
+    pub terminal_session_id: Option<String>,
 }
 
 /// final-report.json 里的单轮审查记录
@@ -114,8 +117,10 @@ fn supervise_script_path() -> PathBuf {
 
 // ---------------- 进程桥 ----------------
 
-/// spawn pwsh supervise.ps1（stdout/stderr 用管道，由调用方异步读取；stdin 关闭）
-pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
+/// spawn pwsh supervise.ps1（stdout/stderr 用管道，由调用方异步读取；stdin 关闭）。
+/// `task_id` 写入环境变量 `SUPERVISE_TASK_ID`，供 ps1 把产物落到
+/// `.supervise/tasks/<id>/`；`None` 不设该变量（测试用假脚本兼容）。
+pub fn spawn_supervise(req: &SuperviseRequest, task_id: Option<&str>) -> Result<Child, String> {
     let mut cmd = Command::new(pwsh_path());
     // 发布版是 GUI 子系统：不加 CREATE_NO_WINDOW 会在桌面弹出一个 pwsh 窗口
     path_util::no_console_window(&mut cmd);
@@ -145,6 +150,9 @@ pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
             cmd.arg("-Model").arg(m);
         }
     }
+    if let Some(id) = task_id.filter(|s| !s.is_empty()) {
+        cmd.env("SUPERVISE_TASK_ID", id);
+    }
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -164,7 +172,7 @@ pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
 
 /// 后台线程消费子进程 stderr，逐行回调。
 /// stderr 管道若无人读取，子进程写满系统管道缓冲（Windows 4-64KB）后会阻塞在
-/// stderr 写入上——整个监督任务挂死、busy_workdirs 永不清理、该目录被永久锁死。
+/// stderr 写入上——整个监督任务挂死、任务注册表永不收尾。
 pub fn drain_stderr<F>(stderr: std::process::ChildStderr, on_line: F)
 where
     F: Fn(String) + Send + 'static,
@@ -206,11 +214,25 @@ pub fn terminate_supervise(child: &mut Child) {
 
 // ---------------- 产物解析 ----------------
 
-/// 读 .supervise 目录产物：
+/// 任务产物目录：`.supervise/tasks/<task_id>/`。
+/// 有 task_id → 始终指向该子目录（不存在则读取为空，禁止回退根）；
+/// 无 task_id → 根 `.supervise/`（看板应传 task_id）。
+pub fn resolve_artifact_dir(work_dir: &str, task_id: Option<&str>) -> PathBuf {
+    let root = Path::new(work_dir).join(".supervise");
+    match task_id.filter(|id| !id.is_empty()) {
+        Some(id) => root.join("tasks").join(id),
+        None => root,
+    }
+}
+
+/// 读监督产物：
 /// 1. final-report.json（如果有）→ 结构化摘要
 /// 2. review-N.md 系列 → 逐轮意见
-pub fn read_artifacts(work_dir: &str) -> Result<Vec<ReviewArtifact>, String> {
-    let dir = Path::new(work_dir).join(".supervise");
+pub fn read_artifacts(work_dir: &str, task_id: Option<&str>) -> Result<Vec<ReviewArtifact>, String> {
+    read_artifacts_from_dir(&resolve_artifact_dir(work_dir, task_id))
+}
+
+fn read_artifacts_from_dir(dir: &Path) -> Result<Vec<ReviewArtifact>, String> {
     if !dir.exists() {
         return Ok(vec![]);
     }
@@ -241,7 +263,7 @@ pub fn read_artifacts(work_dir: &str) -> Result<Vec<ReviewArtifact>, String> {
 
     // fallback：逐轮解析 review-N.md
     let mut out = vec![];
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("读 .supervise 失败: {e}"))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -366,7 +388,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("sv-nodir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        assert!(read_artifacts(&tmp.to_string_lossy()).unwrap().is_empty());
+        assert!(read_artifacts(&tmp.to_string_lossy(), None).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -381,7 +403,7 @@ mod tests {
             r#"{"status":"accepted","task":"写计算器","rounds":2,"sessionId":"s1","sessionFile":"f1","verdicts":[{"round":1,"verdict":"REVIEW","reason":"缺校验","sessionId":"s1","file":"f1"},{"round":2,"verdict":"PASS","reason":"已补","sessionId":"s1","file":"f1"}]}"#,
         )
         .unwrap();
-        let arts = read_artifacts(&tmp.to_string_lossy()).expect("解析成功");
+        let arts = read_artifacts(&tmp.to_string_lossy(), None).expect("解析成功");
         assert_eq!(arts.len(), 2);
         assert_eq!(arts[0].verdict, "REVIEW");
         assert_eq!(arts[1].verdict, "PASS");
@@ -401,7 +423,7 @@ mod tests {
             "\u{feff}# 第 1 轮审查意见\n\n- 判定：PASS\n- 审查模型：gpt-5.6-luna\n- 会话：mock-9\n- 会话文件：C:\\s\\mock-9.jsonl\n\n## 意见\n\n一次通过。\n",
         )
         .unwrap();
-        let arts = read_artifacts(&tmp.to_string_lossy()).expect("解析成功");
+        let arts = read_artifacts(&tmp.to_string_lossy(), None).expect("解析成功");
         assert_eq!(arts.len(), 1);
         assert_eq!(arts[0].verdict, "PASS");
         assert_eq!(arts[0].session_id, "mock-9");
@@ -483,8 +505,9 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            terminal_session_id: None,
         };
-        let mut child = spawn_supervise(&req).expect("spawn 成功");
+        let mut child = spawn_supervise(&req, None).expect("spawn 成功");
 
         // 读 stdout（子进程退出后读完）
         use std::io::{BufRead, BufReader};
@@ -542,8 +565,9 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            terminal_session_id: None,
         };
-        let mut child = spawn_supervise(&req).expect("spawn 成功");
+        let mut child = spawn_supervise(&req, None).expect("spawn 成功");
         let stderr = child.stderr.take().expect("stderr 管道");
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         drain_stderr(stderr, move |line| {
@@ -631,8 +655,9 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            terminal_session_id: None,
         };
-        let child = spawn_supervise(&req).expect("spawn 成功");
+        let child = spawn_supervise(&req, None).expect("spawn 成功");
         let pgid = child.id();
         // 断言失败走 unwind：Drop 守卫兜底终止，不留无限循环的 pwsh/sh 孤儿
         struct TerminateOnDrop(Option<Child>);
@@ -678,6 +703,102 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
+        match old_script {
+            Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),
+            None => std::env::remove_var("HARNESS_SUPERVISE_SCRIPT"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_artifact_dir_headless_subdir_when_present() {
+        let tmp = std::env::temp_dir().join(format!("sv-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sub = tmp.join(".supervise").join("tasks").join("task-1");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            resolve_artifact_dir(&tmp.to_string_lossy(), Some("task-1")),
+            sub
+        );
+        // 空目录也算存在，禁止回退根
+        assert_eq!(
+            resolve_artifact_dir(&tmp.to_string_lossy(), Some("task-1")).join("review-1.md").exists(),
+            false
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_artifacts_with_task_id_does_not_fall_back_to_root_when_subdir_exists() {
+        let tmp = std::env::temp_dir().join(format!("sv-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join(".supervise");
+        let sub = root.join("tasks").join("task-1");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            root.join("final-report.json"),
+            r#"{"status":"accepted","task":"root","rounds":1,"sessionId":"r","sessionFile":"f","verdicts":[{"round":1,"verdict":"PASS","reason":"根产物","sessionId":"r","file":"f"}]}"#,
+        )
+        .unwrap();
+        // 子目录存在但空 → 看板应为空，不能串出根产物
+        let empty = read_artifacts(&tmp.to_string_lossy(), Some("task-1")).expect("ok");
+        assert!(empty.is_empty(), "空子目录不得回退根: {empty:?}");
+
+        std::fs::write(
+            sub.join("final-report.json"),
+            r#"{"status":"accepted","task":"child","rounds":1,"sessionId":"c","sessionFile":"f","verdicts":[{"round":1,"verdict":"REVIEW","reason":"子产物","sessionId":"c","file":"f"}]}"#,
+        )
+        .unwrap();
+        let child = read_artifacts(&tmp.to_string_lossy(), Some("task-1")).expect("ok");
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].reason, "子产物");
+
+        let missing = read_artifacts(&tmp.to_string_lossy(), Some("task-other")).expect("ok");
+        assert!(missing.is_empty(), "子目录不存在不得回退根: {missing:?}");
+
+        let root_only = read_artifacts(&tmp.to_string_lossy(), None).expect("ok");
+        assert_eq!(root_only[0].reason, "根产物");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn spawn_supervise_sets_task_id_env() {
+        if skip_if_no_pwsh() {
+            return;
+        }
+        let _env_guard = SCRIPT_ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("sv-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fake_script = tmp.join("echo-env.ps1");
+        std::fs::write(
+            &fake_script,
+            "param($Task,$WorkDir)\n\
+             try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}\n\
+             Write-Output \"TID=$env:SUPERVISE_TASK_ID\"\n",
+        )
+        .unwrap();
+        let old_script = std::env::var("HARNESS_SUPERVISE_SCRIPT").ok();
+        std::env::set_var("HARNESS_SUPERVISE_SCRIPT", &fake_script);
+        let req = SuperviseRequest {
+            task: "t".into(),
+            work_dir: "D:\\work".into(),
+            level: None,
+            max_rounds: None,
+            model: None,
+            mock: true,
+            terminal_session_id: None,
+        };
+        let mut child = spawn_supervise(&req, Some("task-9")).expect("spawn");
+        use std::io::BufRead;
+        let stdout = child.stdout.take().expect("stdout");
+        let out: String = std::io::BufReader::new(stdout)
+            .lines()
+            .map(|l| l.unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = child.wait();
+        assert!(out.contains("TID=task-9"), "应传入 SUPERVISE_TASK_ID: {out}");
         match old_script {
             Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),
             None => std::env::remove_var("HARNESS_SUPERVISE_SCRIPT"),

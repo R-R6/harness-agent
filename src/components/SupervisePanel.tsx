@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listenWhileMounted } from "../lib/listenWhileMounted";
-import { cancelSupervise, runSupervise, runSuperviseTerminal } from "../lib/api";
+import { runSupervise, runSuperviseTerminal } from "../lib/api";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -12,8 +12,6 @@ interface Props {
   readOnly?: boolean;
   /** 启动成功后回调（携带启动时的目录，供审看看板定位 .supervise 产物） */
   onStarted: (workDir: string) => void;
-  /** 运行状态变化（true=有监督任务在跑，供状态栏计数） */
-  onRunningChange?: (running: boolean) => void;
   /** 终端驱动模式启动成功后回调（App 切到终端 tab 让用户看到干活过程） */
   onDriveStarted?: () => void;
 }
@@ -23,28 +21,27 @@ interface LogLine {
   line: string;
 }
 
-/** 闭环启动器：任务表单 + 启动/取消 + 实时日志流 */
-export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onStarted, onRunningChange, onDriveStarted }: Props) {
+/** 闭环启动器：任务表单 + 启动 + 最近一次任务的实时日志流 */
+export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onStarted, onDriveStarted }: Props) {
   const [task, setTask] = useState("");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
   const [driveTerminal, setDriveTerminal] = useState(false);
-  const [runningTask, setRunningTask] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [error, setError] = useState("");
   const logEndRef = useRef<HTMLDivElement>(null);
+  const lastTaskIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    // StrictMode 下卸载可能早于 listen 完成：迟到的订阅必须立即注销，
-    // 否则日志行会被订阅两次画双份（与终端组件同款 listenWhileMounted）
     const stopLog = listenWhileMounted<LogLine>("supervise-log", (e) => {
-      setLogs((prev) => [...prev.slice(-499), e.payload]); // 最多 500 行
+      if (e.payload.taskId !== lastTaskIdRef.current) return;
+      setLogs((prev) => [...prev.slice(-499), e.payload]);
     });
     const stopDone = listenWhileMounted<{ taskId: string; exitCode?: number | null }>(
       "supervise-done",
       (e) => {
-        setRunningTask((cur) => (cur === e.payload.taskId ? null : cur));
-        // 退出码非 0 = 任务失败（cancel 时 exitCode 为 null/0，不提示）
+        if (e.payload.taskId !== lastTaskIdRef.current) return;
         const code = e.payload.exitCode;
         if (code != null && code !== 0) {
           setError(`任务失败（退出码 ${code}），详见下方日志`);
@@ -62,8 +59,10 @@ export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onS
   }, [logs]);
 
   useEffect(() => {
-    onRunningChange?.(runningTask !== null);
-  }, [runningTask, onRunningChange]);
+    setLogs([]);
+    lastTaskIdRef.current = null;
+    setError("");
+  }, [workDir]);
 
   const start = async () => {
     setError("");
@@ -75,6 +74,7 @@ export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onS
       setError("工作目录不能为空（可点浏览选择）");
       return;
     }
+    setStarting(true);
     try {
       const req = {
         task: task.trim(),
@@ -85,28 +85,17 @@ export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onS
       const taskId = driveTerminal
         ? await runSuperviseTerminal(req)
         : await runSupervise(req);
-      // 启动即上报目录（非 done 时）：闭包取的是当前 props，避免过期值；
-      // 审查看板从任务运行起就指向正确目录
-      onStarted(workDir.trim());
-      // 终端驱动模式：切过去看干活过程（监督的核心体验——全程可见、可插手）
-      if (driveTerminal) onDriveStarted?.();
-      setRunningTask(taskId);
+      lastTaskIdRef.current = taskId;
       setLogs([]);
+      onStarted(workDir.trim());
+      if (driveTerminal) onDriveStarted?.();
     } catch (e) {
       setError(String(e));
+    } finally {
+      setStarting(false);
     }
   };
 
-  const cancel = async () => {
-    if (!runningTask) return;
-    try {
-      await cancelSupervise(runningTask);
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
-  // 打开系统目录选择器选工作目录
   const browseDir = async () => {
     setError("");
     try {
@@ -178,17 +167,10 @@ export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onS
         </div>
         {error && <div className="error">{error}</div>}
         <div className="form-actions">
-          {runningTask ? (
-            <button type="button" className="danger" onClick={cancel}>
-              <Icon name="stop" size={14} />
-              取消任务
-            </button>
-          ) : (
-            <button type="button" onClick={start}>
-              <Icon name="play" size={14} />
-              启动监督闭环
-            </button>
-          )}
+          <button type="button" onClick={() => void start()} disabled={starting}>
+            <Icon name="play" size={14} />
+            {starting ? "启动中..." : "启动监督闭环"}
+          </button>
         </div>
       </div>
 

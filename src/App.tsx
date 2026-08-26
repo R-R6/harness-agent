@@ -18,7 +18,7 @@ import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSuper
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
 import { listenWhileMounted } from "./lib/listenWhileMounted";
-import { addWorkspace, initWorkspaces, saveWorkspaces } from "./lib/workspaces";
+import { addWorkspace, initWorkspaces, saveWorkspaces, tasksForWorkspace } from "./lib/workspaces";
 import type { SessionInfo, TaskInfo, TranscriptEntry } from "./types";
 import pkg from "../package.json";
 import "./App.css";
@@ -113,6 +113,15 @@ function App() {
   const projectWorkDir = activeWorkspace?.path ?? "";
   const [terminalRunning, setTerminalRunning] = useState(0);
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
+  const activeTasks = tasksForWorkspace(tasks, projectWorkDir);
+  const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
+  const focusedTaskIdEffective = useMemo(() => {
+    if (focusedTaskId && activeTasks.some((t) => t.id === focusedTaskId)) return focusedTaskId;
+    const running = activeTasks.filter((t) => t.status === "running");
+    const pool = running.length > 0 ? running : activeTasks;
+    if (pool.length === 0) return null;
+    return [...pool].sort((a, b) => b.started_at_ms - a.started_at_ms)[0].id;
+  }, [activeTasks, focusedTaskId]);
   const superviseRunning = tasks.filter((t) => t.status === "running").length;
 
   // 目录上报（终端 pane 输入/续聊）：与侧栏「+」同语义——命中既有空间→激活；
@@ -700,9 +709,15 @@ function App() {
                     <div className="supervise-tasks__head">
                       <span className="eyebrow">ACTIVE</span>
                       <h4>任务记录</h4>
-                      <span className="count-pill">{tasks.length}</span>
+                      <span className="count-pill">{activeTasks.length}</span>
                     </div>
-                    <TaskList tasks={tasks} onCancel={handleCancelTask} onRetryReview={handleRetryReview} />
+                    <TaskList
+                      tasks={activeTasks}
+                      onCancel={handleCancelTask}
+                      onRetryReview={handleRetryReview}
+                      selectedId={focusedTaskIdEffective}
+                      onSelect={setFocusedTaskId}
+                    />
                   </div>
                   <div
                     className={`supervise-layout ${compactSupervise ? "supervise-layout--stacked" : ""}`}
@@ -717,7 +732,6 @@ function App() {
                         onWorkDirChange={handleWorkDirChange}
                         readOnly
                         onStarted={() => void loadTasks()}
-                        onRunningChange={() => {}}
                         onDriveStarted={handleDriveStarted}
                       />
                     </div>
@@ -733,6 +747,7 @@ function App() {
                     />
                     <ReviewBoard
                       workDir={projectWorkDir}
+                      taskId={focusedTaskIdEffective}
                       onViewSession={openTranscriptByFile}
                       active={tab === "supervise"}
                     />

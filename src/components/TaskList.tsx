@@ -8,6 +8,8 @@ interface Props {
   onCancel: (taskId: string) => void;
   /** 重试审查：已中止且有会话文件时可用 */
   onRetryReview?: (taskId: string) => void;
+  selectedId?: string | null;
+  onSelect?: (taskId: string) => void;
 }
 
 export const TASK_STATUS_LABEL: Record<TaskInfo["status"], string> = {
@@ -38,8 +40,8 @@ export function canRetryReview(t: TaskInfo): boolean {
   return t.kind === "engine" && t.status === "aborted" && Boolean(t.session_file);
 }
 
-/** 监督闭环任务列表：状态/轮数/目录/开始时间；运行中带「取消」；可续跑带「重试审查」 */
-export function TaskList({ tasks, onCancel, onRetryReview }: Props) {
+/** 监督闭环任务列表：状态/轮数/目录/开始时间；运行中带「取消」；可续跑带「重试审查」；行可选中 */
+export function TaskList({ tasks, onCancel, onRetryReview, selectedId, onSelect }: Props) {
   if (tasks.length === 0) {
     return (
       <div className="task-list task-list--empty">
@@ -50,7 +52,13 @@ export function TaskList({ tasks, onCancel, onRetryReview }: Props) {
   return (
     <ul className="task-list">
       {tasks.map((t) => (
-        <li key={t.id} className={`task-row task-row--${t.status}`} title={t.work_dir}>
+        <li
+          key={t.id}
+          className={`task-row task-row--${t.status}${selectedId === t.id ? " is-selected" : ""}`}
+          title={t.work_dir}
+          aria-selected={selectedId === t.id}
+          onClick={() => onSelect?.(t.id)}
+        >
           <span className={`task-badge task-badge--${t.status}`}>
             {TASK_STATUS_LABEL[t.status]}
           </span>
@@ -69,7 +77,14 @@ export function TaskList({ tasks, onCancel, onRetryReview }: Props) {
             </div>
           </div>
           {t.status === "running" && (
-            <button type="button" className="task-row__cancel" onClick={() => onCancel(t.id)}>
+            <button
+              type="button"
+              className="task-row__cancel"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCancel(t.id);
+              }}
+            >
               <Icon name="stop" size={12} /> 取消
             </button>
           )}
@@ -78,7 +93,10 @@ export function TaskList({ tasks, onCancel, onRetryReview }: Props) {
               type="button"
               className="task-row__retry"
               title="修好 Codex/配置后，复用本轮会话只再跑审查（需同目录 Claude 终端在跑）"
-              onClick={() => onRetryReview(t.id)}
+              onClick={(e) => {
+                e.stopPropagation();
+                onRetryReview(t.id);
+              }}
             >
               <Icon name="play" size={12} /> 重试审查
             </button>
