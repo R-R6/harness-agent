@@ -33,6 +33,9 @@ pub struct SuperviseRequest {
     /// 模拟模式（不真调 claude/codex）
     #[serde(default)]
     pub mock: bool,
+    /// 终端驱动：绑定的 Claude PTY session id（一任务一进程）
+    #[serde(default)]
+    pub terminal_session_id: Option<String>,
 }
 
 /// final-report.json 里的单轮审查记录
@@ -169,20 +172,13 @@ where
 
 // ---------------- 产物解析 ----------------
 
-/// 无头任务产物目录：`.supervise/tasks/<task_id>/`；引擎/旧产物：`.supervise/`。
-/// 有 task_id 且该子目录存在（含空目录）→ 只读子目录，禁止回退根；
-/// 子目录不存在 → 读根（引擎任务 + 升级前产物）。
+/// 任务产物目录：`.supervise/tasks/<task_id>/`。
+/// 有 task_id → 始终指向该子目录（不存在则读取为空，禁止回退根）；
+/// 无 task_id → 根 `.supervise/`（看板应传 task_id）。
 pub fn resolve_artifact_dir(work_dir: &str, task_id: Option<&str>) -> PathBuf {
     let root = Path::new(work_dir).join(".supervise");
     match task_id.filter(|id| !id.is_empty()) {
-        Some(id) => {
-            let sub = root.join("tasks").join(id);
-            if sub.exists() {
-                sub
-            } else {
-                root
-            }
-        }
+        Some(id) => root.join("tasks").join(id),
         None => root,
     }
 }
@@ -439,6 +435,7 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, None).expect("spawn 成功");
 
@@ -495,6 +492,7 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, None).expect("spawn 成功");
         let stderr = child.stderr.take().expect("stderr 管道");
@@ -594,8 +592,7 @@ mod tests {
         assert_eq!(child[0].reason, "子产物");
 
         let missing = read_artifacts(&tmp.to_string_lossy(), Some("task-other")).expect("ok");
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].reason, "根产物");
+        assert!(missing.is_empty(), "子目录不存在不得回退根: {missing:?}");
 
         let root_only = read_artifacts(&tmp.to_string_lossy(), None).expect("ok");
         assert_eq!(root_only[0].reason, "根产物");
@@ -625,6 +622,7 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, Some("task-9")).expect("spawn");
         use std::io::BufRead;
