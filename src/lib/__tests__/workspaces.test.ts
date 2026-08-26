@@ -7,6 +7,7 @@ import {
   samePath,
   addWorkspace,
   basenameOf,
+  tasksForWorkspace,
   type Workspace,
 } from "../workspaces";
 
@@ -200,6 +201,33 @@ describe("saveWorkspaces", () => {
     saveWorkspaces([ws], ws.id);
     expect(getStoredActive()).toBe(ws.id);
     // 此时 activeId 不应为 null（initWorkspaces 会补上）
+  });
+});
+
+describe("tasksForWorkspace", () => {
+  const tasks = [
+    { id: "t-a", work_dir: "D:\\space-alpha" },
+    { id: "t-b", work_dir: "D:\\space-beta" },
+    { id: "t-a-slash", work_dir: "D:/space-alpha/" },
+  ];
+
+  it("只留下与空间 path 等价的任务（大小写/斜杠归一）", () => {
+    const hit = tasksForWorkspace(tasks, "d:\\SPACE-alpha");
+    expect(hit.map((t) => t.id)).toEqual(["t-a", "t-a-slash"]);
+  });
+
+  it("空 path → 空数组（无激活空间时不串出全局任务）", () => {
+    expect(tasksForWorkspace(tasks, "")).toEqual([]);
+    expect(tasksForWorkspace(tasks, "   ")).toEqual([]);
+  });
+
+  it("同 basename 不同 path 不串台", () => {
+    const sameName = [
+      { id: "a", work_dir: "D:\\projA\\app" },
+      { id: "b", work_dir: "D:\\projB\\app" },
+    ];
+    expect(tasksForWorkspace(sameName, "D:\\projA\\app").map((t) => t.id)).toEqual(["a"]);
+    expect(tasksForWorkspace(sameName, "D:\\projB\\app").map((t) => t.id)).toEqual(["b"]);
   });
 });
 

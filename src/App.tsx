@@ -18,7 +18,7 @@ import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSuper
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
 import { listenWhileMounted } from "./lib/listenWhileMounted";
-import { addWorkspace, initWorkspaces, saveWorkspaces } from "./lib/workspaces";
+import { addWorkspace, initWorkspaces, saveWorkspaces, tasksForWorkspace } from "./lib/workspaces";
 import type { SessionInfo, TaskInfo, TranscriptEntry } from "./types";
 import pkg from "../package.json";
 import "./App.css";
@@ -113,6 +113,7 @@ function App() {
   const projectWorkDir = activeWorkspace?.path ?? "";
   const [terminalRunning, setTerminalRunning] = useState(0);
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
+  const activeTasks = tasksForWorkspace(tasks, projectWorkDir);
   const superviseRunning = tasks.filter((t) => t.status === "running").length;
 
   // 目录上报（终端 pane 输入/续聊）：与侧栏「+」同语义——命中既有空间→激活；
@@ -689,9 +690,9 @@ function App() {
                     <div className="supervise-tasks__head">
                       <span className="eyebrow">ACTIVE</span>
                       <h4>任务记录</h4>
-                      <span className="count-pill">{tasks.length}</span>
+                      <span className="count-pill">{activeTasks.length}</span>
                     </div>
-                    <TaskList tasks={tasks} onCancel={handleCancelTask} />
+                    <TaskList tasks={activeTasks} onCancel={handleCancelTask} />
                   </div>
                   <div
                     className={`supervise-layout ${compactSupervise ? "supervise-layout--stacked" : ""}`}

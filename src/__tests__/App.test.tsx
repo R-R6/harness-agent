@@ -378,4 +378,114 @@ describe("App 集成", () => {
     expect(screen.getByText("space-two")).toBeInTheDocument();
     expect(screen.getByText("space-one")).toBeInTheDocument();
   });
+
+  it("任务列表按激活空间过滤：切空间后只显示该空间任务，count-pill 同步", async () => {
+    const wsA = { id: "ws-a", path: "D:\\space-alpha", name: "space-alpha", position: 0, createdAt: 1 };
+    const wsB = { id: "ws-b", path: "D:\\space-beta", name: "space-beta", position: 1, createdAt: 2 };
+    localStorage.setItem("ha-workspaces", JSON.stringify([wsA, wsB]));
+    localStorage.setItem("ha-active-workspace", "ws-a");
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_sessions") return Promise.resolve(sessions);
+      if (cmd === "get_transcript") return Promise.resolve(transcript);
+      if (cmd === "search_sessions") return Promise.resolve([sessions[0]]);
+      if (cmd === "read_review_artifacts") return Promise.resolve([]);
+      if (cmd === "list_supervise_tasks") {
+        return Promise.resolve([
+          {
+            id: "task-a",
+            work_dir: "D:\\space-alpha",
+            kind: "ps1",
+            status: "accepted",
+            rounds: 1,
+            last_reason: "",
+            started_at_ms: 1,
+          },
+          {
+            id: "task-b",
+            work_dir: "D:\\space-beta",
+            kind: "ps1",
+            status: "running",
+            rounds: 0,
+            last_reason: "",
+            started_at_ms: 2,
+          },
+        ]);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+
+    const taskSection = () => screen.getByRole("heading", { name: "任务记录" }).closest(".supervise-tasks");
+    const taskTitles = () =>
+      [...(taskSection()?.querySelectorAll(".task-row") ?? [])].map((el) => el.getAttribute("title"));
+
+    await waitFor(() => {
+      expect(taskTitles()).toEqual(["D:\\space-alpha"]);
+    });
+    expect(taskSection()?.querySelector(".count-pill")?.textContent).toBe("1");
+
+    await userEvent.click(screen.getByRole("button", { name: /space-beta/ }));
+    await waitFor(() => {
+      expect(taskTitles()).toEqual(["D:\\space-beta"]);
+    });
+    expect(taskSection()?.querySelector(".count-pill")?.textContent).toBe("1");
+    expect(mocks.invoke).toHaveBeenCalledWith(
+      "read_review_artifacts",
+      expect.objectContaining({ workDir: "D:\\space-beta" }),
+    );
+  });
+
+  it("同 basename 不同 path 的两个空间，任务列表不串台", async () => {
+    const wsA = { id: "ws-a", path: "D:\\projA\\app", name: "app-a", position: 0, createdAt: 1 };
+    const wsB = { id: "ws-b", path: "D:\\projB\\app", name: "app-b", position: 1, createdAt: 2 };
+    localStorage.setItem("ha-workspaces", JSON.stringify([wsA, wsB]));
+    localStorage.setItem("ha-active-workspace", "ws-a");
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_sessions") return Promise.resolve(sessions);
+      if (cmd === "read_review_artifacts") return Promise.resolve([]);
+      if (cmd === "list_supervise_tasks") {
+        return Promise.resolve([
+          {
+            id: "task-a",
+            work_dir: "D:\\projA\\app",
+            kind: "ps1",
+            status: "accepted",
+            rounds: 1,
+            last_reason: "",
+            started_at_ms: 1,
+          },
+          {
+            id: "task-b",
+            work_dir: "D:\\projB\\app",
+            kind: "ps1",
+            status: "accepted",
+            rounds: 1,
+            last_reason: "",
+            started_at_ms: 2,
+          },
+        ]);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+
+    const taskSection = () => screen.getByRole("heading", { name: "任务记录" }).closest(".supervise-tasks");
+    const taskTitles = () =>
+      [...(taskSection()?.querySelectorAll(".task-row") ?? [])].map((el) => el.getAttribute("title"));
+
+    await waitFor(() => {
+      expect(taskTitles()).toEqual(["D:\\projA\\app"]);
+    });
+
+    await userEvent.click(screen.getByTitle("D:\\projB\\app"));
+    await waitFor(() => {
+      expect(taskTitles()).toEqual(["D:\\projB\\app"]);
+    });
+  });
 });
