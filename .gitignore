@@ -39,3 +39,10 @@ __pycache__/
 # 本地工具配置（Codex 沙箱等，非项目代码）
 .codex/
 
+# 本地视觉工具目录（.dsh-vision-toolkit，运行时生成，非项目代码）
+/.dsh-vision-toolkit/
+
+# 本机 DSH Desktop 加固脚本与补丁备份（非项目代码，勿提交）
+/scripts/dsh-hardening/
+/dsh-client-connection.index.js.orig
+
