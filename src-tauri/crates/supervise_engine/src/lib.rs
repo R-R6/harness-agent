@@ -53,6 +53,10 @@ pub struct EngineOptions {
     pub artifacts_dir: Option<PathBuf>,
     /// 审查者标签（写产物用：模型名 / "mock"）
     pub reviewer_label: String,
+    /// 续跑：工人已完成该轮，跳过注入/等待，直接审查此会话文件（重试审查）
+    pub resume_transcript: Option<PathBuf>,
+    /// 续跑对应的轮次（与 resume_transcript 成对；缺省则视为第 1 轮）
+    pub resume_round: Option<i64>,
 }
 
 impl Default for EngineOptions {
@@ -67,6 +71,8 @@ impl Default for EngineOptions {
             delivery_confirm: Duration::from_secs(15),
             artifacts_dir: None,
             reviewer_label: String::new(),
+            resume_transcript: None,
+            resume_round: None,
         }
     }
 }
@@ -88,6 +94,8 @@ pub struct EngineOutcome {
     pub status: EngineStatus,
     pub rounds: i64,
     pub last_reason: String,
+    /// 本场用到的会话文件（供审查失败后「重试审查」续跑）
+    pub session_file: Option<PathBuf>,
 }
 
 // ---------------- Stop hook marker 消费 ----------------
@@ -180,6 +188,54 @@ fn wait_user_input_grown(path: &Path, before: usize, deadline: Instant, poll: Du
         std::thread::sleep(poll);
     }
     grown()
+}
+
+/// 会话里是否还有未完成的 tool_use（有 id 发出去、还没有对应 tool_result）。
+/// 真实事故：Bash 审批/门禁卡住数分钟不写文件，180s 静默把轮次截掉。
+fn has_pending_tool_use(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut open: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut anon = 0u32;
+    for line in text.lines() {
+        if !line.contains("tool_use") && !line.contains("tool_result") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(arr) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for item in arr {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") => {
+                    let id = item
+                        .get("id")
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            anon += 1;
+                            format!("#anon{anon}")
+                        });
+                    open.insert(id);
+                }
+                Some("tool_result") => {
+                    if let Some(id) = item.get("tool_use_id").and_then(|s| s.as_str()) {
+                        open.remove(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    !open.is_empty()
 }
 
 fn read_lines(path: &Path) -> Vec<String> {    match std::fs::read(path) {
@@ -309,10 +365,12 @@ fn wait_round_end(
         // 主信号：本项目 slug 目录内、且（已锁定会话时）属于该会话的新 marker
         for m in markers.read_new() {
             let Some(tp) = &m.transcript_path else { continue };
+            // 大小写不敏感：busy 锁曾把小写路径喂给引擎时，slug 会与 Claude
+            // 真实会话目录（保留大小写）差一档；忽略大小写仍能对上 Stop marker。
             let in_project = Path::new(tp)
                 .parent()
                 .and_then(|p| p.file_name())
-                .is_some_and(|n| n.to_string_lossy() == slug);
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(slug));
             let session_ok = session_pin
                 .as_ref()
                 .map(|p| m.session_id.as_deref() == Some(p.as_str()))
@@ -331,11 +389,15 @@ fn wait_round_end(
         if transcript.is_none() {
             transcript = newest_session_after(projects_root, slug, cutoff);
         }
-        // 静默兜底（只在拿到 transcript 后启用）
+        // 静默兜底（只在拿到 transcript 后启用）。有未完成的 tool_use 时不判停，
+        // 等到 tool_result / Stop hook / 硬超时——避免把卡在审批里的 Bash 当干完。
         if let Some(tp) = transcript.clone() {
-            let w = watch.get_or_insert_with(|| TranscriptWatch::new(tp));
+            let w = watch.get_or_insert_with(|| TranscriptWatch::new(tp.clone()));
             w.poll();
-            if w.saw_activity && w.last_change.elapsed() >= opts.silence {
+            if w.saw_activity
+                && w.last_change.elapsed() >= opts.silence
+                && !has_pending_tool_use(&tp)
+            {
                 return (transcript, RoundEnd::Silence);
             }
         }
@@ -494,19 +556,41 @@ fn run_loop(
     on_log: &OnLog,
     records: &mut Vec<RoundRecord>,
 ) -> EngineOutcome {
-    let slug = project_slug(&opts.work_dir);
+    // 续跑优先用会话文件父目录名作 slug（Claude 真实项目目录），避免 TaskInfo
+    // 里被 normalize 成小写的 work_dir 算出错误 slug。
+    let slug = opts
+        .resume_transcript
+        .as_ref()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| project_slug(&opts.work_dir));
     let started_at = SystemTime::now();
     // 兜底定位的 mtime 截止：留 5s 容差——会话文件可能恰在引擎启动前后几毫秒
     // 内创建/落盘，严格 >= 会因毫秒级竞态漏掉
     let cutoff = started_at
         .checked_sub(Duration::from_secs(5))
         .unwrap_or(started_at);
+    let resume_round = opts.resume_round.unwrap_or(1).max(1);
+    let resuming = opts.resume_transcript.is_some();
     on_log(&format!(
-        "[ENGINE] 监督引擎启动：{} 轮，pane 目录 {}（slug {}）",
-        opts.max_rounds, opts.work_dir, slug
+        "[ENGINE] 监督引擎{}：{} 轮，pane 目录 {}（slug {}）{}",
+        if resuming {
+            format!("续跑审查（从第 {resume_round} 轮）")
+        } else {
+            "启动".into()
+        },
+        opts.max_rounds,
+        opts.work_dir,
+        slug,
+        if resuming { "——跳过工人，直接审查已有会话" } else { "" }
     ));
-    if let Some(dir) = &opts.artifacts_dir {
-        reset_artifacts(dir);
+    // 续跑保留已有 review-*.md；全新开局才清产物
+    if !resuming {
+        if let Some(dir) = &opts.artifacts_dir {
+            reset_artifacts(dir);
+        }
     }
 
     let mut last_reason = String::new();
@@ -516,115 +600,140 @@ fn run_loop(
     // （大小+mtime，供复读守卫判定"会话无变化"）
     let mut known_transcript: Option<PathBuf> = None;
     let mut last_review_stat: Option<(u64, Option<SystemTime>)> = None;
+    let mut pending_resume = opts.resume_transcript.clone();
     let mut round: i64 = 0;
+
+    let finish = |status: EngineStatus,
+                  rounds: i64,
+                  last_reason: String,
+                  known: &Option<PathBuf>| EngineOutcome {
+        status,
+        rounds,
+        last_reason,
+        session_file: known.clone(),
+    };
+
     while round < opts.max_rounds {
         if cancel.load(Ordering::Relaxed) {
             on_log("[ENGINE] 已取消");
-            return EngineOutcome {
-                status: EngineStatus::Cancelled,
-                rounds: round,
-                last_reason,
-            };
+            return finish(EngineStatus::Cancelled, round, last_reason, &known_transcript);
         }
         round += 1;
 
-        // 绑定校验：pane 会话还活着且目录未换（防误注入）
-        match pane.current_work_dir() {
-            Some(dir) if same_dir(&dir, &opts.work_dir) => {}
-            other => {
-                let msg = format!(
-                    "pane 绑定失效（期望 {}，实际 {:?}），中止防误注入",
-                    opts.work_dir, other
-                );
-                on_log(&format!("[ENGINE] {msg}"));
-                return EngineOutcome {
-                    status: EngineStatus::Aborted(msg),
-                    rounds: round - 1,
-                    last_reason,
-                };
-            }
-        }
+        // 续跑首轮：工人已干完，跳过注入/等待，直接拿会话去审查
+        let resume_now = pending_resume
+            .take()
+            .filter(|_| round == resume_round);
 
-        // 首次注入任务文本；此后每轮注入上一轮的返工意见。审查失败的重试
-        // 不重新注入（见下方审查重试循环），first_inject 只认第一次真正注入。
-        // 反计划模式指令：真实事故——工人对"补测试"自作主张进入计划模式，
-        // 写完计划等确认卡死，静默判停把"等确认"当"干完"，白烧一轮
-        let inject = if first_inject {
-            format!(
-                "{}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）\r",
-                opts.task
-            )
+        let transcript = if let Some(tp) = resume_now {
+            if !tp.is_file() {
+                let msg = format!("续跑会话文件不存在：{}", tp.display());
+                on_log(&format!("[ENGINE] {msg}"));
+                return finish(EngineStatus::Aborted(msg), round - 1, last_reason, &None);
+            }
+            // 续跑审查本身不写 pane；若随后 REVIEW 需返工，再校验绑定
+            known_transcript = Some(tp.clone());
+            if let Some(stem) = tp.file_stem() {
+                session_pin = Some(stem.to_string_lossy().to_string());
+            }
+            first_inject = false;
+            on_log(&format!(
+                "[ENGINE] 第 {round}/{} 轮续跑：复用会话 {}",
+                opts.max_rounds,
+                tp.display()
+            ));
+            tp
         } else {
-            format!(
-                "上一轮审查未通过，请按要求返工：{}\r（直接动手修改文件并运行验证，禁止进入计划模式或等待确认；如已在计划模式请立即退出并执行）\r",
-                last_reason
-            )
-        };
-        first_inject = false;
-        // 唤醒回车 + 正文一起封装：确认失败重发时复用同一序列
-        let send_inject = |pane: &Arc<dyn PaneIo>| -> Result<(), String> {
-            // 先敲空回车唤醒 TUI：Claude Code 空闲/away 状态可能吞掉直接注入的
-            // 文本（真实事故：第 2/3 轮返工意见未进入会话，工人无动作被冤枉）
-            let _ = pane.write("\r");
-            std::thread::sleep(Duration::from_millis(300));
-            pane.write(&inject)
-        };
-        if let Err(e) = send_inject(&pane) {
-            let msg = format!("注入失败：{e}");
-            on_log(&format!("[ENGINE] {msg}"));
-            return EngineOutcome {
-                status: EngineStatus::Aborted(msg),
-                rounds: round - 1,
-                last_reason,
-            };
-        }
-        // 注入送达确认：已知会话文件时，确认注入真的变成会话里的新用户行。
-        // 失败重发一次；仍失败只告警不中止——保守保留旧行为超集（首轮没有
-        // 已知会话文件，跳过确认）
-        if let (Some(path), Some(before)) = (
-            known_transcript.as_deref(),
-            known_transcript.as_deref().and_then(count_user_inputs),
-        ) {
-            let deadline = Instant::now() + opts.delivery_confirm;
-            if !wait_user_input_grown(path, before, deadline, opts.poll_interval) {
-                on_log("[ENGINE] 注入未在会话中确认，重发一次…");
-                let _ = send_inject(&pane);
-                let deadline = Instant::now() + opts.delivery_confirm;
-                if !wait_user_input_grown(path, before, deadline, opts.poll_interval) {
-                    on_log("[ENGINE] 警告：注入疑似被终端空闲状态吞掉，工人本轮可能空转");
+            // 绑定校验：pane 会话还活着且目录未换（防误注入）
+            match pane.current_work_dir() {
+                Some(dir) if same_dir(&dir, &opts.work_dir) => {}
+                other => {
+                    let msg = format!(
+                        "pane 绑定失效（期望 {}，实际 {:?}），中止防误注入",
+                        opts.work_dir, other
+                    );
+                    on_log(&format!("[ENGINE] {msg}"));
+                    return finish(
+                        EngineStatus::Aborted(msg),
+                        round - 1,
+                        last_reason,
+                        &known_transcript,
+                    );
                 }
             }
-        }
-        on_log(&format!(
-            "[ENGINE] 第 {round}/{} 轮已注入，等待干活完成…",
-            opts.max_rounds
-        ));
 
-        let (transcript, ended) =
-            wait_round_end(opts, markers, projects_root, &slug, cutoff, &mut session_pin, cancel);
-        if ended == RoundEnd::Cancelled {
-            return EngineOutcome {
-                status: EngineStatus::Cancelled,
-                rounds: round,
-                last_reason,
+            // 首次注入任务文本；此后每轮注入上一轮的返工意见。
+            // 反计划模式指令：真实事故——工人对"补测试"自作主张进入计划模式，
+            // 写完计划等确认卡死，静默判停把"等确认"当"干完"，白烧一轮
+            let inject = if first_inject {
+                format!(
+                    "{}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）\r",
+                    opts.task
+                )
+            } else {
+                format!(
+                    "上一轮审查未通过，请按要求返工：{}\r（直接动手修改文件并运行验证，禁止进入计划模式或等待确认；如已在计划模式请立即退出并执行）\r",
+                    last_reason
+                )
             };
-        }
-        on_log(&format!(
-            "[ENGINE] 第 {round} 轮结束（{}）",
-            match ended {
-                RoundEnd::StopMarker => "Stop hook 信号",
-                RoundEnd::Silence => "会话静默",
-                RoundEnd::Timeout => "单轮超时",
-                RoundEnd::Cancelled => unreachable!(),
+            first_inject = false;
+            let send_inject = |pane: &Arc<dyn PaneIo>| -> Result<(), String> {
+                let _ = pane.write("\r");
+                std::thread::sleep(Duration::from_millis(300));
+                pane.write(&inject)
+            };
+            if let Err(e) = send_inject(&pane) {
+                let msg = format!("注入失败：{e}");
+                on_log(&format!("[ENGINE] {msg}"));
+                return finish(
+                    EngineStatus::Aborted(msg),
+                    round - 1,
+                    last_reason,
+                    &known_transcript,
+                );
             }
-        ));
+            if let (Some(path), Some(before)) = (
+                known_transcript.as_deref(),
+                known_transcript.as_deref().and_then(count_user_inputs),
+            ) {
+                let deadline = Instant::now() + opts.delivery_confirm;
+                if !wait_user_input_grown(path, before, deadline, opts.poll_interval) {
+                    on_log("[ENGINE] 注入未在会话中确认，重发一次…");
+                    let _ = send_inject(&pane);
+                    let deadline = Instant::now() + opts.delivery_confirm;
+                    if !wait_user_input_grown(path, before, deadline, opts.poll_interval) {
+                        on_log("[ENGINE] 警告：注入疑似被终端空闲状态吞掉，工人本轮可能空转");
+                    }
+                }
+            }
+            on_log(&format!(
+                "[ENGINE] 第 {round}/{} 轮已注入，等待干活完成…",
+                opts.max_rounds
+            ));
 
-        let Some(transcript) = transcript else {
-            last_reason = "未找到会话文件（无 marker 也无新会话），无法审查".into();
-            on_log(&format!("[ENGINE] {last_reason}"));
-            continue;
+            let (transcript, ended) =
+                wait_round_end(opts, markers, projects_root, &slug, cutoff, &mut session_pin, cancel);
+            if ended == RoundEnd::Cancelled {
+                return finish(EngineStatus::Cancelled, round, last_reason, &known_transcript);
+            }
+            on_log(&format!(
+                "[ENGINE] 第 {round} 轮结束（{}）",
+                match ended {
+                    RoundEnd::StopMarker => "Stop hook 信号",
+                    RoundEnd::Silence => "会话静默",
+                    RoundEnd::Timeout => "单轮超时",
+                    RoundEnd::Cancelled => unreachable!(),
+                }
+            ));
+
+            let Some(transcript) = transcript else {
+                last_reason = "未找到会话文件（无 marker 也无新会话），无法审查".into();
+                on_log(&format!("[ENGINE] {last_reason}"));
+                continue;
+            };
+            known_transcript = Some(transcript.clone());
+            transcript
         };
-        known_transcript = Some(transcript.clone());
 
         // 复读守卫（确定性，防假 PASS）：会话文件与上轮审查时完全相同
         // （大小+mtime）说明工人未响应返工（注入可能被吞）——直接维持 REVIEW，
@@ -656,14 +765,8 @@ fn run_loop(
         // 叠加重试——两层嵌套最坏 15 次 codex exec、单轮可拖约 20 分钟，
         // 且取消延迟被放大。审查硬失败即中止（失败信息落日志与产物）
         if cancel.load(Ordering::Relaxed) {
-            return EngineOutcome {
-                status: EngineStatus::Cancelled,
-                rounds: round,
-                last_reason,
-            };
+            return finish(EngineStatus::Cancelled, round, last_reason, &known_transcript);
         }
-        // 审查可能持续数分钟：开工前明示，否则用户面对静止的日志分不清
-        // "正在审查"和"卡住了"（真实反馈：截图问"这是在审查吗"）
         on_log(&format!(
             "[ENGINE] 第 {round} 轮审查中（{}），通常需要一到几分钟…",
             opts.reviewer_label
@@ -673,19 +776,18 @@ fn run_loop(
             Err(e) => {
                 last_reason = format!("审查失败：{e}");
                 on_log(&format!("[FAIL] {last_reason}"));
-                return EngineOutcome {
-                    status: EngineStatus::Aborted(last_reason.clone()),
-                    rounds: round,
+                return finish(
+                    EngineStatus::Aborted(last_reason.clone()),
+                    round,
                     last_reason,
-                };
+                    &known_transcript,
+                );
             }
         };
-        // 审查后的文件指纹作为下一轮复读守卫的基线
         last_review_stat = std::fs::metadata(&transcript)
             .ok()
             .map(|m| (m.len(), m.modified().ok()));
 
-        // 产物：逐轮落盘（运行中即可在看板刷新看到），报告在 run() 收尾统一写
         records.push(RoundRecord {
             round,
             pass: verdict.pass,
@@ -698,11 +800,12 @@ fn run_loop(
 
         if verdict.pass {
             on_log(&format!("[PASS] 第 {round} 轮验收通过：{}", verdict.reason));
-            return EngineOutcome {
-                status: EngineStatus::Accepted,
-                rounds: round,
-                last_reason: verdict.reason,
-            };
+            return finish(
+                EngineStatus::Accepted,
+                round,
+                verdict.reason,
+                &known_transcript,
+            );
         }
         last_reason = verdict.reason.clone();
         on_log(&format!("[REVIEW] 第 {round} 轮需返工：{}", verdict.reason));
@@ -712,11 +815,12 @@ fn run_loop(
         "[FAIL] 达到最大轮数 {}，未通过验收。最后意见：{}",
         opts.max_rounds, last_reason
     ));
-    EngineOutcome {
-        status: EngineStatus::Rejected,
-        rounds: opts.max_rounds,
+    finish(
+        EngineStatus::Rejected,
+        opts.max_rounds,
         last_reason,
-    }
+        &known_transcript,
+    )
 }
 
 /// 目录等价比较（大小写不敏感 + 分隔符归一）
@@ -814,6 +918,8 @@ mod tests {
             delivery_confirm: Duration::from_millis(200),
             artifacts_dir: None,
             reviewer_label: "mock".into(),
+            resume_transcript: None,
+            resume_round: None,
         }
     }
 
@@ -988,6 +1094,237 @@ mod tests {
         );
         assert!(matches!(outcome.status, EngineStatus::Aborted(_)), "{:?}", outcome.status);
         assert!(pane.writes.lock().unwrap().is_empty(), "绑定失效后绝不能注入");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn jsonl_tool_use(id: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"Bash"}}]}}}}"#
+        )
+    }
+    fn jsonl_tool_result(id: &str) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"abced"}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn has_pending_tool_use_true_until_matching_result() {
+        let dir = tmp_dir("pending-fn");
+        let p = dir.join("s.jsonl");
+        std::fs::write(&p, "static content\n").unwrap();
+        assert!(!has_pending_tool_use(&p), "无工具行不应拦截静默");
+        std::fs::write(&p, format!("{}\n", jsonl_tool_use("call_1"))).unwrap();
+        assert!(has_pending_tool_use(&p), "未完成的 Bash 应 pending");
+        std::fs::write(
+            &p,
+            format!("{}\n{}\n", jsonl_tool_use("call_1"), jsonl_tool_result("call_1")),
+        )
+        .unwrap();
+        assert!(!has_pending_tool_use(&p), "成对 result 后不应 pending");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 复现：tool_use 已发出、result 迟迟不到。静默阈值到了也不能结束轮次，
+    /// 直到硬超时（Stop hook 仍可提前结束，这里不写 marker）。
+    #[test]
+    fn pending_tool_use_blocks_silence_until_round_timeout() {
+        let dir = tmp_dir("pending-block");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("s.jsonl");
+        std::fs::write(&transcript, format!("{}\n", jsonl_tool_use("call_bash"))).unwrap();
+
+        let mut opts = quick_opts(&dir, 1);
+        opts.silence = Duration::from_millis(40);
+        opts.round_timeout = Duration::from_millis(350);
+        opts.poll_interval = Duration::from_millis(15);
+        let src = MarkerSource::new(dir.join("no-markers.jsonl"));
+        let mut pin = None;
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let (_path, ended) = wait_round_end(
+            &opts,
+            &src,
+            &projects_root,
+            &slug,
+            SystemTime::UNIX_EPOCH,
+            &mut pin,
+            &cancel,
+        );
+        assert_eq!(ended, RoundEnd::Timeout, "pending Bash 不得走静默");
+        assert!(
+            started.elapsed() >= opts.round_timeout,
+            "应等到硬超时而不是静默提前返回"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// result 落地后恢复静默：不再无限等硬超时
+    #[test]
+    fn silence_resumes_after_tool_result_lands() {
+        let dir = tmp_dir("pending-resume");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("s.jsonl");
+        std::fs::write(&transcript, format!("{}\n", jsonl_tool_use("call_bash"))).unwrap();
+        let transcript2 = transcript.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript2)
+                .unwrap();
+            writeln!(f, "{}", jsonl_tool_result("call_bash")).unwrap();
+        });
+
+        let mut opts = quick_opts(&dir, 1);
+        opts.silence = Duration::from_millis(40);
+        opts.round_timeout = Duration::from_secs(3);
+        opts.poll_interval = Duration::from_millis(15);
+        let src = MarkerSource::new(dir.join("no-markers.jsonl"));
+        let mut pin = None;
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let (_path, ended) = wait_round_end(
+            &opts,
+            &src,
+            &projects_root,
+            &slug,
+            SystemTime::UNIX_EPOCH,
+            &mut pin,
+            &cancel,
+        );
+        assert_eq!(ended, RoundEnd::Silence, "result 到达后应恢复静默判停");
+        assert!(
+            started.elapsed() >= Duration::from_millis(80),
+            "不得在 result 到达前静默"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// 重试审查：跳过工人注入，直接审已有会话；PASS 则整场通过且不写 pane
+    #[test]
+    fn resume_review_skips_worker_and_accepts() {
+        let dir = tmp_dir("resume-pass");
+        let transcript = dir.join("existing.jsonl");
+        std::fs::write(&transcript, "worker already done\n").unwrap();
+        let pane = Arc::new(FakePane {
+            dir_ok: Mutex::new(None), // 续跑直审不依赖 pane；PASS 后结束
+            writes: Mutex::new(vec![]),
+            fail_write: AtomicBool::new(false),
+        });
+        let reviewer = MockReviewer::always(Ok(Verdict {
+            pass: true,
+            reason: "续跑通过".into(),
+        }));
+        let cancel = AtomicBool::new(false);
+        let on_log: OnLog = Arc::new(|_: &str| {});
+        let src = MarkerSource::new(dir.join("no-markers.jsonl"));
+        let mut opts = quick_opts(&dir, 3);
+        opts.resume_transcript = Some(transcript.clone());
+        opts.resume_round = Some(1);
+        let outcome = run(
+            &opts,
+            pane.clone(),
+            Arc::new(reviewer),
+            &src,
+            &dir,
+            &cancel,
+            &on_log,
+        );
+        assert_eq!(outcome.status, EngineStatus::Accepted);
+        assert_eq!(outcome.rounds, 1);
+        assert_eq!(outcome.session_file.as_deref(), Some(transcript.as_path()));
+        assert!(
+            pane.writes.lock().unwrap().is_empty(),
+            "续跑直审 PASS 不得注入工人"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 续跑时 work_dir 被小写污染：slug 须来自会话父目录，返工轮才能吃到 Stop marker
+    #[test]
+    fn resume_review_slug_from_transcript_parent_despite_lowercased_work_dir() {
+        let dir = tmp_dir("resume-case");
+        let projects_root = dir.join("projects");
+        // 模拟 Claude 真实 slug（大小写与小写 work_dir 算出的不一致）
+        let real_slug = "-Users-mgw-Desktop-my-skills";
+        let slug_dir = projects_root.join(real_slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("sess.jsonl");
+        std::fs::write(&transcript, "worker done\n").unwrap();
+        let marker_file = dir.join("markers.jsonl");
+        std::fs::write(&marker_file, "").unwrap();
+
+        let pane = Arc::new(FakePane {
+            dir_ok: Mutex::new(Some("/Users/mgw/Desktop/my_skills".into())),
+            writes: Mutex::new(vec![]),
+            fail_write: AtomicBool::new(false),
+        });
+        let marker_body = serde_json::json!({
+            "session_id": "sess", // 须与续跑 session_pin（文件 stem）一致
+            "transcript_path": transcript.to_string_lossy(),
+        });
+        simulate_worker(
+            pane.clone(),
+            transcript.clone(),
+            marker_file.clone(),
+            slug_dir,
+            vec![marker_body.clone(), marker_body],
+        );
+
+        let reviewer = MockReviewer::scripted(vec![
+            Ok(Verdict {
+                pass: false,
+                reason: "需返工".into(),
+            }),
+            Ok(Verdict {
+                pass: true,
+                reason: "通过".into(),
+            }),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let logs = Arc::new(Mutex::new(vec![]));
+        let logs2 = logs.clone();
+        let on_log: OnLog = Arc::new(move |l: &str| logs2.lock().unwrap().push(l.to_string()));
+        let src = MarkerSource::new(marker_file);
+        let mut opts = quick_opts(&dir, 3);
+        // 再现线上 bug：续跑喂小写路径 → project_slug 会变成 -users-...
+        opts.work_dir = "/users/mgw/desktop/my_skills".into();
+        opts.resume_transcript = Some(transcript.clone());
+        opts.resume_round = Some(1);
+        opts.silence = Duration::from_secs(30); // 逼迫走 Stop，勿静默抢跑
+        opts.round_timeout = Duration::from_secs(5);
+        let outcome = run(
+            &opts,
+            pane,
+            Arc::new(reviewer),
+            &src,
+            &projects_root,
+            &cancel,
+            &on_log,
+        );
+        assert_eq!(outcome.status, EngineStatus::Accepted);
+        let joined = logs.lock().unwrap().join("\n");
+        assert!(
+            joined.contains("Stop hook 信号"),
+            "返工轮应收 Stop hook，日志:\n{joined}"
+        );
+        assert!(
+            !joined.contains("slug -users-mgw-desktop-my-skills"),
+            "续跑 slug 应来自会话父目录，不应是小写 work_dir 算出的"
+        );
+        assert!(
+            joined.contains(&format!("slug {real_slug}")),
+            "应使用会话父目录 slug，日志:\n{joined}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

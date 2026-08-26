@@ -49,6 +49,11 @@ export async function cancelSupervise(taskId: string): Promise<void> {
   return invoke<void>("cancel_supervise", { taskId });
 }
 
+/** 重试审查：复用已中止任务的会话，跳过工人只再跑 Codex */
+export async function retrySuperviseReview(taskId: string): Promise<string> {
+  return invoke<string>("retry_supervise_review", { taskId });
+}
+
 /** 读 .supervise 产物（审查看板数据） */
 export async function fetchReviewArtifacts(workDir: string): Promise<ReviewArtifact[]> {
   return invoke("read_review_artifacts", { workDir });

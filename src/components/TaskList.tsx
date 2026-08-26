@@ -6,6 +6,8 @@ interface Props {
   tasks: TaskInfo[];
   /** 取消运行中的任务（复用 cancel_supervise） */
   onCancel: (taskId: string) => void;
+  /** 重试审查：已中止且有会话文件时可用 */
+  onRetryReview?: (taskId: string) => void;
 }
 
 export const TASK_STATUS_LABEL: Record<TaskInfo["status"], string> = {
@@ -31,8 +33,13 @@ export function formatTaskTime(ms: number): string {
   return `${month}/${day} ${hour}:${minute}`;
 }
 
-/** 监督闭环任务列表：状态/轮数/目录/开始时间；运行中带「取消」 */
-export function TaskList({ tasks, onCancel }: Props) {
+/** 是否可点「重试审查」：终端驱动 + 已中止 + 仍有会话文件 */
+export function canRetryReview(t: TaskInfo): boolean {
+  return t.kind === "engine" && t.status === "aborted" && Boolean(t.session_file);
+}
+
+/** 监督闭环任务列表：状态/轮数/目录/开始时间；运行中带「取消」；可续跑带「重试审查」 */
+export function TaskList({ tasks, onCancel, onRetryReview }: Props) {
   if (tasks.length === 0) {
     return (
       <div className="task-list task-list--empty">
@@ -64,6 +71,16 @@ export function TaskList({ tasks, onCancel }: Props) {
           {t.status === "running" && (
             <button type="button" className="task-row__cancel" onClick={() => onCancel(t.id)}>
               <Icon name="stop" size={12} /> 取消
+            </button>
+          )}
+          {canRetryReview(t) && onRetryReview && (
+            <button
+              type="button"
+              className="task-row__retry"
+              title="修好 Codex/配置后，复用本轮会话只再跑审查（需同目录 Claude 终端在跑）"
+              onClick={() => onRetryReview(t.id)}
+            >
+              <Icon name="play" size={12} /> 重试审查
             </button>
           )}
         </li>

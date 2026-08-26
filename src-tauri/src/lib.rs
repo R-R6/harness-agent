@@ -48,6 +48,15 @@ struct TaskInfo {
     rounds: i64,
     last_reason: String,
     started_at_ms: u64,
+    /// 原始任务描述（重试审查需要）
+    task: String,
+    /// 工人完成后的会话文件；审查失败后「重试审查」依赖它
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_file: Option<String>,
+    max_rounds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    mock: bool,
 }
 
 /// 毫秒级时间戳（用于 started_at）
@@ -469,15 +478,20 @@ async fn run_supervise(
     // 逐行并入 supervise-log（带 [stderr] 前缀），诊断信息直接进 UI 日志流。
     let stderr = child.stderr.take();
     state.running.lock().unwrap().insert(task_id.clone(), child);
-    // 登记任务注册表（Running 态）
+    // 登记任务注册表（Running 态）。展示用原始路径；busy 锁仍用上面的 normalize 键。
     state.tasks.lock().unwrap().insert(task_id.clone(), TaskInfo {
         id: task_id.clone(),
-        work_dir: work_dir.clone(),
+        work_dir: request.work_dir.clone(),
         kind: TaskKind::Ps1,
         status: TaskStatus::Running,
         rounds: 0,
         last_reason: String::new(),
         started_at_ms: now_ms(),
+        task: request.task.clone(),
+        session_file: None,
+        max_rounds: level_rounds(request.level.as_deref(), request.max_rounds),
+        model: request.model.clone(),
+        mock: request.mock,
     });
 
     // 后台线程读 stdout → 逐行 emit 到前端；进程结束后清理 State 并 emit done
@@ -674,15 +688,21 @@ async fn run_supervise_terminal(
         .lock()
         .unwrap()
         .insert(task_id.clone(), cancel.clone());
-    // 登记任务注册表（Running 态）
+    // 登记任务注册表（Running 态）。work_dir 必须保留用户/终端原始大小写：
+    // normalize 键只用于 busy 锁；引擎用此路径算 project_slug，小写会错位 Claude 会话目录。
     state.tasks.lock().unwrap().insert(task_id.clone(), TaskInfo {
         id: task_id.clone(),
-        work_dir: work_dir.clone(),
+        work_dir: request.work_dir.clone(),
         kind: TaskKind::Engine,
         status: TaskStatus::Running,
         rounds: 0,
         last_reason: String::new(),
         started_at_ms: now_ms(),
+        task: request.task.clone(),
+        session_file: None,
+        max_rounds: rounds,
+        model: model.map(|m| m.to_string()),
+        mock: request.mock,
     });
 
     let opts = EngineOptions {
@@ -746,6 +766,7 @@ async fn run_supervise_terminal(
                     status: supervise_engine::EngineStatus::Aborted(format!("引擎线程异常: {msg}")),
                     rounds: 0,
                     last_reason: msg,
+                    session_file: None,
                 }
             });
 
@@ -786,6 +807,205 @@ async fn run_supervise_terminal(
                 };
                 t.rounds = outcome.rounds;
                 t.last_reason = outcome.last_reason.clone();
+                if let Some(sf) = &outcome.session_file {
+                    t.session_file = Some(sf.display().to_string());
+                }
+            }
+        }
+        let _ = app2.emit(
+            "supervise-done",
+            serde_json::json!({ "taskId": task_id2, "exitCode": code, "reason": outcome.last_reason }),
+        );
+    });
+
+    Ok(task_id)
+}
+
+/// 重试审查：复用已中止任务的会话文件，跳过工人，只再跑 Codex。
+/// 需同目录 Claude 终端仍在跑（若审查结果为返工，还要继续注入）。
+#[tauri::command]
+async fn retry_supervise_review(app: AppHandle, task_id: String) -> Result<String, String> {
+    let state = app.state::<SuperviseState>();
+    let snapshot = {
+        let tasks = state.tasks.lock().map_err(|_| "任务状态锁已损坏")?;
+        tasks.get(&task_id).cloned().ok_or_else(|| "任务不存在".to_string())?
+    };
+    if snapshot.kind != TaskKind::Engine {
+        return Err("仅终端驱动任务支持重试审查".into());
+    }
+    if snapshot.status != TaskStatus::Aborted {
+        return Err(format!(
+            "只有已中止的任务可重试审查（当前状态：{:?}）",
+            snapshot.status
+        ));
+    }
+    let session_file = snapshot
+        .session_file
+        .clone()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "没有可复用的会话文件（工人未完成或产物已丢失）".to_string())?;
+    if !std::path::Path::new(&session_file).is_file() {
+        return Err(format!("会话文件不存在：{session_file}"));
+    }
+    let lock_key = normalize_path(&snapshot.work_dir);
+    let resume_round = snapshot.rounds.max(1);
+
+    // 同目录 Claude pane：取其原始大小写路径喂给引擎（旧任务可能把小写 normalize
+    // 路径写进 TaskInfo，直接复用会算出错误 slug，Stop hook 对不上）。
+    let (session_id, pane_work_dir) = {
+        let term = app.state::<TerminalState>();
+        let sessions = term.sessions.lock().map_err(|_| "终端状态锁已损坏")?;
+        sessions
+            .iter()
+            .find(|(_, p)| p.agent == "claude" && normalize_path(&p.work_dir) == lock_key)
+            .map(|(id, p)| (id.clone(), p.work_dir.clone()))
+            .ok_or_else(|| {
+                "未找到运行中的 Claude 终端（请先在该工作目录启动 Claude，再点重试审查）"
+                    .to_string()
+            })?
+    };
+
+    {
+        let mut busy = state.busy_workdirs.lock().unwrap();
+        if busy.contains(&lock_key) {
+            return Err(format!("工作目录 {lock_key} 已有监督任务在运行"));
+        }
+        busy.push(lock_key.clone());
+    }
+
+    let supervise_dir = std::path::Path::new(&pane_work_dir).join(".supervise");
+    if let Err(e) = std::fs::create_dir_all(&supervise_dir) {
+        state.busy_workdirs.lock().unwrap().retain(|w| w != &lock_key);
+        return Err(format!("创建 .supervise 失败: {e}"));
+    }
+    let marker_file = supervise_dir.join("stop-markers.jsonl");
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "无法定位用户主目录（USERPROFILE/HOME 均缺失）".to_string())?;
+    let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
+    let hook_installed = !snapshot.mock;
+    if hook_installed {
+        if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
+            state.busy_workdirs.lock().unwrap().retain(|w| w != &lock_key);
+            return Err(format!("安装 Stop hook 失败: {e}"));
+        }
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .engine_cancels
+        .lock()
+        .unwrap()
+        .insert(task_id.clone(), cancel.clone());
+    {
+        let mut tasks = state.tasks.lock().unwrap();
+        if let Some(t) = tasks.get_mut(&task_id) {
+            t.status = TaskStatus::Running;
+            t.last_reason = String::new();
+            // 纠正可能被 normalize 污染的大小写
+            t.work_dir = pane_work_dir.clone();
+        }
+    }
+
+    let model = snapshot.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let opts = EngineOptions {
+        task: snapshot.task.clone(),
+        work_dir: pane_work_dir,
+        max_rounds: snapshot.max_rounds.max(resume_round),
+        artifacts_dir: Some(supervise_dir.clone()),
+        reviewer_label: match (snapshot.mock, model) {
+            (true, _) => "mock".to_string(),
+            (false, Some(m)) => m.to_string(),
+            (false, None) => "codex 默认模型".to_string(),
+        },
+        resume_transcript: Some(std::path::PathBuf::from(&session_file)),
+        resume_round: Some(resume_round),
+        ..Default::default()
+    };
+    let reviewer: Arc<dyn Reviewer> = if snapshot.mock {
+        Arc::new(MockReviewer::always(Ok(Verdict {
+            pass: true,
+            reason: "（模拟）重试审查通过".into(),
+        })))
+    } else {
+        Arc::new(CodexReviewer::new(model, &snapshot.task))
+    };
+
+    let app2 = app.clone();
+    let task_id2 = task_id.clone();
+    let work_dir2 = lock_key.clone();
+    let settings2 = settings.clone();
+    let marker_file2 = marker_file.clone();
+    std::thread::spawn(move || {
+        let markers = MarkerSource::new(marker_file);
+        let projects_root = std::path::PathBuf::from(&home).join(".claude").join("projects");
+        let pane = Arc::new(TerminalPaneAdapter {
+            app: app2.clone(),
+            session_id,
+        });
+        let app3 = app2.clone();
+        let task_id3 = task_id2.clone();
+        let on_log: supervise_engine::OnLog = Arc::new(move |line: &str| {
+            let _ = app3.emit(
+                "supervise-log",
+                serde_json::json!({ "taskId": task_id3, "line": line.to_string() }),
+            );
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            supervise_engine::run(&opts, pane, reviewer, &markers, &projects_root, &cancel, &on_log)
+        }))
+        .unwrap_or_else(|panic| {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "未知异常".to_string()
+            };
+            supervise_engine::EngineOutcome {
+                status: supervise_engine::EngineStatus::Aborted(format!("引擎线程异常: {msg}")),
+                rounds: 0,
+                last_reason: msg,
+                session_file: Some(std::path::PathBuf::from(&session_file)),
+            }
+        });
+
+        let app_state = app2.state::<SuperviseState>();
+        let remaining_engines = {
+            let mut flags = app_state.engine_cancels.lock().unwrap();
+            flags.remove(&task_id2);
+            flags.len()
+        };
+        app_state
+            .busy_workdirs
+            .lock()
+            .unwrap()
+            .retain(|w| w != &work_dir2);
+        if hook_installed && remaining_engines == 0 {
+            if let Err(e) = remove_stop_hook(&settings2, &marker_file2) {
+                eprintln!("[supervise] 卸载 Stop hook 失败（不影响任务结果）: {e}");
+            }
+        }
+        let code = match outcome.status {
+            supervise_engine::EngineStatus::Accepted
+            | supervise_engine::EngineStatus::Cancelled => 0,
+            supervise_engine::EngineStatus::Rejected => 1,
+            supervise_engine::EngineStatus::Aborted(_) => 2,
+        };
+        {
+            let mut tasks = app_state.tasks.lock().unwrap();
+            if let Some(t) = tasks.get_mut(&task_id2) {
+                t.status = match outcome.status {
+                    supervise_engine::EngineStatus::Accepted => TaskStatus::Accepted,
+                    supervise_engine::EngineStatus::Rejected => TaskStatus::Rejected,
+                    supervise_engine::EngineStatus::Cancelled => TaskStatus::Cancelled,
+                    supervise_engine::EngineStatus::Aborted(_) => TaskStatus::Aborted,
+                };
+                t.rounds = outcome.rounds;
+                t.last_reason = outcome.last_reason.clone();
+                if let Some(sf) = &outcome.session_file {
+                    t.session_file = Some(sf.display().to_string());
+                }
             }
         }
         let _ = app2.emit(
@@ -947,6 +1167,7 @@ pub fn run() {
             run_supervise,
             cancel_supervise,
             run_supervise_terminal,
+            retry_supervise_review,
             read_review_artifacts,
             list_supervise_tasks,
             check_mcp,
@@ -1010,6 +1231,11 @@ mod tests {
             rounds: 0,
             last_reason: String::new(),
             started_at_ms: now_ms(),
+            task: "demo".into(),
+            session_file: None,
+            max_rounds: 3,
+            model: None,
+            mock: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["kind"], "engine");

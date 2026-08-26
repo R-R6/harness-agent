@@ -13,17 +13,21 @@ use serde_json::{json, Value};
 ///    marker 落盘了但引擎读不出，三轮全靠静默兜底）。
 ///
 /// 路径单引号包裹，内部单引号加倍转义。
+/// 解释器与 supervise_runner 的 OS 兜底一致：Windows 用自带 powershell 5.1，
+/// Unix 用 pwsh（brew install powershell）。不读 HARNESS_PWSH——这条命令会
+/// 写进 ~/.claude/settings.json，测试用覆盖不应固化进用户配置。
 pub fn hook_command(marker_file: &Path) -> String {
     let path = marker_file.to_string_lossy().replace('\'', "''");
+    let shell = if cfg!(windows) { "powershell" } else { "pwsh" };
     format!(
-        "powershell -NoProfile -Command \"[System.IO.File]::AppendAllText('{path}', \
+        "{shell} -NoProfile -Command \"[System.IO.File]::AppendAllText('{path}', \
          (New-Object System.IO.StreamReader([Console]::OpenStandardInput(), \
          [System.Text.Encoding]::UTF8)).ReadToEnd(), [System.Text.Encoding]::UTF8)\""
     )
 }
 
 /// 确保 settings.json 的 hooks.Stop 含指向 marker 文件的命令。
-/// 幂等：已安装（任意 hook 命令包含该 marker 路径）则不动。
+/// 幂等：已安装且命令与当前 `hook_command` 一致则不动；命令过期则就地改写。
 /// 写前备份 settings.json.bak-<epoch 秒>。返回是否发生了写入。
 pub fn ensure_stop_hook(settings_path: &Path, marker_file: &Path) -> Result<bool, String> {
     let mut root: Value = match std::fs::read_to_string(settings_path) {
@@ -48,25 +52,40 @@ pub fn ensure_stop_hook(settings_path: &Path, marker_file: &Path) -> Result<bool
         .as_array_mut()
         .ok_or("settings.json 的 hooks.Stop 不是数组")?;
 
-    // 幂等检查：任一现有命令已指向该 marker 文件
-    let already = stop_arr.iter().any(|entry| {
-        entry["hooks"]
-            .as_array()
-            .map(|hs| {
-                hs.iter().any(|h| {
-                    h["command"]
-                        .as_str()
-                        .is_some_and(|c| c.contains(&marker_str))
-                })
-            })
-            .unwrap_or(false)
-    });
-    if already {
+    let desired = hook_command(marker_file);
+    // 已有指向该 marker 的命令：一致则幂等；不一致则改写。
+    // Mac 合并前曾把 `powershell` 写进 settings.json，本机只有 `pwsh`，
+    // 不改写的话引擎会一直走静默兜底。
+    let mut rewritten = false;
+    let mut present = false;
+    for entry in stop_arr.iter_mut() {
+        let Some(hs) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            continue;
+        };
+        for h in hs {
+            let Some(c) = h.get("command").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !c.contains(&marker_str) {
+                continue;
+            }
+            present = true;
+            if c != desired {
+                h["command"] = json!(desired.clone());
+                rewritten = true;
+            }
+        }
+    }
+    if rewritten {
+        write_settings(settings_path, &root)?;
+        return Ok(true);
+    }
+    if present {
         return Ok(false);
     }
 
     stop_arr.push(json!({
-        "hooks": [ { "type": "command", "command": hook_command(marker_file) } ]
+        "hooks": [ { "type": "command", "command": desired } ]
     }));
 
     write_settings(settings_path, &root)?;
@@ -235,6 +254,92 @@ mod tests {
         let err = ensure_stop_hook(&settings, &dir.join("m.jsonl"));
         assert!(err.is_err(), "解析失败必须拒绝写入而不是覆盖用户配置");
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), "not json {");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hook_command_uses_platform_shell() {
+        let cmd = hook_command(Path::new("/tmp/m.jsonl"));
+        #[cfg(windows)]
+        assert!(cmd.starts_with("powershell "), "{cmd}");
+        #[cfg(not(windows))]
+        assert!(cmd.starts_with("pwsh "), "{cmd}");
+    }
+
+    #[test]
+    fn ensure_stop_hook_rewrites_stale_command() {
+        let dir = tmp("migrate");
+        let settings = dir.join("settings.json");
+        let marker = dir.join("m.jsonl");
+        let stale = format!(
+            "powershell -NoProfile -Command \"[System.IO.File]::AppendAllText('{}', 'x')\"",
+            marker.display()
+        );
+        std::fs::write(
+            &settings,
+            json!({
+                "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": stale }] }] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(ensure_stop_hook(&settings, &marker).unwrap(), "过期命令应改写");
+        assert!(!ensure_stop_hook(&settings, &marker).unwrap(), "改写后应幂等");
+
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(cmd, hook_command(&marker), "{cmd}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 生成的命令必须能被本机解释器执行并写出 UTF-8 marker。
+    /// 这是 Mac 上 `powershell` 找不到、引擎走静默兜底的回归钉。
+    #[cfg(unix)]
+    #[test]
+    fn hook_command_pwsh_appends_utf8_stdin_to_marker() {
+        if std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-Command", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("跳过：未找到 pwsh（Unix 需 brew install powershell）");
+            return;
+        }
+        let dir = tmp("pwsh-run");
+        let marker = dir.join("m.jsonl");
+        let cmd = hook_command(&marker);
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all("{\"session_id\":\"中文\"}\n".as_bytes())
+                .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "pwsh 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = std::fs::read_to_string(&marker).expect("marker 应落盘");
+        assert!(text.contains("中文"), "UTF-8 内容必须原样写入: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

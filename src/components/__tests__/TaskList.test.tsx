@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { TaskList, formatTaskTime, TASK_STATUS_LABEL } from "../TaskList";
+import { TaskList, formatTaskTime, TASK_STATUS_LABEL, canRetryReview } from "../TaskList";
 import type { TaskInfo } from "../../types";
 
 const makeTask = (overrides: Partial<TaskInfo> = {}): TaskInfo => ({
@@ -70,5 +70,39 @@ describe("TaskList", () => {
     for (const s of statuses) {
       expect(TASK_STATUS_LABEL[s]).toBeDefined();
     }
+  });
+
+
+  it("已中止且有 session_file 时显示重试审查并回调", async () => {
+    const onRetry = vi.fn();
+    const tasks = [
+      makeTask({
+        status: "aborted",
+        kind: "engine",
+        session_file: "/tmp/s.jsonl",
+        last_reason: "审查失败：额度用尽",
+      }),
+    ];
+    render(<TaskList tasks={tasks} onCancel={vi.fn()} onRetryReview={onRetry} />);
+    const btn = screen.getByRole("button", { name: /重试审查/ });
+    expect(btn).toBeInTheDocument();
+    await userEvent.click(btn);
+    expect(onRetry).toHaveBeenCalledWith("task-1");
+  });
+
+  it("已中止但无 session_file 时不显示重试审查", () => {
+    const tasks = [makeTask({ status: "aborted", kind: "engine", session_file: undefined })];
+    render(<TaskList tasks={tasks} onCancel={vi.fn()} onRetryReview={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /重试审查/ })).not.toBeInTheDocument();
+  });
+
+  it("canRetryReview 仅对 engine+aborted+有会话 为真", () => {
+    expect(
+      canRetryReview(makeTask({ status: "aborted", kind: "engine", session_file: "/x" })),
+    ).toBe(true);
+    expect(canRetryReview(makeTask({ status: "aborted", kind: "ps1", session_file: "/x" }))).toBe(
+      false,
+    );
+    expect(canRetryReview(makeTask({ status: "accepted", session_file: "/x" }))).toBe(false);
   });
 });

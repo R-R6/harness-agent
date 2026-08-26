@@ -39,6 +39,13 @@ export interface TaskInfo {
   rounds: number;
   last_reason: string;
   started_at_ms: number;
+  /** 原始任务描述 */
+  task?: string;
+  /** 可重试审查时的会话文件路径 */
+  session_file?: string;
+  max_rounds?: number;
+  model?: string;
+  mock?: boolean;
 }
 
 // ---- MCP 健康检查（阶段 3） ----

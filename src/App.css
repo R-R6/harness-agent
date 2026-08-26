@@ -536,3 +536,5 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .task-row__reason { display: inline-block; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; margin-left: 4px; color: var(--text-faint); }
 .task-row__cancel { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
 .task-row__cancel:hover { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
+.task-row__retry { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--codex); font-size: 11px; cursor: pointer; }
+.task-row__retry:hover { background: var(--codex-soft); border-color: var(--codex); }

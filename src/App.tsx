@@ -14,7 +14,7 @@ import { StatusBar } from "./components/StatusBar";
 import { TerminalWorkspace, type TerminalWorkspaceHandle } from "./components/TerminalWorkspace";
 import { SplitHandle } from "./components/SplitHandle";
 import harnessMark from "./assets/harness-mark.svg";
-import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSupervise } from "./lib/api";
+import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSupervise, retrySuperviseReview } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
 import { listenWhileMounted } from "./lib/listenWhileMounted";
@@ -207,6 +207,17 @@ function App() {
       // 取消失败静默
     }
   }, []);
+
+  /** 重试审查：修好 Codex 后由用户主动接续 */
+  const handleRetryReview = useCallback(async (taskId: string) => {
+    setError("");
+    try {
+      await retrySuperviseReview(taskId);
+      void loadTasks();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [loadTasks]);
 
   /** 终端驱动监督启动后切到终端 tab */
   const handleDriveStarted = useCallback(() => {
@@ -691,7 +702,7 @@ function App() {
                       <h4>任务记录</h4>
                       <span className="count-pill">{tasks.length}</span>
                     </div>
-                    <TaskList tasks={tasks} onCancel={handleCancelTask} />
+                    <TaskList tasks={tasks} onCancel={handleCancelTask} onRetryReview={handleRetryReview} />
                   </div>
                   <div
                     className={`supervise-layout ${compactSupervise ? "supervise-layout--stacked" : ""}`}
