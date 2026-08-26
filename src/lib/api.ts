@@ -49,9 +49,11 @@ export async function cancelSupervise(taskId: string): Promise<void> {
   return invoke<void>("cancel_supervise", { taskId });
 }
 
-/** 读 .supervise 产物（审查看板数据） */
-export async function fetchReviewArtifacts(workDir: string): Promise<ReviewArtifact[]> {
-  return invoke("read_review_artifacts", { workDir });
+/** 读 .supervise 产物（审查看板数据）。无头任务传 taskId 读 tasks/<id>/，省略则读根目录。 */
+export async function fetchReviewArtifacts(workDir: string, taskId?: string | null): Promise<ReviewArtifact[]> {
+  const args: Record<string, string> = { workDir };
+  if (taskId) args.taskId = taskId;
+  return invoke("read_review_artifacts", args);
 }
 
 /** 列出全部监督任务（含历史终态；重启后清空） */

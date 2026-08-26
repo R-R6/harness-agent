@@ -438,6 +438,51 @@ describe("App 集成", () => {
     );
   });
 
+  it("同空间两个运行中任务可分别取消，互不干扰", async () => {
+    const wsA = { id: "ws-a", path: "D:\\space-alpha", name: "space-alpha", position: 0, createdAt: 1 };
+    localStorage.setItem("ha-workspaces", JSON.stringify([wsA]));
+    localStorage.setItem("ha-active-workspace", "ws-a");
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_sessions") return Promise.resolve(sessions);
+      if (cmd === "read_review_artifacts") return Promise.resolve([]);
+      if (cmd === "list_supervise_tasks") {
+        return Promise.resolve([
+          {
+            id: "task-1",
+            work_dir: "D:\\space-alpha",
+            kind: "ps1",
+            status: "running",
+            rounds: 0,
+            last_reason: "",
+            started_at_ms: 1,
+          },
+          {
+            id: "task-2",
+            work_dir: "D:\\space-alpha",
+            kind: "ps1",
+            status: "running",
+            rounds: 0,
+            last_reason: "",
+            started_at_ms: 2,
+          },
+        ]);
+      }
+      if (cmd === "cancel_supervise") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    const cancels = await screen.findAllByRole("button", { name: /取消/ });
+    expect(cancels).toHaveLength(2);
+    await userEvent.click(cancels[1]);
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("cancel_supervise", { taskId: "task-2" });
+    });
+    expect(mocks.invoke).not.toHaveBeenCalledWith("cancel_supervise", { taskId: "task-1" });
+  });
+
   it("同 basename 不同 path 的两个空间，任务列表不串台", async () => {
     const wsA = { id: "ws-a", path: "D:\\projA\\app", name: "app-a", position: 0, createdAt: 1 };
     const wsB = { id: "ws-b", path: "D:\\projB\\app", name: "app-b", position: 1, createdAt: 2 };

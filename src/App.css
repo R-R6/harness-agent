@@ -523,8 +523,9 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .supervise-tasks__head h4 { margin: 0; font-size: 13px; font-weight: 650; }
 .task-list { list-style: none; margin: 0; padding: 0 0 8px; max-height: 200px; overflow: auto; }
 .task-list--empty { padding: 14px 0; color: var(--text-faint); font-size: 12px; }
-.task-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-sm); }
+.task-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-sm); cursor: pointer; }
 .task-row:hover { background: var(--hover); }
+.task-row.is-selected { background: var(--hover); outline: 1px solid var(--border); }
 .task-badge { display: inline-flex; min-width: 48px; height: 20px; align-items: center; justify-content: center; padding: 0 6px; border-radius: 999px; font-size: 10px; font-weight: 650; white-space: nowrap; }
 .task-badge--running { background: var(--codex-soft); color: var(--codex); }
 .task-badge--accepted { background: var(--success-soft); color: var(--success); }

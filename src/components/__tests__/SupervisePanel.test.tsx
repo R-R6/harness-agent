@@ -179,10 +179,69 @@ describe("SupervisePanel", () => {
     mocks.invoke.mockResolvedValue("task-1");
 
     renderPanel();
-    // 等 useEffect 异步注册 listener 完成
     await waitFor(() => expect(logHandler).toBeDefined());
-    // 触发一次日志事件
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "t");
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalled());
     logHandler?.({ payload: { taskId: "task-1", line: "[PASS] 验收通过" } });
     expect(await screen.findByText("[PASS] 验收通过")).toBeInTheDocument();
+  });
+
+  it("启动成功后仍可再开任务，表单不再出现取消按钮", async () => {
+    mocks.invoke.mockResolvedValueOnce("task-1").mockResolvedValueOnce("task-2");
+    renderPanel("D:\\work");
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: "启动监督闭环" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /取消任务/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(2));
+  });
+
+  it("日志只保留最近一次启动的 taskId；切目录后清空", async () => {
+    let logHandler: ((e: { payload: { taskId: string; line: string } }) => void) | undefined;
+    mocks.listen.mockImplementation((event: string, cb: (e: never) => void) => {
+      if (event === "supervise-log") logHandler = cb as never;
+      return Promise.resolve(() => {});
+    });
+    mocks.invoke.mockResolvedValueOnce("task-1").mockResolvedValueOnce("task-2");
+    const { onWorkDirChange } = renderPanel("D:\\work");
+    await waitFor(() => expect(logHandler).toBeDefined());
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    logHandler?.({ payload: { taskId: "task-1", line: "log-from-1" } });
+    expect(await screen.findByText("log-from-1")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("log-from-1")).not.toBeInTheDocument();
+    logHandler?.({ payload: { taskId: "task-1", line: "stale-1" } });
+    logHandler?.({ payload: { taskId: "task-2", line: "log-from-2" } });
+    expect(await screen.findByText("log-from-2")).toBeInTheDocument();
+    expect(screen.queryByText("stale-1")).not.toBeInTheDocument();
+
+    const dirInput = screen.getByPlaceholderText(/浏览选择/);
+    await userEvent.clear(dirInput);
+    await userEvent.type(dirInput, "D:\\other");
+    expect(onWorkDirChange).toHaveBeenCalled();
+    expect(screen.queryByText("log-from-2")).not.toBeInTheDocument();
+  });
+
+  it("启动请求进行中时禁用启动按钮，防止连点", async () => {
+    let resolveStart: ((id: string) => void) | undefined;
+    mocks.invoke.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    renderPanel("D:\\work");
+    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
+    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    expect(await screen.findByRole("button", { name: "启动中..." })).toBeDisabled();
+    resolveStart?.("task-1");
+    expect(await screen.findByRole("button", { name: "启动监督闭环" })).toBeEnabled();
   });
 });

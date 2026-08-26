@@ -6,6 +6,8 @@ interface Props {
   tasks: TaskInfo[];
   /** 取消运行中的任务（复用 cancel_supervise） */
   onCancel: (taskId: string) => void;
+  selectedId?: string | null;
+  onSelect?: (taskId: string) => void;
 }
 
 export const TASK_STATUS_LABEL: Record<TaskInfo["status"], string> = {
@@ -32,7 +34,7 @@ export function formatTaskTime(ms: number): string {
 }
 
 /** 监督闭环任务列表：状态/轮数/目录/开始时间；运行中带「取消」 */
-export function TaskList({ tasks, onCancel }: Props) {
+export function TaskList({ tasks, onCancel, selectedId, onSelect }: Props) {
   if (tasks.length === 0) {
     return (
       <div className="task-list task-list--empty">
@@ -43,7 +45,13 @@ export function TaskList({ tasks, onCancel }: Props) {
   return (
     <ul className="task-list">
       {tasks.map((t) => (
-        <li key={t.id} className={`task-row task-row--${t.status}`} title={t.work_dir}>
+        <li
+          key={t.id}
+          className={`task-row task-row--${t.status}${selectedId === t.id ? " is-selected" : ""}`}
+          title={t.work_dir}
+          aria-selected={selectedId === t.id}
+          onClick={() => onSelect?.(t.id)}
+        >
           <span className={`task-badge task-badge--${t.status}`}>
             {TASK_STATUS_LABEL[t.status]}
           </span>
@@ -62,7 +70,14 @@ export function TaskList({ tasks, onCancel }: Props) {
             </div>
           </div>
           {t.status === "running" && (
-            <button type="button" className="task-row__cancel" onClick={() => onCancel(t.id)}>
+            <button
+              type="button"
+              className="task-row__cancel"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCancel(t.id);
+              }}
+            >
               <Icon name="stop" size={12} /> 取消
             </button>
           )}

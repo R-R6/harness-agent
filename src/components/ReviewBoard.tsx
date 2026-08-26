@@ -5,6 +5,8 @@ import { Icon } from "./Icon";
 
 interface Props {
   workDir: string;
+  /** 焦点任务：无头产物在 .supervise/tasks/<id>/；省略则读根 .supervise */
+  taskId?: string | null;
   /** 点击「查看会话」跳到会话浏览打开该轮的 transcript（file 为空时按钮隐藏） */
   onViewSession?: (file: string) => void;
   /** 所在 tab 是否激活：切入时自动刷新（监督任务运行中逐轮落盘，切回即见
@@ -13,7 +15,7 @@ interface Props {
 }
 
 /** 审查看板：读 .supervise 产物，按轮次展示 verdict/reason */
-export function ReviewBoard({ workDir, onViewSession, active = true }: Props) {
+export function ReviewBoard({ workDir, taskId, onViewSession, active = true }: Props) {
   const [artifacts, setArtifacts] = useState<ReviewArtifact[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -23,13 +25,13 @@ export function ReviewBoard({ workDir, onViewSession, active = true }: Props) {
     setLoading(true);
     setError("");
     try {
-      setArtifacts(await fetchReviewArtifacts(workDir.trim()));
+      setArtifacts(await fetchReviewArtifacts(workDir.trim(), taskId));
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
-  }, [workDir]);
+  }, [workDir, taskId]);
 
   // 挂载即加载 + workDir 变化加载 + tab 切回（active 翻 true）自动刷新
   useEffect(() => {
