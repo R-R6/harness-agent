@@ -3403,6 +3403,7 @@ dependencies = [
 name = "supervise_runner"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "path_util",
  "serde",
  "serde_json",

@@ -46,6 +46,18 @@ export function detectWindowsPty(
 }
 
 /**
+ * macOS ships no Cascadia/Consolas/SimSun. The Windows-first stack would fall
+ * back to `monospace` (Menlo) for Latin and a proportional system CJK font
+ * for Chinese, which reads as a broken mixed-font grid inside the fixed-cell
+ * canvas. Detect the platform so each OS gets a stack it can actually resolve.
+ */
+function detectMacOS(env: NavigatorLike = typeof navigator === "undefined" ? {} : navigator): boolean {
+  const ua = env.userAgent ?? "";
+  const platform = env.platform ?? "";
+  return /Mac OS X|Macintosh/i.test(ua) || platform === "MacIntel" || platform === "MacARM";
+}
+
+/**
  * Options for hosting Claude Code (Ink) and Codex (fullscreen TUI) over a PTY.
  *
  * `convertEol` must stay false: xterm docs say PTY/termios already translates
@@ -53,16 +65,24 @@ export function detectWindowsPty(
  */
 export function buildXtermOptions(env?: NavigatorLike): ITerminalOptions {
   const windowsPty = detectWindowsPty(env);
+  const mac = detectMacOS(env);
+  // Windows: Cascadia/Consolas have no CJK glyphs, so NSimSun/SimSun provide a
+  // monospace CJK fallback (otherwise Windows substitutes proportional YaHei
+  // and Ink's cursor jumps a whole row). macOS: use SF Mono/Menlo plus
+  // PingFang SC / Hiragino Sans GB for CJK.
+  const fontFamily = mac
+    ? '"SF Mono", Menlo, Monaco, "PingFang SC", "Hiragino Sans GB", monospace'
+    : "Cascadia Mono, Consolas, NSimSun, SimSun, monospace";
   return {
     convertEol: false,
     cursorBlink: false,
     cursorInactiveStyle: "outline",
-    // Cascadia/Consolas have no CJK glyphs. Without a monospace CJK fallback,
-    // Windows substitutes Microsoft YaHei (proportional), so 你好 is not two
-    // cells wide and Ink/Claude's cursor jumps a whole row.
-    fontFamily: "Cascadia Mono, Consolas, NSimSun, SimSun, monospace",
+    fontFamily,
     fontSize: 13,
-    lineHeight: 1,
+    // macOS CJK fallbacks (PingFang/Hiragino) have taller metrics than Menlo;
+    // a bit of extra line height keeps them from clipping against the cell.
+    // Windows/Linux keep 1: NSimSun is a real monospace CJK font there.
+    lineHeight: mac ? 1.15 : 1,
     // ConPTY + windowsPty pushes the old viewport into scrollback when rows
     // grow (maximize/fit). Ink/ratatui then look like two stacked UIs.
     scrollback: 0,

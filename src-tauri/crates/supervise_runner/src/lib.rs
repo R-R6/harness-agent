@@ -78,9 +78,16 @@ pub struct ReviewArtifact {
 
 // ---------------- 路径定位 ----------------
 
-/// PowerShell 可执行文件：优先环境变量 HARNESS_PWSH，否则 powershell（Windows 自带 5.1）
+/// PowerShell 可执行文件：优先环境变量 HARNESS_PWSH，否则按 OS 兜底——
+/// Windows 自带 powershell 5.1；macOS/Linux 用 pwsh（brew install powershell）
 fn pwsh_path() -> String {
-    std::env::var("HARNESS_PWSH").unwrap_or_else(|_| "powershell".to_string())
+    std::env::var("HARNESS_PWSH").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "powershell".to_string()
+        } else {
+            "pwsh".to_string()
+        }
+    })
 }
 
 /// supervise.ps1 路径（三级解析）：
@@ -143,6 +150,14 @@ pub fn spawn_supervise(req: &SuperviseRequest) -> Result<Child, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    #[cfg(unix)]
+    {
+        // 独立进程组（pgid == 自身 pid）：取消监督时对整组发信号即可杀掉
+        // claude/codex 及其工具子进程，避免只杀 pwsh 留孤儿烧 API 额度
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
     cmd.spawn()
         .map_err(|e| format!("spawn pwsh 失败（请确认 PowerShell 可用）: {e}"))
 }
@@ -160,6 +175,33 @@ where
             on_line(line);
         }
     });
+}
+
+/// Unix：终止整个监督进程组并收割父进程。
+/// spawn_supervise 已把子进程设为独立进程组（pgid == pid），claude/codex 及其
+/// 工具子进程同组。流程：组 SIGTERM（给 CLI 优雅中断机会，立即中断烧额度的
+/// API 调用）→ 宽限轮询父进程退出 → 组 SIGKILL 扫尾（pwsh 对 SIGTERM 可能
+/// 优雅滞留；父先退的子孙被 reparent 后仍在原组，扫尾同样覆盖）→ reap。
+#[cfg(unix)]
+pub fn terminate_supervise(child: &mut Child) {
+    use std::time::{Duration, Instant};
+    let pgid = child.id() as i32;
+    // 负 pid = 对整个进程组发信号；组已不存在时返回 ESRCH，无害
+    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    let _ = child.wait();
 }
 
 // ---------------- 产物解析 ----------------
@@ -380,8 +422,37 @@ mod tests {
 
     // ---- 进程桥（fake ps1 fixture） ----
 
+    /// 三个 spawn 用例都要改写进程级环境变量 HARNESS_SUPERVISE_SCRIPT，cargo 默认
+    /// 并行跑测试线程会互相踩踏（A 刚设好脚本路径就被 B 覆盖，A spawn 到 B 的
+    /// 脚本——无限循环的 group-kill 脚本被 args 用例捞到就是永久挂死）。
+    /// 持锁覆盖"设变量 → spawn → 断言 → 还原"全程，串行化这几个用例。
+    static SCRIPT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// PowerShell 与生产同规则解析（HARNESS_PWSH → 按 OS 兜底）；
+    /// 环境里没有该解释器时跳过调用方测试（Unix 需 brew install powershell）
+    fn skip_if_no_pwsh() -> bool {
+        let exe = super::pwsh_path();
+        let ran = std::process::Command::new(&exe)
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Err(e) = ran {
+            eprintln!("跳过：未找到 {exe}（{e}）——Unix 需 brew install powershell");
+            return true;
+        }
+        false
+    }
+
     #[test]
     fn spawn_supervise_passes_args_and_captures_stdout() {
+        if skip_if_no_pwsh() {
+            return;
+        }
+        let _env_guard = SCRIPT_ENV_LOCK.lock().unwrap();
         // 用假的 ps1 充当 supervise 脚本：打印收到的参数 + 输出模拟日志
         let tmp = std::env::temp_dir().join(format!("sv-spawn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -401,10 +472,9 @@ mod tests {
         )
         .unwrap();
 
-        // 环境变量指向 fake 脚本；HARNESS_PWSH 用 powershell.exe
+        // 环境变量指向 fake 脚本；解释器走 pwsh_path() 的默认解析
         let old_script = std::env::var("HARNESS_SUPERVISE_SCRIPT").ok();
         std::env::set_var("HARNESS_SUPERVISE_SCRIPT", &fake_script);
-        std::env::set_var("HARNESS_PWSH", "powershell");
 
         let req = SuperviseRequest {
             task: "写计算器".into(),
@@ -444,6 +514,10 @@ mod tests {
     /// 正常退出且逐行回调不丢首尾行。
     #[test]
     fn drain_stderr_consumes_more_than_pipe_buffer() {
+        if skip_if_no_pwsh() {
+            return;
+        }
+        let _env_guard = SCRIPT_ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("sv-errdrain-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
@@ -460,7 +534,6 @@ mod tests {
 
         let old_script = std::env::var("HARNESS_SUPERVISE_SCRIPT").ok();
         std::env::set_var("HARNESS_SUPERVISE_SCRIPT", &fake_script);
-        std::env::set_var("HARNESS_PWSH", "powershell");
 
         let req = SuperviseRequest {
             task: "t".into(),
@@ -516,6 +589,94 @@ mod tests {
         assert_eq!(count, 8192, "8192 行 stderr 必须全部收到，实际 {count}");
         assert!(first.starts_with("ERR-1-"), "首行: {first}");
         assert!(last.starts_with("ERR-8192-"), "末行: {last}");
+
+        match old_script {
+            Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),
+            None => std::env::remove_var("HARNESS_SUPERVISE_SCRIPT"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Unix 进程组终止：fake 脚本 spawn 一个忽略 SIGTERM 的 sh 子孙后进入死循环，
+    /// terminate_supervise 后整组（pwsh + sh + sleep）必须全部消亡——
+    /// 验证 SIGTERM 组信号 + SIGKILL 扫尾不留孤儿（取消监督烧 API 额度的根因）
+    #[cfg(unix)]
+    #[test]
+    fn terminate_supervise_kills_group_including_sigterm_ignorers() {
+        if skip_if_no_pwsh() {
+            return;
+        }
+        let _env_guard = SCRIPT_ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("sv-grpkill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fake_script = tmp.join("group-kill.ps1");
+        std::fs::write(
+            &fake_script,
+            "param()\n\
+             try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}\n\
+             Start-Process -FilePath '/bin/sh' -ArgumentList '-c', 'trap \"\" TERM; sleep 600'\n\
+             Write-Output \"SPAWNED\"\n\
+             while ($true) { Start-Sleep -Milliseconds 500 }\n",
+        )
+        .unwrap();
+
+        let old_script = std::env::var("HARNESS_SUPERVISE_SCRIPT").ok();
+        std::env::set_var("HARNESS_SUPERVISE_SCRIPT", &fake_script);
+
+        let req = SuperviseRequest {
+            task: "t".into(),
+            work_dir: "/tmp".into(),
+            level: None,
+            max_rounds: None,
+            model: None,
+            mock: true,
+        };
+        let child = spawn_supervise(&req).expect("spawn 成功");
+        let pgid = child.id();
+        // 断言失败走 unwind：Drop 守卫兜底终止，不留无限循环的 pwsh/sh 孤儿
+        struct TerminateOnDrop(Option<Child>);
+        impl Drop for TerminateOnDrop {
+            fn drop(&mut self) {
+                if let Some(mut c) = self.0.take() {
+                    super::terminate_supervise(&mut c);
+                }
+            }
+        }
+        let mut guard = TerminateOnDrop(Some(child));
+        let child = guard.0.as_mut().unwrap();
+
+        // 读到 SPAWNED 再动手：确保 sh 子孙已经跑起来
+        use std::io::BufRead;
+        let mut first_line = String::new();
+        {
+            let stdout = child.stdout.take().expect("stdout 管道");
+            let mut reader = std::io::BufReader::new(stdout);
+            reader.read_line(&mut first_line).expect("读首行");
+        } // reader 离开作用域关闭管道
+        assert!(first_line.contains("SPAWNED"), "首行: {first_line}");
+
+        terminate_supervise(child);
+        let reaped = child.try_wait().expect("try_wait").is_some();
+        guard.0 = None; // 已正常收割，跳过 Drop 兜底
+        assert!(reaped, "父进程必须已被收割");
+
+        // 全组消亡断言：僵尸被 reparent 给 launchd 后 reap 有窗口期，必须轮询。
+        // kill(-pgid, 0) 返回 ESRCH = 组内再无存活/僵尸成员
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let probe = unsafe { libc::kill(-(pgid as i32), 0) };
+            if probe == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "进程组 {pgid} 10s 后仍有存活成员（孤儿未清干净）"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
 
         match old_script {
             Some(v) => std::env::set_var("HARNESS_SUPERVISE_SCRIPT", v),

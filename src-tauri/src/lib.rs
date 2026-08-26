@@ -86,22 +86,44 @@ impl SuperviseState {
     /// 窗口关闭时终止全部监督任务——否则 pwsh + claude/codex 孤儿进程
     /// 会在应用退出后继续无人监督地跑完整轮任务（烧 token）
     fn stop_all(&self) {
-        let mut running = match self.running.lock() {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        for (_id, mut child) in running.drain() {
-            let pid = child.id();
-            let _ = kill_process_tree(Some(pid));
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        // 引擎线程：置取消标志（注入/等待循环每 500ms 检查一次即退出）
+        // 先置引擎取消标志：Unix 进程组终止可能数秒，引擎线程应尽快停注入
         if let Ok(flags) = self.engine_cancels.lock() {
             for flag in flags.values() {
                 flag.store(true, Ordering::Relaxed);
             }
         }
+        // 短锁 drain：终止含宽限等待，持锁会卡住 run_supervise 的 insert
+        let children: Vec<std::process::Child> = {
+            let Ok(mut running) = self.running.lock() else { return };
+            running.drain().map(|(_, c)| c).collect()
+        };
+        for mut child in children {
+            terminate_supervise_child(&mut child);
+        }
+    }
+}
+
+/// 终止一个监督子进程及其全部子孙。
+/// Unix：spawn 时已设独立进程组 → 组 SIGTERM → 宽限 → 组 SIGKILL 扫尾；
+/// Windows：先 kill_process_tree（父进程仍活着时 taskkill /T）再杀父进程。
+fn terminate_supervise_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        supervise_runner::terminate_supervise(child);
+    }
+    #[cfg(windows)]
+    {
+        let pid = child.id();
+        if let Err(error) = kill_process_tree(Some(pid)) {
+            eprintln!("[supervise] 终止监督进程树（PID {pid}）失败: {error}");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -203,6 +225,7 @@ fn emit_terminal_output(
 /// taskkill /T /F 杀掉整棵进程树（含 PTY 主进程）。
 /// 必须在父进程还活着时调用——父进程先死后 taskkill 枚举不到子树，
 /// 子孙进程会变成孤儿继续存活。目标进程已退出（taskkill 报"没有找到进程"）视为成功。
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn kill_process_tree(pid: Option<u32>) -> Result<(), String> {
     let Some(pid) = pid else { return Ok(()) };
     #[cfg(windows)]
@@ -517,18 +540,17 @@ async fn run_supervise(
 #[tauri::command]
 async fn cancel_supervise(app: AppHandle, task_id: String) -> Result<(), String> {
     let state = app.state::<SuperviseState>();
-    let mut running = state.running.lock().unwrap();
-    if let Some((pid, mut child)) = running.remove(&task_id).map(|c| (c.id(), c)) {
-        // 先杀整棵进程树再杀主进程：父进程先死后 taskkill /T 枚举不到子树，
-        // claude/codex 子孙会变孤儿继续跑（与 stop_terminal 同款顺序）
-        if let Err(error) = kill_process_tree(Some(pid)) {
-            eprintln!("[supervise] 终止监督进程树（PID {pid}）失败: {error}");
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+    // 短锁：只摘除 entry。终止流程含最多数秒的宽限等待，持锁做会卡死
+    // run_supervise 的 insert 与 reader 线程的收尾清理
+    let mut child = state
+        .running
+        .lock()
+        .map_err(|_| "监督状态锁已损坏")?
+        .remove(&task_id);
+    if let Some(c) = child.as_mut() {
+        terminate_supervise_child(c);
         return Ok(());
     }
-    drop(running);
     if let Some(flag) = state.engine_cancels.lock().unwrap().get(&task_id) {
         flag.store(true, Ordering::Relaxed);
         return Ok(());
@@ -840,6 +862,46 @@ async fn export_transcript_md(file: String, dest: String) -> Result<String, Stri
 
 // ---------------- 入口 ----------------
 
+/// GUI 直启（Finder/Dock 启动 .app）继承的是 launchd 的最小 PATH（/usr/bin:/bin:…），
+/// 找不到 /opt/homebrew/bin 的 pwsh/node 与用户级 npm bin 的 claude/codex。
+/// 采集一次登录交互 shell 的 PATH（-i 补读 ~/.zshrc——nvm 等常把导出写在 zshrc），
+/// 把缺失条目追加进当前进程 PATH；此后所有子进程（PTY 终端 / session_proxy /
+/// mcp_checker / supervise）经环境继承全部生效。失败静默保持现状（dev 模式本就
+/// 继承开发 shell 的完整 PATH，合并幂等无害）。
+#[cfg(unix)]
+fn augment_path_from_login_shell() {
+    use std::process::{Command, Stdio};
+    let Ok(out) = Command::new("/bin/zsh")
+        .arg("-ilc")
+        .arg("printf %s \"$PATH\"")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let login_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if login_path.is_empty() {
+        return;
+    }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let have: Vec<_> = std::env::split_paths(&current).collect();
+    let mut merged = have.clone();
+    for dir in std::env::split_paths(&login_path) {
+        if !merged.contains(&dir) {
+            merged.push(dir);
+        }
+    }
+    if merged != have {
+        if let Ok(joined) = std::env::join_paths(merged) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -855,6 +917,9 @@ pub fn run() {
             sessions: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
+            // GUI 直启时 PATH 不含 homebrew/npm 全局 bin，先补齐（见函数注释）
+            #[cfg(unix)]
+            augment_path_from_login_shell();
             // 注入打包资源里的 server.js / supervise.ps1 路径（发布/开发均来自
             // BaseDirectory::Resource，即 exe 同级目录；替代旧的 mcp-lab 绝对路径）
             let server_js = app.path().resolve(
@@ -891,6 +956,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 window.state::<TerminalState>().stop_all();
+                // 监督任务同样清理：不清理会留 pwsh/claude/codex 孤儿继续烧 API 额度
                 window.state::<SuperviseState>().stop_all();
             }
         })
@@ -948,5 +1014,31 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["kind"], "engine");
         assert_eq!(json["status"], "running");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod path_tests {
+    /// 剥到 launchd 级最小 PATH 后调用采集：登录 shell 的条目（含用户级 npm bin、
+    /// homebrew）必须被追加进来，且原有条目不丢。改的是进程级环境，测试结束还原。
+    /// 注：不能依赖 ps eww 观测——它显示的是 exec 时的环境块快照，看不到运行期
+    /// set_var 的修改，必须进程内断言。
+    #[test]
+    fn augment_path_from_login_shell_merges_missing_entries() {
+        let saved = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        super::augment_path_from_login_shell();
+        let now = std::env::var("PATH").expect("PATH 仍在");
+        let count = now.split(':').filter(|s| !s.is_empty()).count();
+        assert!(
+            count > 4,
+            "登录 shell 的 PATH 条目应被追加合并（实际 {count} 条）: {now}"
+        );
+        for base in ["/usr/bin", "/bin"] {
+            assert!(now.contains(base), "原有条目不丢: {now}");
+        }
+        if let Some(p) = saved {
+            std::env::set_var("PATH", p);
+        }
     }
 }
