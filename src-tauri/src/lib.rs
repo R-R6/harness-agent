@@ -74,21 +74,23 @@ fn ps1_exit_to_status(code: Option<i64>) -> TaskStatus {
 struct SuperviseState {
     /// task_id → 运行中的子进程（ps1 无头模式，用于取消）
     running: Mutex<HashMap<String, std::process::Child>>,
-    /// 终端驱动引擎：同目录互斥（一个 Claude pane 同时只能注入一个任务）
-    engine_busy_dirs: Mutex<HashSet<String>>,
+    /// 终端驱动引擎：同一 Claude PTY session 互斥（同目录多进程允许，无上限）
+    engine_busy_sessions: Mutex<HashSet<String>>,
     /// task_id → 终端驱动引擎（阶段 2）的取消标志
     engine_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 任务注册表（含历史终态；应用退出即清，重启后历史消失属预期）
     tasks: Mutex<HashMap<String, TaskInfo>>,
+    /// 实际安装过 Stop hook 的引擎数（mock 不计入，避免卡住卸载）
+    engine_hook_refs: Mutex<u32>,
 }
 
-fn engine_dir_available(busy: &HashSet<String>, dir: &str) -> bool {
-    !busy.contains(dir)
+fn engine_session_available(busy: &HashSet<String>, session_id: &str) -> bool {
+    !busy.contains(session_id)
 }
 
-fn release_engine_dir(state: &SuperviseState, dir: &str) {
-    if let Ok(mut busy) = state.engine_busy_dirs.lock() {
-        busy.remove(dir);
+fn release_engine_session(state: &SuperviseState, session_id: &str) {
+    if let Ok(mut busy) = state.engine_busy_sessions.lock() {
+        busy.remove(session_id);
     }
 }
 
@@ -588,42 +590,72 @@ async fn run_supervise_terminal(
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
 
-    // 定位正在跑的 Claude pane（必须在任务目录上——引擎逐轮校验绑定）。
-    // 单次遍历取 (id, dir)：两次 find 在同目录多 pane 时可能各命中不同的
-    // pane（HashMap 无序），id 与目录错配
+    // 一任务一 Claude PTY：优先用请求里的 terminal_session_id；否则取该目录
+    // 上尚未被引擎占用的 Claude pane（兼容旧前端）。解析与占用同一把锁，防竞态。
     let session_id = {
         let term = app.state::<TerminalState>();
         let sessions = term.sessions.lock().map_err(|_| "终端状态锁已损坏")?;
-        sessions
-            .iter()
-            .find(|(_, p)| p.agent == "claude" && normalize_path(&p.work_dir) == work_dir)
-            .map(|(id, _)| id.clone())
-            .ok_or_else(|| {
-                "未找到运行中的 Claude 终端（请先在终端工作台以该工作目录启动 Claude CLI）"
-                    .to_string()
-            })?
+        let mut busy = state.engine_busy_sessions.lock().unwrap();
+        let id = if let Some(want) = request
+            .terminal_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let proc = sessions.get(want).ok_or_else(|| {
+                format!("指定的终端会话不存在或已退出：{want}")
+            })?;
+            if proc.agent != "claude" {
+                return Err(format!("指定会话不是 Claude 终端：{want}"));
+            }
+            if normalize_path(&proc.work_dir) != work_dir {
+                return Err(format!(
+                    "指定 Claude 会话目录与任务目录不符（会话 {}，任务 {}）",
+                    proc.work_dir, request.work_dir
+                ));
+            }
+            if !engine_session_available(&busy, want) {
+                return Err("该 Claude 终端已有监督任务在运行（同一会话不能并行注入）".into());
+            }
+            want.to_string()
+        } else {
+            sessions
+                .iter()
+                .find(|(id, p)| {
+                    p.agent == "claude"
+                        && normalize_path(&p.work_dir) == work_dir
+                        && engine_session_available(&busy, id)
+                })
+                .map(|(id, _)| id.clone())
+                .ok_or_else(|| {
+                    "未找到可用的 Claude 终端（请先启动 Claude，或传入 terminal_session_id）"
+                        .to_string()
+                })?
+        };
+        busy.insert(id.clone());
+        id
     };
 
-    // 目录占用登记（仅引擎：同 Claude pane 不能并行注入）
-    {
-        let mut busy = state.engine_busy_dirs.lock().unwrap();
-        if !engine_dir_available(&busy, &work_dir) {
-            return Err("该工作目录已有终端驱动任务在运行（同一 Claude 会话不能并行注入）".into());
-        }
-        busy.insert(work_dir.clone());
-    }
+    let rounds = level_rounds(request.level.as_deref(), request.max_rounds);
+    let model = request.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
 
-    // Stop hook 幂等安装 + marker 文件（.supervise/stop-markers.jsonl，随项目走）
+    // 产物按 task 隔离；Stop marker 仍共享根目录（引擎靠 task_token 预钉 session）
     let supervise_dir = std::path::Path::new(&request.work_dir).join(".supervise");
-    if let Err(e) = std::fs::create_dir_all(&supervise_dir) {
-        release_engine_dir(&state, &work_dir);
-        return Err(format!("创建 .supervise 失败: {e}"));
+    let artifacts_dir = supervise_dir.join("tasks").join(&task_id);
+    if let Err(e) = std::fs::create_dir_all(&artifacts_dir) {
+        release_engine_session(&state, &session_id);
+        return Err(format!("创建任务产物目录失败: {e}"));
     }
     let marker_file = supervise_dir.join("stop-markers.jsonl");
+    if let Err(e) = std::fs::create_dir_all(&supervise_dir) {
+        release_engine_session(&state, &session_id);
+        return Err(format!("创建 .supervise 失败: {e}"));
+    }
     let home = match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
         Ok(h) => h,
         Err(_) => {
-            release_engine_dir(&state, &work_dir);
+            release_engine_session(&state, &session_id);
             return Err("无法定位用户主目录（USERPROFILE/HOME 均缺失）".into());
         }
     };
@@ -631,14 +663,12 @@ async fn run_supervise_terminal(
     let hook_installed = !request.mock;
     if hook_installed {
         if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
-            release_engine_dir(&state, &work_dir);
+            release_engine_session(&state, &session_id);
             return Err(format!("安装 Stop hook 失败（可重试或改用无头模式）: {e}"));
         }
+        *state.engine_hook_refs.lock().unwrap() += 1;
     }
 
-    let rounds = level_rounds(request.level.as_deref(), request.max_rounds);
-    let model = request.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
-    let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
     let cancel = Arc::new(AtomicBool::new(false));
     state
         .engine_cancels
@@ -660,8 +690,8 @@ async fn run_supervise_terminal(
         task: request.task.clone(),
         work_dir: request.work_dir.clone(),
         max_rounds: rounds,
-        // 产物落 .supervise（审查看板与「查看会话」跳转消费同一套格式）
-        artifacts_dir: Some(supervise_dir.clone()),
+        artifacts_dir: Some(artifacts_dir),
+        task_token: Some(task_id.clone()),
         reviewer_label: match (request.mock, model) {
             (true, _) => "mock".to_string(),
             (false, Some(m)) => m.to_string(),
@@ -680,7 +710,7 @@ async fn run_supervise_terminal(
 
     let app2 = app.clone();
     let task_id2 = task_id.clone();
-    let work_dir2 = work_dir.clone();
+    let session_id2 = session_id.clone();
     let settings2 = settings.clone();
     let marker_file2 = marker_file.clone();
     std::thread::spawn(move || {
@@ -724,17 +754,23 @@ async fn run_supervise_terminal(
         // Stop hook 指向本项目 marker，遗留会让用户所有 Claude 会话每次
         // Stop 都白跑一次 powershell，多项目还会累积死条目
         let app_state = app2.state::<SuperviseState>();
-        let remaining_engines = {
+        {
             let mut flags = app_state.engine_cancels.lock().unwrap();
             flags.remove(&task_id2);
-            flags.len()
-        };
+        }
         app_state
-            .engine_busy_dirs
+            .engine_busy_sessions
             .lock()
             .unwrap()
-            .remove(&work_dir2);
-        if hook_installed && remaining_engines == 0 {
+            .remove(&session_id2);
+        let remaining_hooks = if hook_installed {
+            let mut n = app_state.engine_hook_refs.lock().unwrap();
+            *n = n.saturating_sub(1);
+            *n
+        } else {
+            *app_state.engine_hook_refs.lock().unwrap()
+        };
+        if hook_installed && remaining_hooks == 0 {
             if let Err(e) = remove_stop_hook(&settings2, &marker_file2) {
                 eprintln!("[supervise] 卸载 Stop hook 失败（不影响任务结果）: {e}");
             }
@@ -843,7 +879,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(SuperviseState {
             running: Mutex::new(HashMap::new()),
-            engine_busy_dirs: Mutex::new(HashSet::new()),
+            engine_busy_sessions: Mutex::new(HashSet::new()),
+            engine_hook_refs: Mutex::new(0),
             engine_cancels: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
         })
@@ -947,11 +984,11 @@ mod tests {
     }
 
     #[test]
-    fn engine_dir_available_same_dir_busy_other_dir_free() {
+    fn engine_session_available_same_session_busy_other_free() {
         let mut busy = HashSet::new();
-        assert!(engine_dir_available(&busy, "D:\\a"));
-        busy.insert("D:\\a".into());
-        assert!(!engine_dir_available(&busy, "D:\\a"));
-        assert!(engine_dir_available(&busy, "D:\\b"));
+        assert!(engine_session_available(&busy, "terminal-1"));
+        busy.insert("terminal-1".into());
+        assert!(!engine_session_available(&busy, "terminal-1"));
+        assert!(engine_session_available(&busy, "terminal-2"));
     }
 }

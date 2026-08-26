@@ -168,7 +168,10 @@ describe("TerminalWorkspace", () => {
       });
       expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
     });
-    expect(mocks.invoke.mock.calls.some((call) => call[0] === "resize_terminal")).toBe(false);
+    // 启动后会按实际 xterm 尺寸再 sync 一次 resize（修黑屏）
+    await waitFor(() => {
+      expect(mocks.invoke.mock.calls.some((call) => call[0] === "resize_terminal")).toBe(true);
+    });
 
     await waitFor(() => {
       expect(mocks.listeners.get("terminal-output")).toHaveLength(1);
@@ -365,6 +368,94 @@ describe("TerminalWorkspace", () => {
         }),
       });
     });
+  });
+
+  it("start_terminal 返回前到达的输出不丢（避免 Claude 启动后黑屏）", async () => {
+    let releaseStart!: (value: {
+      id: string;
+      agent: string;
+      work_dir: string;
+      status: string;
+    }) => void;
+    const startPromise = new Promise<{
+      id: string;
+      agent: string;
+      work_dir: string;
+      status: string;
+    }>((resolve) => {
+      releaseStart = resolve;
+    });
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "start_terminal") return startPromise;
+      return Promise.resolve(undefined);
+    });
+
+    renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+    await waitFor(() => expect(mocks.listeners.get("terminal-output")).toHaveLength(1));
+
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+    // PTY 已在跑、前端尚未写入 session：早期输出必须进 orphan 缓冲
+    emitEvent("terminal-output", { sessionId: "terminal-claude-early", data: "welcome-tui" });
+    expect(mocks.terminals[0].writes.some((chunk) => chunk.includes("welcome-tui"))).toBe(false);
+
+    await act(async () => {
+      releaseStart({
+        id: "terminal-claude-early",
+        agent: "claude",
+        work_dir: PROJECT_DIR,
+        status: "running",
+      });
+      await startPromise;
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "停止 Claude CLI" })).toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(mocks.terminals[0].writes.some((chunk) => chunk.includes("welcome-tui"))).toBe(true);
+    });
+  });
+
+  it("startClaudeForTask 可连续两次启动，不出现「终端已在运行」", async () => {
+    let startCount = 0;
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "start_terminal") {
+        startCount += 1;
+        return Promise.resolve({
+          id: `terminal-claude-${startCount}`,
+          agent: "claude",
+          work_dir: PROJECT_DIR,
+          status: "running",
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const ref = { current: null as TerminalWorkspaceHandle | null };
+    render(
+      <TerminalWorkspace
+        ref={ref as unknown as React.Ref<TerminalWorkspaceHandle>}
+        active
+        projectWorkDir={PROJECT_DIR}
+        onProjectWorkDirChange={() => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+
+    let firstId = "";
+    let secondId = "";
+    await act(async () => {
+      firstId = await ref.current!.startClaudeForTask(PROJECT_DIR);
+    });
+    await act(async () => {
+      secondId = await ref.current!.startClaudeForTask(PROJECT_DIR);
+    });
+
+    expect(firstId).toBe("terminal-claude-1");
+    expect(secondId).toBe("terminal-claude-2");
+    expect(mocks.invoke.mock.calls.filter((call) => call[0] === "start_terminal")).toHaveLength(2);
+    expect(screen.queryByText(/终端已在运行/)).not.toBeInTheDocument();
   });
 
   it("停止与自行退出竞态：invoke 失败不再回滚 running 卡死面板", async () => {

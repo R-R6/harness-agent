@@ -15,7 +15,13 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.dialogOpen }));
 
 /** 受控宿主：面板的 workDir 由父组件持有（与 App 中的用法一致） */
-function renderPanel(initialDir = "D:\\work", extra: { onDriveStarted?: () => void } = {}) {
+function renderPanel(
+  initialDir = "D:\\work",
+  extra: {
+    onDriveStarted?: () => void;
+    prepareDriveTerminal?: (workDir: string) => Promise<string>;
+  } = {},
+) {
   const onStarted = vi.fn();
   const onWorkDirChange = vi.fn();
   const Host = () => {
@@ -30,6 +36,7 @@ function renderPanel(initialDir = "D:\\work", extra: { onDriveStarted?: () => vo
         onWorkDirChange={handleDirChange}
         onStarted={onStarted}
         onDriveStarted={extra.onDriveStarted}
+        prepareDriveTerminal={extra.prepareDriveTerminal}
       />
     );
   };
@@ -154,16 +161,19 @@ describe("SupervisePanel", () => {
   it("勾选「驱动 Claude 终端」→ 调用 run_supervise_terminal 并回调 onDriveStarted", async () => {
     mocks.invoke.mockResolvedValue("task-8");
     const onDriveStarted = vi.fn();
-    renderPanel("D:\\work", { onDriveStarted });
+    const prepareDriveTerminal = vi.fn().mockResolvedValue("terminal-99");
+    renderPanel("D:\\work", { onDriveStarted, prepareDriveTerminal });
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务B");
     await userEvent.click(screen.getByLabelText("驱动 Claude 终端"));
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
+    await waitFor(() => expect(prepareDriveTerminal).toHaveBeenCalledWith("D:\\work"));
     expect(mocks.invoke).toHaveBeenCalledWith("run_supervise_terminal", {
       request: {
         task: "任务B",
         work_dir: "D:\\work",
         level: "L1",
         mock: true,
+        terminal_session_id: "terminal-99",
       },
     });
     await waitFor(() => expect(onDriveStarted).toHaveBeenCalledTimes(1));

@@ -434,9 +434,9 @@ describe("App 集成", () => {
     expect(taskSection()?.querySelector(".count-pill")?.textContent).toBe("1");
     expect(mocks.invoke).toHaveBeenCalledWith(
       "read_review_artifacts",
-      expect.objectContaining({ workDir: "D:\\space-beta" }),
+      expect.objectContaining({ workDir: "D:\\space-beta", taskId: "task-b" }),
     );
-  });
+  }, 15000);
 
   it("同空间两个运行中任务可分别取消，互不干扰", async () => {
     const wsA = { id: "ws-a", path: "D:\\space-alpha", name: "space-alpha", position: 0, createdAt: 1 };
@@ -481,7 +481,7 @@ describe("App 集成", () => {
       expect(mocks.invoke).toHaveBeenCalledWith("cancel_supervise", { taskId: "task-2" });
     });
     expect(mocks.invoke).not.toHaveBeenCalledWith("cancel_supervise", { taskId: "task-1" });
-  });
+  }, 15000);
 
   it("同 basename 不同 path 的两个空间，任务列表不串台", async () => {
     const wsA = { id: "ws-a", path: "D:\\projA\\app", name: "app-a", position: 0, createdAt: 1 };

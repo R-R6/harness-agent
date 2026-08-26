@@ -721,6 +721,11 @@ function App() {
                         readOnly
                         onStarted={() => void loadTasks()}
                         onDriveStarted={handleDriveStarted}
+                        prepareDriveTerminal={async (workDir) => {
+                          const id = await terminalRef.current?.startClaudeForTask(workDir);
+                          if (!id) throw new Error("无法启动 Claude 终端");
+                          return id;
+                        }}
                       />
                     </div>
                     <SplitHandle

@@ -47,10 +47,12 @@ pub struct EngineOptions {
     /// 注入送达确认窗口（默认 15s）：注入后在会话文件里等它变成新的用户行，
     /// 超时则重发一次（真实事故：空闲/away 的 TUI 吞掉注入文本，工人整轮空转）
     pub delivery_confirm: Duration,
-    /// 产物目录（.supervise）：逐轮 review-N.md + 结束 final-report.json。
-    /// None 则不落盘（纯测试用）。注意只清 review-*.md/final-report.json，
-    /// 不能整目录删——stop-markers.jsonl 也在这里，MarkerSource 正快照着它
+    /// 产物目录（.supervise/tasks/<id> 或测试目录）：逐轮 review-N.md + final-report.json。
+    /// None 则不落盘（纯测试用）。只清 review-*.md/final-report.json，不整目录删。
     pub artifacts_dir: Option<PathBuf>,
+    /// 任务令牌：注入文案带 `[supervise-task:<token>]`，首轮据此在会话文件中预钉
+    /// Claude session，避免同目录多引擎共享 stop-markers 时首轮互抢。
+    pub task_token: Option<String>,
     /// 审查者标签（写产物用：模型名 / "mock"）
     pub reviewer_label: String,
 }
@@ -66,6 +68,7 @@ impl Default for EngineOptions {
             poll_interval: Duration::from_millis(500),
             delivery_confirm: Duration::from_secs(15),
             artifacts_dir: None,
+            task_token: None,
             reviewer_label: String::new(),
         }
     }
@@ -237,6 +240,35 @@ pub fn newest_session_after(projects_root: &Path, slug: &str, cutoff: SystemTime
     best.map(|(_, p)| p)
 }
 
+/// 在 slug 目录中找内容含 token 的会话文件（多进程首轮预钉用）
+pub fn find_session_containing(projects_root: &Path, slug: &str, token: &str) -> Option<PathBuf> {
+    if token.is_empty() {
+        return None;
+    }
+    let entries = std::fs::read_dir(projects_root.join(slug)).ok()?;
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if !String::from_utf8_lossy(&bytes).contains(token) {
+            continue;
+        }
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let key = mtime.unwrap_or(SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| key >= *t) {
+            best = Some((key, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn session_id_of_transcript(path: &Path) -> Option<String> {
+    path.file_stem().map(|s| s.to_string_lossy().to_string())
+}
+
 // ---------------- 轮次等待：marker 主信号 + 静默兜底 + 硬超时 ----------------
 
 struct TranscriptWatch {
@@ -327,9 +359,15 @@ fn wait_round_end(
                 return (Some(path), RoundEnd::StopMarker);
             }
         }
-        // 兜底定位：slug 目录里引擎启动后活跃的会话文件
+        // 兜底定位：已预钉则只跟该会话文件；否则取启动后最新（单进程兼容）
         if transcript.is_none() {
-            transcript = newest_session_after(projects_root, slug, cutoff);
+            transcript = session_pin
+                .as_ref()
+                .and_then(|sid| {
+                    let p = projects_root.join(slug).join(format!("{sid}.jsonl"));
+                    p.exists().then_some(p)
+                })
+                .or_else(|| newest_session_after(projects_root, slug, cutoff));
         }
         // 静默兜底（只在拿到 transcript 后启用）
         if let Some(tp) = transcript.clone() {
@@ -550,10 +588,16 @@ fn run_loop(
         // 反计划模式指令：真实事故——工人对"补测试"自作主张进入计划模式，
         // 写完计划等确认卡死，静默判停把"等确认"当"干完"，白烧一轮
         let inject = if first_inject {
-            format!(
-                "{}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）\r",
-                opts.task
-            )
+            match opts.task_token.as_deref().filter(|s| !s.is_empty()) {
+                Some(tok) => format!(
+                    "[supervise-task:{tok}] {}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）\r",
+                    opts.task
+                ),
+                None => format!(
+                    "{}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）\r",
+                    opts.task
+                ),
+            }
         } else {
             format!(
                 "上一轮审查未通过，请按要求返工：{}\r（直接动手修改文件并运行验证，禁止进入计划模式或等待确认；如已在计划模式请立即退出并执行）\r",
@@ -599,6 +643,38 @@ fn run_loop(
             "[ENGINE] 第 {round}/{} 轮已注入，等待干活完成…",
             opts.max_rounds
         ));
+
+        // 首轮：用注入令牌在会话文件中预钉 Claude session，避免多引擎抢同一 Stop
+        if session_pin.is_none() {
+            if let Some(tok) = opts.task_token.as_deref().filter(|s| !s.is_empty()) {
+                let token = format!("[supervise-task:{tok}]");
+                let deadline = Instant::now() + opts.delivery_confirm;
+                while Instant::now() < deadline && session_pin.is_none() {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(path) = find_session_containing(projects_root, &slug, &token) {
+                        if let Some(sid) = session_id_of_transcript(&path) {
+                            on_log(&format!("[ENGINE] 已预钉 Claude 会话 {sid}"));
+                            session_pin = Some(sid);
+                            known_transcript = Some(path);
+                        }
+                    }
+                    if session_pin.is_none() {
+                        std::thread::sleep(opts.poll_interval);
+                    }
+                }
+                if session_pin.is_none() {
+                    let msg = "未能按令牌预钉 Claude 会话，中止以防同目录任务串台".to_string();
+                    on_log(&format!("[ENGINE] {msg}"));
+                    return EngineOutcome {
+                        status: EngineStatus::Aborted(msg.clone()),
+                        rounds: round - 1,
+                        last_reason: msg,
+                    };
+                }
+            }
+        }
 
         let (transcript, ended) =
             wait_round_end(opts, markers, projects_root, &slug, cutoff, &mut session_pin, cancel);
@@ -813,6 +889,7 @@ mod tests {
             poll_interval: Duration::from_millis(30),
             delivery_confirm: Duration::from_millis(200),
             artifacts_dir: None,
+            task_token: None,
             reviewer_label: "mock".into(),
         }
     }
@@ -825,6 +902,43 @@ mod tests {
             "F--project-workspace-side-my-skils"
         );
         assert_eq!(project_slug("C:\\Work\\My Project"), "C--Work-My-Project");
+    }
+
+    #[test]
+    fn find_session_containing_picks_token_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv-engine-find-token-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let slug = "proj";
+        let slug_dir = dir.join(slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let a = slug_dir.join("sess-a.jsonl");
+        let b = slug_dir.join("sess-b.jsonl");
+        std::fs::write(&a, "nope\n").unwrap();
+        std::fs::write(&b, "hello [supervise-task:task-9] world\n").unwrap();
+        let got = find_session_containing(&dir, slug, "[supervise-task:task-9]").unwrap();
+        assert_eq!(got, b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_session_containing_does_not_prefix_match_task_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv-engine-find-token-prefix-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let slug = "proj";
+        let slug_dir = dir.join(slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        std::fs::write(slug_dir.join("sess-10.jsonl"), "[supervise-task:task-10]\n").unwrap();
+        assert!(
+            find_session_containing(&dir, slug, "[supervise-task:task-1]").is_none(),
+            "task-10 不得命中 task-1"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

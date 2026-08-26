@@ -5,7 +5,7 @@ import { Icon } from "./Icon";
 
 interface Props {
   workDir: string;
-  /** 焦点任务：无头产物在 .supervise/tasks/<id>/；省略则读根 .supervise */
+  /** 焦点任务：产物在 .supervise/tasks/<id>/；无 taskId 不读盘 */
   taskId?: string | null;
   /** 点击「查看会话」跳到会话浏览打开该轮的 transcript（file 为空时按钮隐藏） */
   onViewSession?: (file: string) => void;
@@ -20,8 +20,15 @@ export function ReviewBoard({ workDir, taskId, onViewSession, active = true }: P
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  const hasTask = Boolean(taskId?.trim());
+
   const load = useCallback(async () => {
-    if (!workDir.trim()) return;
+    if (!workDir.trim() || !taskId?.trim()) {
+      setArtifacts([]);
+      setError("");
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError("");
     try {
@@ -42,15 +49,17 @@ export function ReviewBoard({ workDir, taskId, onViewSession, active = true }: P
     <div className="review-board">
       <div className="board-head">
         <h3>审查看板</h3>
-        <button type="button" onClick={load} disabled={loading}>
+        <button type="button" onClick={() => void load()} disabled={loading || !hasTask}>
           <Icon name="refresh" size={13} className={loading ? "spin" : ""} /> {loading ? "加载中..." : "刷新"}
         </button>
       </div>
       {error && <div className="error">{error}</div>}
-      {artifacts.length === 0 ? (
+      {!hasTask ? (
+        <div className="empty">请选择任务</div>
+      ) : artifacts.length === 0 ? (
         <div className="empty">
           暂无审查记录。启动监督闭环后，每轮审查意见会落盘到
-          <code>工作目录\.supervise\</code> 并显示在这里。
+          <code>.supervise\tasks\&lt;任务id&gt;\</code> 并显示在这里。
         </div>
       ) : (
         <div className="rounds">

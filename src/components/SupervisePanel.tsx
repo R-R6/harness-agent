@@ -14,6 +14,8 @@ interface Props {
   onStarted: (workDir: string) => void;
   /** 终端驱动模式启动成功后回调（App 切到终端 tab 让用户看到干活过程） */
   onDriveStarted?: () => void;
+  /** 驱动前准备 Claude PTY，返回 terminal session id */
+  prepareDriveTerminal?: (workDir: string) => Promise<string>;
 }
 
 interface LogLine {
@@ -22,7 +24,14 @@ interface LogLine {
 }
 
 /** 闭环启动器：任务表单 + 启动 + 最近一次任务的实时日志流 */
-export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onStarted, onDriveStarted }: Props) {
+export function SupervisePanel({
+  workDir,
+  onWorkDirChange,
+  readOnly = false,
+  onStarted,
+  onDriveStarted,
+  prepareDriveTerminal,
+}: Props) {
   const [task, setTask] = useState("");
   const [level, setLevel] = useState("L1");
   const [mock, setMock] = useState(true);
@@ -76,18 +85,22 @@ export function SupervisePanel({ workDir, onWorkDirChange, readOnly = false, onS
     }
     setStarting(true);
     try {
+      const dir = workDir.trim();
       const req = {
         task: task.trim(),
-        work_dir: workDir.trim(),
+        work_dir: dir,
         level,
         mock,
+        ...(driveTerminal && prepareDriveTerminal
+          ? { terminal_session_id: await prepareDriveTerminal(dir) }
+          : {}),
       };
       const taskId = driveTerminal
         ? await runSuperviseTerminal(req)
         : await runSupervise(req);
       lastTaskIdRef.current = taskId;
       setLogs([]);
-      onStarted(workDir.trim());
+      onStarted(dir);
       if (driveTerminal) onDriveStarted?.();
     } catch (e) {
       setError(String(e));

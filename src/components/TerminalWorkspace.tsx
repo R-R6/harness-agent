@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useImperativeHandle, useRef, useState, type CSSProperties, type Ref } from "react";
+import { useCallback, useEffect, useImperativeHandle, useRef, useState, type CSSProperties, type Ref } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { FitAddon } from "@xterm/addon-fit";
 import type { Terminal } from "@xterm/xterm";
@@ -15,9 +15,14 @@ const TERMINAL_STACK_WIDTH = 720;
 const TERMINAL_MIN_WIDTH = 320;
 const TERMINAL_MIN_HEIGHT = 220;
 const SPLITTER_SIZE = 12;
+const CODEX_KEY = "codex";
 
 function clampRatio(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), Math.max(min, max));
+}
+
+function isBusyStatus(status: TerminalStatus) {
+  return status === "starting" || status === "running" || status === "stopping";
 }
 
 interface PaneState {
@@ -32,10 +37,18 @@ const initialPane = (): PaneState => ({
   error: "",
 });
 
+interface ClaudeTab {
+  id: string;
+  pane: PaneState;
+}
+
 const AGENTS: { id: TerminalAgent; label: string; description: string }[] = [
   { id: "claude", label: "Claude CLI", description: "本机 Claude Code CLI" },
   { id: "codex", label: "Codex CLI", description: "本机 codex CLI" },
 ];
+
+const CLAUDE_META = AGENTS[0];
+const CODEX_META = AGENTS[1];
 
 function writeIdleBanner(terminal: Terminal, agent: { label: string; description: string }) {
   terminal.writeln(`\x1b[90m${agent.label} · ${agent.description}\x1b[0m`);
@@ -46,9 +59,13 @@ interface StartOptions {
   workDir?: string;
   args?: string[];
 }
-/** 供 App 命令式驱动终端（如会话列表「在终端中续聊」） */
+
+/** 供 App 命令式驱动终端（如会话列表「在终端中续聊」/ 监督驱动） */
 export interface TerminalWorkspaceHandle {
   startWith: (agent: TerminalAgent, opts?: StartOptions) => void;
+  /** 始终新建 Claude PTY（驱动任务用），返回 session id */
+  startClaudeForTask: (workDir?: string) => Promise<string>;
+  focusSession: (sessionId: string) => void;
 }
 
 interface Props {
@@ -61,25 +78,27 @@ interface Props {
 }
 
 /**
- * Two persistent local CLI panes. The browser only renders xterm; the Rust side
- * owns the PTY, child process and lifecycle so switching workspaces is harmless.
- * The Claude pane's work dir is the shared project context (App-owned); the
- * Codex pane keeps its own persisted dir for side-by-side review.
+ * Claude 可多开（一任务一 PTY）；Codex 保持单 pane。
+ * 浏览器只渲染 xterm；Rust 侧拥有 PTY / 子进程。
  */
 export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onProjectWorkDirChange, ref }: Props) {
-  const [panes, setPanes] = useState<Record<TerminalAgent, PaneState>>({
-    claude: initialPane(),
-    codex: initialPane(),
-  });
-  const panesRef = useRef(panes);
-  const terminals = useRef(new Map<TerminalAgent, Terminal>());
-  const inputQueuesRef = useRef<Record<TerminalAgent, Promise<void>>>({
-    claude: Promise.resolve(),
-    codex: Promise.resolve(),
-  });
+  const claudeSeqRef = useRef(1);
+  const [claudeTabs, setClaudeTabs] = useState<ClaudeTab[]>(() => [
+    { id: "claude-1", pane: initialPane() },
+  ]);
+  const [activeClaudeId, setActiveClaudeId] = useState("claude-1");
+  const [codexPane, setCodexPane] = useState<PaneState>(initialPane);
+  const claudeTabsRef = useRef(claudeTabs);
+  const activeClaudeIdRef = useRef(activeClaudeId);
+  const codexPaneRef = useRef(codexPane);
+  const terminals = useRef(new Map<string, Terminal>());
+  const inputQueuesRef = useRef(new Map<string, Promise<void>>());
   const codexStabilizerRef = useRef(createOutputStabilizer());
-  const pendingOutputRef = useRef(new Map<TerminalAgent, { sessionId: string; data: string }>());
+  const pendingOutputRef = useRef(new Map<string, { sessionId: string; data: string }>());
+  /** sessionId → 尚未绑定到 pane 的输出（start_terminal 返回前 PTY 已可能吐字） */
+  const orphanOutputRef = useRef(new Map<string, string>());
   const outputFrameRef = useRef<number | null>(null);
+  const claudeStartChainRef = useRef(Promise.resolve());
   const [codexWorkDir, setCodexWorkDir] = useStoredString("ha-workdir-codex", "");
   const gridRef = useRef<HTMLDivElement>(null);
   const gridSize = useElementSize(gridRef);
@@ -95,47 +114,108 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   const ratio = clampRatio(stacked ? stackedRatio : wideRatio, minRatio, maxRatio);
   const setRatio = stacked ? setStackedRatio : setWideRatio;
 
-  // panesRef 以 ref 为准、同步更新：terminal-exit 事件与 stop invoke 的拒绝
-  // 可能在同一 tick 内先后到达，若靠 useEffect 在提交后才同步 ref，catch 里
-  // 读到的是旧值（session 仍在），竞态判断失效（M4 卡死的真实根因）
-  const patchPane = useCallback((agent: TerminalAgent, patch: Partial<PaneState>) => {
-    const current = panesRef.current;
-    const next = { ...current, [agent]: { ...current[agent], ...patch } };
-    panesRef.current = next;
-    setPanes(next);
+  const syncClaudeTabs = useCallback((next: ClaudeTab[]) => {
+    claudeTabsRef.current = next;
+    setClaudeTabs(next);
   }, []);
 
-  const mountTerminal = useCallback((agent: TerminalAgent, terminal: Terminal) => {
-    terminals.current.set(agent, terminal);
+  const patchClaudeTab = useCallback((tabId: string, patch: Partial<PaneState>) => {
+    const next = claudeTabsRef.current.map((tab) =>
+      tab.id === tabId ? { ...tab, pane: { ...tab.pane, ...patch } } : tab,
+    );
+    syncClaudeTabs(next);
+  }, [syncClaudeTabs]);
+
+  const patchCodex = useCallback((patch: Partial<PaneState>) => {
+    const next = { ...codexPaneRef.current, ...patch };
+    codexPaneRef.current = next;
+    setCodexPane(next);
   }, []);
 
-  const unmountTerminal = useCallback((agent: TerminalAgent) => {
-    terminals.current.delete(agent);
+  const addClaudeTab = useCallback(() => {
+    claudeSeqRef.current += 1;
+    const id = `claude-${claudeSeqRef.current}`;
+    const next = [...claudeTabsRef.current, { id, pane: initialPane() }];
+    syncClaudeTabs(next);
+    activeClaudeIdRef.current = id;
+    setActiveClaudeId(id);
+    return id;
+  }, [syncClaudeTabs]);
+
+  const focusClaudeTab = useCallback((tabId: string) => {
+    activeClaudeIdRef.current = tabId;
+    setActiveClaudeId(tabId);
+  }, []);
+
+  const unmountTerminal = useCallback((paneKey: string) => {
+    terminals.current.delete(paneKey);
   }, []);
 
   const flushOutput = useCallback(() => {
     outputFrameRef.current = null;
     const output = Array.from(pendingOutputRef.current.entries());
     pendingOutputRef.current.clear();
-    for (const [agent, chunk] of output) {
-      if (panesRef.current[agent].session?.id === chunk.sessionId) {
-        const data = agent === "codex" ? codexStabilizerRef.current.push(chunk.data) : chunk.data;
-        if (data) terminals.current.get(agent)?.write(data);
+    let deferred = false;
+    for (const [paneKey, chunk] of output) {
+      const pane =
+        paneKey === CODEX_KEY
+          ? codexPaneRef.current
+          : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane;
+      if (pane?.session?.id !== chunk.sessionId) continue;
+      const term = terminals.current.get(paneKey);
+      if (!term) {
+        // xterm 尚未 mount：放回队列，等 onMount 再刷，避免启动瞬间黑屏丢字
+        const existing = pendingOutputRef.current.get(paneKey);
+        if (existing?.sessionId === chunk.sessionId) existing.data += chunk.data;
+        else pendingOutputRef.current.set(paneKey, chunk);
+        deferred = true;
+        continue;
       }
+      const data = paneKey === CODEX_KEY ? codexStabilizerRef.current.push(chunk.data) : chunk.data;
+      if (data) term.write(data);
+    }
+    if (deferred && outputFrameRef.current === null) {
+      outputFrameRef.current = -1;
+      const frame = window.requestAnimationFrame(flushOutput);
+      if (outputFrameRef.current === -1) outputFrameRef.current = frame;
     }
   }, []);
 
-  const enqueueOutput = useCallback((agent: TerminalAgent, sessionId: string, data: string) => {
-    const pending = pendingOutputRef.current.get(agent);
+  const enqueueOutput = useCallback((paneKey: string, sessionId: string, data: string) => {
+    const pending = pendingOutputRef.current.get(paneKey);
     if (pending?.sessionId === sessionId) {
       pending.data += data;
     } else {
-      pendingOutputRef.current.set(agent, { sessionId, data });
+      pendingOutputRef.current.set(paneKey, { sessionId, data });
     }
     if (outputFrameRef.current !== null) return;
     outputFrameRef.current = -1;
     const frame = window.requestAnimationFrame(flushOutput);
     if (outputFrameRef.current === -1) outputFrameRef.current = frame;
+  }, [flushOutput]);
+
+  const claimOrphanOutput = useCallback((paneKey: string, sessionId: string) => {
+    const buffered = orphanOutputRef.current.get(sessionId);
+    if (!buffered) return;
+    orphanOutputRef.current.delete(sessionId);
+    const term = terminals.current.get(paneKey);
+    // 同步写入：避免 rAF 晚于 starting→reset 把欢迎屏清掉
+    if (term) {
+      const data = paneKey === CODEX_KEY ? codexStabilizerRef.current.push(buffered) : buffered;
+      if (data) term.write(data);
+      return;
+    }
+    enqueueOutput(paneKey, sessionId, buffered);
+  }, [enqueueOutput]);
+
+  const mountTerminal = useCallback((paneKey: string, terminal: Terminal) => {
+    terminals.current.set(paneKey, terminal);
+    // mount 晚于 PTY 输出时，把积压刷进刚就绪的 xterm
+    if (outputFrameRef.current === null && pendingOutputRef.current.size > 0) {
+      outputFrameRef.current = -1;
+      const frame = window.requestAnimationFrame(flushOutput);
+      if (outputFrameRef.current === -1) outputFrameRef.current = frame;
+    }
   }, [flushOutput]);
 
   useEffect(() => () => {
@@ -144,53 +224,67 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     }
     outputFrameRef.current = null;
     pendingOutputRef.current.clear();
+    orphanOutputRef.current.clear();
   }, []);
 
-  const runningCount = Object.values(panes).filter((pane) => pane.status === "running").length;
+  const runningCount =
+    claudeTabs.filter((tab) => tab.pane.status === "running").length +
+    (codexPane.status === "running" ? 1 : 0);
 
   useEffect(() => {
     onRunningChange?.(runningCount);
   }, [onRunningChange, runningCount]);
 
-  // PTY output is byte-oriented; never split it by line because ANSI cursor
-  // sequences and partial UTF-8 chunks may span multiple events.
+  const findPaneKeyBySession = useCallback((sessionId: string): string | null => {
+    for (const tab of claudeTabsRef.current) {
+      if (tab.pane.session?.id === sessionId) return tab.id;
+    }
+    if (codexPaneRef.current.session?.id === sessionId) return CODEX_KEY;
+    return null;
+  }, []);
+
   useEffect(() => {
     const stopOutput = listenWhileMounted<{ sessionId: string; data: string }>(
       "terminal-output",
       (event) => {
-        for (const [agent] of terminals.current.entries()) {
-          if (panesRef.current[agent].session?.id === event.payload.sessionId) {
-            enqueueOutput(agent, event.payload.sessionId, event.payload.data);
-            break;
-          }
+        const paneKey = findPaneKeyBySession(event.payload.sessionId);
+        if (paneKey) {
+          enqueueOutput(paneKey, event.payload.sessionId, event.payload.data);
+          return;
         }
+        const prev = orphanOutputRef.current.get(event.payload.sessionId) ?? "";
+        orphanOutputRef.current.set(event.payload.sessionId, prev + event.payload.data);
       },
     );
     const stopExit = listenWhileMounted<{ sessionId: string; code?: number | null }>(
       "terminal-exit",
       (event) => {
-        for (const agent of ["claude", "codex"] as TerminalAgent[]) {
-          if (panesRef.current[agent].session?.id === event.payload.sessionId) {
-            const code = event.payload.code;
-            patchPane(agent, {
-              status: "exited",
-              session: null,
-              error: code != null && code !== 0 ? `CLI 异常退出（代码 ${code}）` : "",
-            });
-            break;
-          }
-        }
+        const paneKey = findPaneKeyBySession(event.payload.sessionId);
+        if (!paneKey) return;
+        const code = event.payload.code;
+        const patch = {
+          status: "exited" as const,
+          session: null,
+          error: code != null && code !== 0 ? `CLI 异常退出（代码 ${code}）` : "",
+        };
+        if (paneKey === CODEX_KEY) patchCodex(patch);
+        else patchClaudeTab(paneKey, patch);
       },
     );
     const stopError = listenWhileMounted<{ sessionId?: string; message: string }>(
       "terminal-error",
       (event) => {
-        for (const agent of ["claude", "codex"] as TerminalAgent[]) {
-          if (!event.payload.sessionId || panesRef.current[agent].session?.id === event.payload.sessionId) {
-            patchPane(agent, { status: "error", error: event.payload.message });
-            if (event.payload.sessionId) break;
-          }
+        if (event.payload.sessionId) {
+          const paneKey = findPaneKeyBySession(event.payload.sessionId);
+          if (!paneKey) return;
+          if (paneKey === CODEX_KEY) patchCodex({ status: "error", error: event.payload.message });
+          else patchClaudeTab(paneKey, { status: "error", error: event.payload.message });
+          return;
         }
+        for (const tab of claudeTabsRef.current) {
+          patchClaudeTab(tab.id, { status: "error", error: event.payload.message });
+        }
+        patchCodex({ status: "error", error: event.payload.message });
       },
     );
 
@@ -199,41 +293,85 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       stopExit();
       stopError();
     };
-  }, [enqueueOutput, patchPane]);
+  }, [enqueueOutput, findPaneKeyBySession, patchClaudeTab, patchCodex]);
 
-  const handleStart = useCallback(
-    async (agent: TerminalAgent, cols: number, rows: number, opts?: StartOptions) => {
-      const pane = panesRef.current[agent];
-      if (["starting", "running", "stopping"].includes(pane.status)) {
-        // 主要来自「在终端中续聊」等命令式启动：pane 占用时不能静默失败，
-        // 用户已切到终端 tab，必须告诉他为什么没动静
-        patchPane(agent, { error: "终端已在运行：请先停止当前会话再续聊/启动" });
-        return;
+  const startPane = useCallback(
+    async (
+      paneKey: string,
+      agent: TerminalAgent,
+      cols: number,
+      rows: number,
+      opts?: StartOptions,
+      options?: { skipBusyGate?: boolean },
+    ): Promise<string | null> => {
+      const pane =
+        paneKey === CODEX_KEY
+          ? codexPaneRef.current
+          : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane;
+      if (!pane) return null;
+      if (!options?.skipBusyGate && isBusyStatus(pane.status)) {
+        const patch = { error: "终端已在运行：请先停止当前会话再续聊/启动" };
+        if (paneKey === CODEX_KEY) patchCodex(patch);
+        else patchClaudeTab(paneKey, patch);
+        return null;
       }
       const workDir = (opts?.workDir ?? (agent === "claude" ? projectWorkDir ?? "" : codexWorkDir)).trim();
       if (!workDir) {
-        patchPane(agent, { status: "error", error: "请输入工作目录" });
-        return;
+        const patch = { status: "error" as const, error: "请输入工作目录" };
+        if (paneKey === CODEX_KEY) patchCodex(patch);
+        else patchClaudeTab(paneKey, patch);
+        return null;
       }
-      patchPane(agent, { status: "starting", error: "" });
-      if (agent === "codex") codexStabilizerRef.current.reset();
+      if (paneKey === CODEX_KEY) {
+        patchCodex({ status: "starting", error: "" });
+        codexStabilizerRef.current.reset();
+      } else {
+        patchClaudeTab(paneKey, { status: "starting", error: "" });
+      }
+      // 同步清屏，避免 useEffect(reset) 在 orphan 回放之后才跑把画面清空
+      terminals.current.get(paneKey)?.reset();
       try {
         const session = await startTerminal({
           agent,
           work_dir: workDir,
-          cols,
-          rows,
+          cols: Math.max(cols, 80),
+          rows: Math.max(rows, 24),
           args: opts?.args,
         });
-        patchPane(agent, { session, status: "running", error: "" });
+        if (paneKey === CODEX_KEY) patchCodex({ session, status: "running", error: "" });
+        else patchClaudeTab(paneKey, { session, status: "running", error: "" });
+        claimOrphanOutput(paneKey, session.id);
+        const term = terminals.current.get(paneKey);
+        if (term?.cols && term.rows) {
+          try {
+            await resizeTerminal(session.id, term.cols, term.rows);
+          } catch {
+            // 尺寸同步失败不阻断启动；后续 ResizeObserver 会再试
+          }
+        }
+        return session.id;
       } catch (error) {
-        patchPane(agent, { status: "error", error: String(error) });
+        const patch = { status: "error" as const, error: String(error) };
+        if (paneKey === CODEX_KEY) patchCodex(patch);
+        else patchClaudeTab(paneKey, patch);
+        return null;
       }
     },
-    [patchPane, projectWorkDir, codexWorkDir],
+    [claimOrphanOutput, patchClaudeTab, patchCodex, projectWorkDir, codexWorkDir],
   );
 
-  // 命令式启动入口（会话列表「在终端中续聊」）：目录覆盖走正常受控链路
+  const pickClaudeTabForResume = useCallback(() => {
+    const activeId = activeClaudeIdRef.current;
+    const activeTab = claudeTabsRef.current.find((t) => t.id === activeId);
+    if (activeTab && !isBusyStatus(activeTab.pane.status)) return activeTab.id;
+    const idle = claudeTabsRef.current.find((t) => !isBusyStatus(t.pane.status));
+    if (idle) {
+      focusClaudeTab(idle.id);
+      return idle.id;
+    }
+    return addClaudeTab();
+  }, [addClaudeTab, focusClaudeTab]);
+
   useImperativeHandle(
     ref,
     () => ({
@@ -242,50 +380,110 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           if (agent === "claude") onProjectWorkDirChange?.(opts.workDir);
           else setCodexWorkDir(opts.workDir);
         }
-        const terminal = terminals.current.get(agent);
-        void handleStart(agent, terminal?.cols ?? 120, terminal?.rows ?? 30, opts);
+        if (agent === "codex") {
+          const terminal = terminals.current.get(CODEX_KEY);
+          void startPane(CODEX_KEY, "codex", terminal?.cols ?? 120, terminal?.rows ?? 30, opts);
+          return;
+        }
+        const tabId = pickClaudeTabForResume();
+        const terminal = terminals.current.get(tabId);
+        void startPane(tabId, "claude", terminal?.cols ?? 120, terminal?.rows ?? 30, opts);
+      },
+      startClaudeForTask: (workDir) => {
+        const run = async () => {
+          if (workDir !== undefined) onProjectWorkDirChange?.(workDir);
+          const idle = claudeTabsRef.current.find(
+            (t) => !isBusyStatus(t.pane.status) && !t.pane.session,
+          );
+          const tabId = idle?.id ?? addClaudeTab();
+          if (idle) {
+            patchClaudeTab(idle.id, { status: "starting", error: "" });
+            focusClaudeTab(idle.id);
+          }
+          const terminal = terminals.current.get(tabId);
+          const sessionId = await startPane(
+            tabId,
+            "claude",
+            terminal?.cols ?? 120,
+            terminal?.rows ?? 30,
+            { workDir },
+            { skipBusyGate: true },
+          );
+          if (!sessionId) throw new Error("无法启动 Claude 终端");
+          return sessionId;
+        };
+        const queued = claudeStartChainRef.current.then(run, run);
+        claudeStartChainRef.current = queued.then(
+          () => undefined,
+          () => undefined,
+        );
+        return queued;
+      },
+      focusSession: (sessionId) => {
+        const tab = claudeTabsRef.current.find((t) => t.pane.session?.id === sessionId);
+        if (tab) focusClaudeTab(tab.id);
       },
     }),
-    [handleStart, onProjectWorkDirChange],
+    [addClaudeTab, focusClaudeTab, onProjectWorkDirChange, patchClaudeTab, pickClaudeTabForResume, startPane],
   );
 
   const handleStop = useCallback(
-    async (agent: TerminalAgent) => {
-      const session = panesRef.current[agent].session;
+    async (paneKey: string) => {
+      const pane =
+        paneKey === CODEX_KEY
+          ? codexPaneRef.current
+          : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane;
+      const session = pane?.session;
       if (!session) return;
-      patchPane(agent, { status: "stopping", error: "" });
+      if (paneKey === CODEX_KEY) patchCodex({ status: "stopping", error: "" });
+      else patchClaudeTab(paneKey, { status: "stopping", error: "" });
       try {
         await stopTerminal(session.id);
       } catch (error) {
-        // 仅当会话仍在时回滚 running：CLI 恰在点停止时自行退出的竞态下，
-        // terminal-exit 已把面板置为 exited/session=null，再回滚 running 会
-        // 造成"停止按钮无响应且无启动按钮"的永久卡死
-        if (panesRef.current[agent].session?.id === session.id) {
-          patchPane(agent, { status: "running", error: String(error) });
+        const still =
+          paneKey === CODEX_KEY
+            ? codexPaneRef.current.session?.id === session.id
+            : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane.session?.id === session.id;
+        if (still) {
+          const patch = { status: "running" as const, error: String(error) };
+          if (paneKey === CODEX_KEY) patchCodex(patch);
+          else patchClaudeTab(paneKey, patch);
         }
       }
     },
-    [patchPane],
+    [patchClaudeTab, patchCodex],
   );
 
   const handleInput = useCallback(
-    (agent: TerminalAgent, data: string) => {
-      const session = panesRef.current[agent].session;
+    (paneKey: string, data: string) => {
+      const pane =
+        paneKey === CODEX_KEY
+          ? codexPaneRef.current
+          : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane;
+      const session = pane?.session;
       if (!session) return;
       const sessionId = session.id;
       const write = async () => {
-        if (panesRef.current[agent].session?.id !== sessionId) return;
+        const current =
+          paneKey === CODEX_KEY
+            ? codexPaneRef.current.session?.id
+            : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane.session?.id;
+        if (current !== sessionId) return;
         try {
           await writeTerminal(sessionId, data);
         } catch (error) {
-          patchPane(agent, { status: "error", error: String(error) });
+          const patch = { status: "error" as const, error: String(error) };
+          if (paneKey === CODEX_KEY) patchCodex(patch);
+          else patchClaudeTab(paneKey, patch);
         }
       };
-      inputQueuesRef.current[agent] = inputQueuesRef.current[agent]
-        .catch(() => undefined)
-        .then(write);
+      const prev = inputQueuesRef.current.get(paneKey) ?? Promise.resolve();
+      inputQueuesRef.current.set(
+        paneKey,
+        prev.catch(() => undefined).then(write),
+      );
     },
-    [patchPane],
+    [patchClaudeTab, patchCodex],
   );
 
   return (
@@ -293,8 +491,8 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       <div className="terminal-intro">
         <div>
           <span className="eyebrow">LOCAL CLI WORKBENCH</span>
-          <h2>两个终端，保持上下文</h2>
-          <p>按需启动本机已安装的 Claude Code 和 Codex CLI。切换工作区不会结束进程。</p>
+          <h2>本地 CLI 工作台</h2>
+          <p>按需启动本机已安装的 Claude Code 和 Codex CLI。Claude 可开多个标签；切换工作区不会结束进程。</p>
         </div>
         <div className="terminal-intro__note">
           <Icon name="shield" size={15} />
@@ -306,46 +504,96 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         ref={gridRef}
         style={{ "--terminal-primary-size": `${ratio}%` } as CSSProperties}
       >
-        {AGENTS.map((agent, index) => (
-          <Fragment key={agent.id}>
-            {index > 0 && (
-              <SplitHandle
-                orientation={stacked ? "horizontal" : "vertical"}
-                label="调整 Claude 与 Codex 终端区域"
-                value={ratio}
-                min={minRatio}
-                max={maxRatio}
-                onChange={setRatio}
-                pixelsPerUnit={Math.max(1, axisSize - SPLITTER_SIZE) / 100}
-                step={5}
-                className="terminal-split"
-                valueText={`Claude 终端区域占比 ${Math.round(ratio)}%`}
+        <div className="terminal-claude-stack">
+          {claudeTabs.length > 1 && (
+            <div className="terminal-claude-tabs" role="tablist" aria-label="Claude 终端标签">
+              {claudeTabs.map((tab, index) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={tab.id === activeClaudeId}
+                  className={`terminal-claude-tab ${tab.id === activeClaudeId ? "is-active" : ""}`}
+                  onClick={() => focusClaudeTab(tab.id)}
+                >
+                  Claude {index + 1}
+                  {tab.pane.status === "running" ? " · 运行中" : ""}
+                </button>
+              ))}
+            </div>
+          )}
+          {claudeTabs.map((tab) => (
+            <div
+              key={tab.id}
+              className={`terminal-claude-host ${tab.id === activeClaudeId ? "is-active" : ""}`}
+              hidden={tab.id !== activeClaudeId}
+              style={{ display: tab.id === activeClaudeId ? "flex" : "none" }}
+            >
+              <TerminalPane
+                agent={CLAUDE_META}
+                paneKey={tab.id}
+                workspaceActive={active && tab.id === activeClaudeId}
+                surfaceVisible={tab.id === activeClaudeId}
+                pane={tab.pane}
+                workDir={projectWorkDir ?? ""}
+                onMount={(terminal) => mountTerminal(tab.id, terminal)}
+                onUnmount={() => unmountTerminal(tab.id)}
+                onStart={(_agent, cols, rows) => {
+                  void startPane(tab.id, "claude", cols, rows);
+                }}
+                onStop={() => {
+                  void handleStop(tab.id);
+                }}
+                onInput={(_agent, data) => handleInput(tab.id, data)}
+                onResize={async (sessionId, cols, rows) => {
+                  try {
+                    await resizeTerminal(sessionId, cols, rows);
+                  } catch (error) {
+                    patchClaudeTab(tab.id, { error: String(error) });
+                  }
+                }}
+                onWorkDirChange={(workDir) => onProjectWorkDirChange?.(workDir)}
               />
-            )}
-            <TerminalPane
-              agent={agent}
-              active={active}
-              pane={panes[agent.id]}
-              workDir={agent.id === "claude" ? (projectWorkDir ?? "") : codexWorkDir}
-              onMount={(terminal) => mountTerminal(agent.id, terminal)}
-              onUnmount={() => unmountTerminal(agent.id)}
-              onStart={handleStart}
-              onStop={handleStop}
-              onInput={handleInput}
-              onResize={async (sessionId, cols, rows) => {
-                try {
-                  await resizeTerminal(sessionId, cols, rows);
-                } catch (error) {
-                  patchPane(agent.id, { error: String(error) });
-                }
-              }}
-              onWorkDirChange={(workDir) => {
-                if (agent.id === "claude") onProjectWorkDirChange?.(workDir);
-                else setCodexWorkDir(workDir);
-              }}
-            />
-          </Fragment>
-        ))}
+            </div>
+          ))}
+        </div>
+        <SplitHandle
+          orientation={stacked ? "horizontal" : "vertical"}
+          label="调整 Claude 与 Codex 终端区域"
+          value={ratio}
+          min={minRatio}
+          max={maxRatio}
+          onChange={setRatio}
+          pixelsPerUnit={Math.max(1, axisSize - SPLITTER_SIZE) / 100}
+          step={5}
+          className="terminal-split"
+          valueText={`Claude 终端区域占比 ${Math.round(ratio)}%`}
+        />
+        <TerminalPane
+          agent={CODEX_META}
+          paneKey={CODEX_KEY}
+          workspaceActive={active}
+          surfaceVisible
+          pane={codexPane}
+          workDir={codexWorkDir}
+          onMount={(terminal) => mountTerminal(CODEX_KEY, terminal)}
+          onUnmount={() => unmountTerminal(CODEX_KEY)}
+          onStart={(_agent, cols, rows) => {
+            void startPane(CODEX_KEY, "codex", cols, rows);
+          }}
+          onStop={() => {
+            void handleStop(CODEX_KEY);
+          }}
+          onInput={(_agent, data) => handleInput(CODEX_KEY, data)}
+          onResize={async (sessionId, cols, rows) => {
+            try {
+              await resizeTerminal(sessionId, cols, rows);
+            } catch (error) {
+              patchCodex({ error: String(error) });
+            }
+          }}
+          onWorkDirChange={setCodexWorkDir}
+        />
       </div>
     </div>
   );
@@ -353,7 +601,9 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
 
 interface PaneProps {
   agent: { id: TerminalAgent; label: string; description: string };
-  active: boolean;
+  paneKey: string;
+  workspaceActive: boolean;
+  surfaceVisible: boolean;
   pane: PaneState;
   workDir: string;
   onMount: (terminal: Terminal) => void;
@@ -367,7 +617,9 @@ interface PaneProps {
 
 function TerminalPane({
   agent,
-  active,
+  paneKey,
+  workspaceActive,
+  surfaceVisible,
   pane,
   workDir,
   onMount,
@@ -378,172 +630,10 @@ function TerminalPane({
   onResize,
   onWorkDirChange,
 }: PaneProps) {
-  const hostRef = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
-  const sessionRef = useRef(pane.session);
-  const activeRef = useRef(active);
-  const mountingRef = useRef(false);
-  const mountedRef = useRef(false);
-  const unmountedRef = useRef(false);
-  const dataListenerRef = useRef<{ dispose: () => void } | null>(null);
-  const cursorPinRef = useRef<{ dispose: () => void } | null>(null);
-  const resizeObserverRef = useRef<ResizeObserver | null>(null);
-  const fitFrameRef = useRef<number | null>(null);
-  const lastPtySizeRef = useRef("");
-  const callbacksRef = useRef({ onMount, onUnmount, onInput, onResize });
   const [terminalReady, setTerminalReady] = useState(false);
   const [terminalError, setTerminalError] = useState("");
-
-  useEffect(() => {
-    sessionRef.current = pane.session;
-    const terminal = terminalRef.current;
-    // Spawn already used the current cols/rows. A same-size ConPTY resize still
-    // SIGWINCH Ink, which commits the welcome screen to Static and draws it again.
-    if (pane.session && terminal) {
-      lastPtySizeRef.current = `${pane.session.id}:${terminal.cols}x${terminal.rows}`;
-    } else if (!pane.session) {
-      lastPtySizeRef.current = "";
-    }
-  }, [pane.session]);
-
-  useEffect(() => {
-    activeRef.current = active;
-  }, [active]);
-
-  useEffect(() => {
-    callbacksRef.current = { onMount, onUnmount, onInput, onResize };
-  }, [onInput, onMount, onResize, onUnmount]);
-
-  const scheduleFitAndResize = useCallback(() => {
-    if (!activeRef.current || fitFrameRef.current !== null) return;
-    fitFrameRef.current = -1;
-    const run = () => {
-      fitFrameRef.current = null;
-      if (!activeRef.current) return;
-      const terminal = terminalRef.current;
-      if (!terminal) return;
-      try {
-        fitRef.current?.fit();
-        const session = sessionRef.current;
-        const sizeKey = session ? `${session.id}:${terminal.cols}x${terminal.rows}` : "";
-        if (session && lastPtySizeRef.current !== sizeKey) {
-          lastPtySizeRef.current = sizeKey;
-          callbacksRef.current.onResize(session.id, terminal.cols, terminal.rows);
-        }
-      } catch {
-        // A hidden or detached terminal can be fitted on the next activation.
-      }
-    };
-    const frame = window.requestAnimationFrame(run);
-    if (fitFrameRef.current === -1) fitFrameRef.current = frame;
-  }, []);
-
-  const disposeTerminal = useCallback(() => {
-    dataListenerRef.current?.dispose();
-    dataListenerRef.current = null;
-    cursorPinRef.current?.dispose();
-    cursorPinRef.current = null;
-    resizeObserverRef.current?.disconnect();
-    resizeObserverRef.current = null;
-    if (fitFrameRef.current !== null && fitFrameRef.current >= 0) {
-      window.cancelAnimationFrame(fitFrameRef.current);
-    }
-    fitFrameRef.current = null;
-    terminalRef.current?.dispose();
-    terminalRef.current = null;
-    fitRef.current = null;
-    setTerminalReady(false);
-    if (mountedRef.current) {
-      mountedRef.current = false;
-      callbacksRef.current.onUnmount();
-    }
-  }, []);
-
-  // xterm is deliberately imported only after this workspace is opened. That
-  // keeps the initial application bundle lighter and avoids canvas setup while
-  // users are browsing transcripts, supervision, or MCP status.
-  useEffect(() => {
-    if (!active || !hostRef.current || terminalRef.current || mountingRef.current) return;
-    mountingRef.current = true;
-
-    void loadXtermRuntime()
-      .then(({ Terminal, FitAddon }) => {
-        if (unmountedRef.current || !hostRef.current || terminalRef.current) return;
-        const terminal = new Terminal(buildXtermOptions());
-        const fit = new FitAddon();
-        terminal.loadAddon(fit);
-        terminal.open(hostRef.current);
-        fitRef.current = fit;
-        terminalRef.current = terminal;
-        try {
-          fit.fit();
-        } catch {
-          // Cell metrics can still be 0; scheduleFitAndResize retries.
-        }
-        callbacksRef.current.onMount(terminal);
-        mountedRef.current = true;
-        setTerminalReady(true);
-        writeIdleBanner(terminal, agent);
-        dataListenerRef.current = terminal.onData((data) => callbacksRef.current.onInput(agent.id, data));
-        if (agent.id === "codex") {
-          cursorPinRef.current = pinCursorSteady(terminal);
-          terminal.write(CODEX_CURSOR_PIN);
-        }
-        // FitAddon no-ops while cell metrics are 0; retry after layout.
-        scheduleFitAndResize();
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            if (!unmountedRef.current) scheduleFitAndResize();
-          });
-        });
-
-        if (typeof ResizeObserver !== "undefined") {
-          const observer = new ResizeObserver(() => {
-            scheduleFitAndResize();
-          });
-          observer.observe(hostRef.current);
-          resizeObserverRef.current = observer;
-        }
-      })
-      .catch((error) => {
-        if (!unmountedRef.current) setTerminalError(`终端渲染器加载失败: ${String(error)}`);
-      })
-      .finally(() => {
-        mountingRef.current = false;
-      });
-  }, [active, agent.description, agent.id, agent.label, scheduleFitAndResize]);
-
-  // Changing workspaces hides the pane but intentionally does not dispose it.
-  // Refit after it becomes visible so the native PTY receives accurate geometry.
-  useEffect(() => {
-    if (!active || !terminalRef.current) return;
-    scheduleFitAndResize();
-  }, [active, pane.session, scheduleFitAndResize]);
-
-  // Drop the idle banner before the TUI takes the alternate screen. Leaving
-  // those lines in the buffer makes Ink/ratatui look like a stacked second UI.
-  // If start fails before a session exists, put the banner back so the pane
-  // is not a blank black box. Do not reset on `exited`: the last TUI frame is useful.
-  useEffect(() => {
-    const terminal = terminalRef.current;
-    if (!terminal) return;
-    if (pane.status === "starting") {
-      terminal.reset();
-      return;
-    }
-    if (pane.status === "error" && !pane.session) {
-      writeIdleBanner(terminal, agent);
-    }
-  }, [agent, pane.session, pane.status]);
-
-  useEffect(() => {
-    unmountedRef.current = false;
-    return () => {
-      unmountedRef.current = true;
-      disposeTerminal();
-    };
-  }, [disposeTerminal]);
 
   const browseWorkDir = async () => {
     try {
@@ -639,7 +729,30 @@ function TerminalPane({
           当前 Claude 终端对话属于「{basenameOf(sessionDir)}」，与激活空间「{basenameOf(workDir)}」不同。停止后重新启动才会切到新空间。
         </div>
       )}
-      <div ref={hostRef} className="terminal-surface" aria-label={`${agent.label} 终端输出`} />
+      <TerminalSurface
+        agent={agent}
+        paneKey={paneKey}
+        workspaceActive={workspaceActive}
+        surfaceVisible={surfaceVisible}
+        pane={pane}
+        onMount={(terminal) => {
+          terminalRef.current = terminal;
+          setTerminalReady(true);
+          onMount(terminal);
+        }}
+        onUnmount={() => {
+          terminalRef.current = null;
+          fitRef.current = null;
+          setTerminalReady(false);
+          onUnmount();
+        }}
+        onFitAddon={(fit) => {
+          fitRef.current = fit;
+        }}
+        onInput={(data) => onInput(agent.id, data)}
+        onResize={onResize}
+        onLoadError={setTerminalError}
+      />
       {(pane.error || terminalError) && (
         <div className="terminal-pane__error" role="alert">
           <Icon name="alert" size={14} />
@@ -651,5 +764,189 @@ function TerminalPane({
         <span>{pane.session?.id ?? "等待 PTY"}</span>
       </div>
     </article>
+  );
+}
+
+interface SurfaceProps {
+  agent: { id: TerminalAgent; label: string; description: string };
+  paneKey: string;
+  workspaceActive: boolean;
+  surfaceVisible: boolean;
+  pane: PaneState;
+  onMount: (terminal: Terminal) => void;
+  onUnmount: () => void;
+  onFitAddon?: (fit: FitAddon | null) => void;
+  onInput: (data: string) => void;
+  onResize: (sessionId: string, cols: number, rows: number) => void;
+  onLoadError?: (message: string) => void;
+}
+
+function TerminalSurface({
+  agent,
+  workspaceActive,
+  surfaceVisible,
+  pane,
+  onMount,
+  onUnmount,
+  onFitAddon,
+  onInput,
+  onResize,
+  onLoadError,
+}: SurfaceProps) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const sessionRef = useRef(pane.session);
+  const layoutActiveRef = useRef(workspaceActive && surfaceVisible);
+  const mountingRef = useRef(false);
+  const mountedRef = useRef(false);
+  const unmountedRef = useRef(false);
+  const dataListenerRef = useRef<{ dispose: () => void } | null>(null);
+  const cursorPinRef = useRef<{ dispose: () => void } | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const fitFrameRef = useRef<number | null>(null);
+  const lastPtySizeRef = useRef("");
+  const callbacksRef = useRef({ onMount, onUnmount, onInput, onResize, onFitAddon, onLoadError });
+
+  useEffect(() => {
+    sessionRef.current = pane.session;
+    const terminal = terminalRef.current;
+    if (pane.session && terminal) {
+      lastPtySizeRef.current = `${pane.session.id}:${terminal.cols}x${terminal.rows}`;
+    } else if (!pane.session) {
+      lastPtySizeRef.current = "";
+    }
+  }, [pane.session]);
+
+  useEffect(() => {
+    layoutActiveRef.current = workspaceActive && surfaceVisible;
+  }, [workspaceActive, surfaceVisible]);
+
+  useEffect(() => {
+    callbacksRef.current = { onMount, onUnmount, onInput, onResize, onFitAddon, onLoadError };
+  }, [onInput, onMount, onResize, onUnmount, onFitAddon, onLoadError]);
+
+  const scheduleFitAndResize = useCallback(() => {
+    if (!layoutActiveRef.current || fitFrameRef.current !== null) return;
+    fitFrameRef.current = -1;
+    const run = () => {
+      fitFrameRef.current = null;
+      if (!layoutActiveRef.current) return;
+      const terminal = terminalRef.current;
+      if (!terminal) return;
+      try {
+        fitRef.current?.fit();
+        const session = sessionRef.current;
+        const sizeKey = session ? `${session.id}:${terminal.cols}x${terminal.rows}` : "";
+        if (session && lastPtySizeRef.current !== sizeKey) {
+          lastPtySizeRef.current = sizeKey;
+          callbacksRef.current.onResize(session.id, terminal.cols, terminal.rows);
+        }
+      } catch {
+        // A hidden or detached terminal can be fitted on the next activation.
+      }
+    };
+    const frame = window.requestAnimationFrame(run);
+    if (fitFrameRef.current === -1) fitFrameRef.current = frame;
+  }, []);
+
+  const disposeTerminal = useCallback(() => {
+    dataListenerRef.current?.dispose();
+    dataListenerRef.current = null;
+    cursorPinRef.current?.dispose();
+    cursorPinRef.current = null;
+    resizeObserverRef.current?.disconnect();
+    resizeObserverRef.current = null;
+    if (fitFrameRef.current !== null && fitFrameRef.current >= 0) {
+      window.cancelAnimationFrame(fitFrameRef.current);
+    }
+    fitFrameRef.current = null;
+    terminalRef.current?.dispose();
+    terminalRef.current = null;
+    fitRef.current = null;
+    callbacksRef.current.onFitAddon?.(null);
+    if (mountedRef.current) {
+      mountedRef.current = false;
+      callbacksRef.current.onUnmount();
+    }
+  }, []);
+
+  // Mount xterm while the terminals workspace is open (all Claude tabs keep instances).
+  useEffect(() => {
+    if (!workspaceActive || !hostRef.current || terminalRef.current || mountingRef.current) return;
+    mountingRef.current = true;
+
+    void loadXtermRuntime()
+      .then(({ Terminal, FitAddon }) => {
+        if (unmountedRef.current || !hostRef.current || terminalRef.current) return;
+        const terminal = new Terminal(buildXtermOptions());
+        const fit = new FitAddon();
+        terminal.loadAddon(fit);
+        terminal.open(hostRef.current);
+        fitRef.current = fit;
+        terminalRef.current = terminal;
+        callbacksRef.current.onFitAddon?.(fit);
+        try {
+          fit.fit();
+        } catch {
+          // Cell metrics can still be 0; scheduleFitAndResize retries.
+        }
+        callbacksRef.current.onMount(terminal);
+        mountedRef.current = true;
+        writeIdleBanner(terminal, agent);
+        dataListenerRef.current = terminal.onData((data) => callbacksRef.current.onInput(data));
+        if (agent.id === "codex") {
+          cursorPinRef.current = pinCursorSteady(terminal);
+          terminal.write(CODEX_CURSOR_PIN);
+        }
+        scheduleFitAndResize();
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (!unmountedRef.current) scheduleFitAndResize();
+          });
+        });
+
+        if (typeof ResizeObserver !== "undefined") {
+          const observer = new ResizeObserver(() => {
+            scheduleFitAndResize();
+          });
+          observer.observe(hostRef.current);
+          resizeObserverRef.current = observer;
+        }
+      })
+      .catch((error) => {
+        if (!unmountedRef.current) {
+          callbacksRef.current.onLoadError?.(`终端渲染器加载失败: ${String(error)}`);
+        }
+      })
+      .finally(() => {
+        mountingRef.current = false;
+      });
+  }, [workspaceActive, agent.description, agent.id, agent.label, scheduleFitAndResize]);
+
+  useEffect(() => {
+    if (!workspaceActive || !surfaceVisible || !terminalRef.current) return;
+    scheduleFitAndResize();
+  }, [workspaceActive, surfaceVisible, pane.session, scheduleFitAndResize]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    // starting 清屏由 startPane 同步 reset，避免 effect 晚到把 PTY 欢迎输出清成黑屏
+    if (pane.status === "error" && !pane.session) {
+      writeIdleBanner(terminal, agent);
+    }
+  }, [agent, pane.session, pane.status]);
+
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+      disposeTerminal();
+    };
+  }, [disposeTerminal]);
+
+  return (
+    <div ref={hostRef} className="terminal-surface" aria-label={`${agent.label} 终端输出`} />
   );
 }

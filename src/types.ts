@@ -24,6 +24,8 @@ export interface SuperviseRequest {
   max_rounds?: number;
   model?: string;
   mock?: boolean;
+  /** 终端驱动：绑定到指定 Claude PTY（一任务一会话） */
+  terminal_session_id?: string;
 }
 
 // ---- 任务注册表（阶段 B）----
