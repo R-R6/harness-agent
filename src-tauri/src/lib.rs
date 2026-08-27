@@ -20,7 +20,7 @@ static TERMINAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 // ---------------- 任务注册表（阶段 B：多任务状态管理） ----------------
 
 /// 任务状态（复用 EngineStatus 语义；ps1 无头模式由退出码推导）
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TaskStatus {
     Running,
@@ -31,22 +31,24 @@ enum TaskStatus {
 }
 
 /// 任务类型
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TaskKind {
     Ps1,
     Engine,
 }
 
-/// 任务注册表条目（应用退出即清，v1 不落盘）
-#[derive(Debug, Clone, serde::Serialize)]
+/// 任务注册表条目（持久化到 app_data_dir/supervise/tasks.json，重启保留）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TaskInfo {
     id: String,
     work_dir: String,
+    task: String,
     kind: TaskKind,
     status: TaskStatus,
     rounds: i64,
     last_reason: String,
+    log: Vec<String>,
     started_at_ms: u64,
 }
 
@@ -115,6 +117,71 @@ impl SuperviseState {
             }
         }
     }
+}
+
+// ---------------- 任务注册表持久化（文件系统） ----------------
+
+/// 每任务日志上限（截断旧行，避免 tasks.json 无限膨胀）
+const TASK_LOG_MAX_LINES: usize = 500;
+
+/// 任务注册表落盘路径：{app_data_dir}/supervise/tasks.json
+fn tasks_file_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法定位应用数据目录: {e}"))?;
+    Ok(dir.join("supervise").join("tasks.json"))
+}
+
+/// 全量序列化写盘（临时文件 + rename 原子写）。锁中毒/路径不可用/序列化失败
+/// 均静默降级——持久化是增强能力，不能反过来崩掉主流程。
+fn persist_tasks(app: &AppHandle) {
+    let tasks: Vec<TaskInfo> = match app.state::<SuperviseState>().tasks.lock() {
+        Ok(t) => t.values().cloned().collect(),
+        Err(_) => return,
+    };
+    let path = match tasks_file_path(app) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let data = match serde_json::to_string_pretty(&tasks) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, data).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// 启动时加载持久化任务。重启后已无进程在跑：running 一律标记 aborted 并回写。
+fn load_tasks(app: &AppHandle) {
+    let path = match tasks_file_path(app) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(_) => return, // 首次启动无文件
+    };
+    let mut tasks: Vec<TaskInfo> = match serde_json::from_str(&data) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for t in tasks.iter_mut() {
+        if t.status == TaskStatus::Running {
+            t.status = TaskStatus::Aborted;
+        }
+    }
+    if let Ok(mut map) = app.state::<SuperviseState>().tasks.lock() {
+        for t in tasks {
+            map.insert(t.id.clone(), t);
+        }
+    }
+    persist_tasks(app);
 }
 
 // ---------------- 本机 CLI 终端状态（ConPTY） ----------------
@@ -448,12 +515,15 @@ async fn run_supervise(
     state.tasks.lock().unwrap().insert(task_id.clone(), TaskInfo {
         id: task_id.clone(),
         work_dir: work_dir.clone(),
+        task: request.task.clone(),
         kind: TaskKind::Ps1,
         status: TaskStatus::Running,
         rounds: 0,
         last_reason: String::new(),
+        log: Vec::new(),
         started_at_ms: now_ms(),
     });
+    persist_tasks(&app);
 
     // 后台线程读 stdout → 逐行 emit 到前端；进程结束后清理 State 并 emit done
     let app2 = app.clone();
@@ -464,8 +534,16 @@ async fn run_supervise(
             if let Ok(l) = line {
                 let _ = app2.emit(
                     "supervise-log",
-                    serde_json::json!({ "taskId": task_id2, "line": l }),
+                    serde_json::json!({ "taskId": task_id2, "line": l.clone() }),
                 );
+                // 落盘用：逐行进内存，终态时统一写 tasks.json
+                if let Ok(mut tasks) = app2.state::<SuperviseState>().tasks.lock() {
+                    if let Some(t) = tasks.get_mut(&task_id2) {
+                        if t.log.len() < TASK_LOG_MAX_LINES {
+                            t.log.push(l);
+                        }
+                    }
+                }
             }
         }
         // stdout EOF（进程退出）→ 收尾：wait 拿退出码，清理 State
@@ -485,6 +563,7 @@ async fn run_supervise(
                 t.status = ps1_exit_to_status(exit_code);
             }
         }
+        persist_tasks(&app2);
         let _ = app2.emit(
             "supervise-done",
             serde_json::json!({ "taskId": task_id2, "exitCode": exit_code }),
@@ -495,10 +574,18 @@ async fn run_supervise(
         let app3 = app.clone();
         let task_id3 = task_id.clone();
         supervise_runner::drain_stderr(stderr, move |line| {
+            let text = format!("[stderr] {line}");
             let _ = app3.emit(
                 "supervise-log",
-                serde_json::json!({ "taskId": task_id3, "line": format!("[stderr] {line}") }),
+                serde_json::json!({ "taskId": task_id3, "line": text.clone() }),
             );
+            if let Ok(mut tasks) = app3.state::<SuperviseState>().tasks.lock() {
+                if let Some(t) = tasks.get_mut(&task_id3) {
+                    if t.log.len() < TASK_LOG_MAX_LINES {
+                        t.log.push(text);
+                    }
+                }
+            }
         });
     }
 
@@ -679,12 +766,15 @@ async fn run_supervise_terminal(
     state.tasks.lock().unwrap().insert(task_id.clone(), TaskInfo {
         id: task_id.clone(),
         work_dir: work_dir.clone(),
+        task: request.task.clone(),
         kind: TaskKind::Engine,
         status: TaskStatus::Running,
         rounds: 0,
         last_reason: String::new(),
+        log: Vec::new(),
         started_at_ms: now_ms(),
     });
+    persist_tasks(&app);
 
     let opts = EngineOptions {
         task: request.task.clone(),
@@ -724,10 +814,18 @@ async fn run_supervise_terminal(
         let task_id3 = task_id2.clone();
         let on_log: supervise_engine::OnLog =
             Arc::new(move |line: &str| {
+                let text = line.to_string();
                 let _ = app3.emit(
                     "supervise-log",
-                    serde_json::json!({ "taskId": task_id3, "line": line.to_string() }),
+                    serde_json::json!({ "taskId": task_id3, "line": text.clone() }),
                 );
+                if let Ok(mut tasks) = app3.state::<SuperviseState>().tasks.lock() {
+                    if let Some(t) = tasks.get_mut(&task_id3) {
+                        if t.log.len() < TASK_LOG_MAX_LINES {
+                            t.log.push(text);
+                        }
+                    }
+                }
             });
         // 引擎 panic（锁中毒/审查器内部异常）也必须走到收尾——否则目录永久
         // 占用、engine_cancels 泄漏、前端永远停在"取消任务"状态
@@ -795,6 +893,7 @@ async fn run_supervise_terminal(
                 t.last_reason = outcome.last_reason.clone();
             }
         }
+        persist_tasks(&app2);
         let _ = app2.emit(
             "supervise-done",
             serde_json::json!({ "taskId": task_id2, "exitCode": code, "reason": outcome.last_reason }),
@@ -813,7 +912,7 @@ async fn read_review_artifacts(
     supervise_runner::read_artifacts(&work_dir, task_id.as_deref())
 }
 
-/// 列出全部监督任务（含历史终态；应用退出即清，重启后历史消失属预期）
+/// 列出全部监督任务（含历史终态；持久化到 app_data_dir，重启后仍在）
 #[tauri::command]
 fn list_supervise_tasks(state: State<'_, SuperviseState>) -> Vec<TaskInfo> {
     state
@@ -825,6 +924,33 @@ fn list_supervise_tasks(state: State<'_, SuperviseState>) -> Vec<TaskInfo> {
             out
         })
         .unwrap_or_default()
+}
+
+/// 删除任务记录（连带删产物目录）。运行中的任务拒绝删除（需先取消）。
+#[tauri::command]
+fn delete_supervise_task(app: AppHandle, task_id: String) -> Result<(), String> {
+    let state = app.state::<SuperviseState>();
+    let removed = {
+        let mut tasks = state.tasks.lock().map_err(|_| "任务注册表锁已损坏")?;
+        let running = tasks
+            .get(&task_id)
+            .map(|t| t.status == TaskStatus::Running);
+        match running {
+            None => return Err("任务不存在".into()),
+            Some(true) => return Err("任务正在运行，请先取消再删除".into()),
+            Some(false) => tasks.remove(&task_id).map(|t| t.work_dir),
+        }
+    };
+    // D2：删除任务即连带清理 .supervise/tasks/<id>/ 产物
+    if let Some(work_dir) = removed {
+        let artifacts = std::path::Path::new(&work_dir)
+            .join(".supervise")
+            .join("tasks")
+            .join(&task_id);
+        let _ = std::fs::remove_dir_all(&artifacts);
+    }
+    persist_tasks(&app);
+    Ok(())
 }
 
 /// MCP 注册健康检查（toml 结构化解析 + 真实握手）
@@ -902,6 +1028,7 @@ pub fn run() {
                 tauri::path::BaseDirectory::Resource,
             )?;
             supervise_runner::set_supervise_script(supervise_ps1);
+            load_tasks(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -917,6 +1044,7 @@ pub fn run() {
             run_supervise_terminal,
             read_review_artifacts,
             list_supervise_tasks,
+            delete_supervise_task,
             check_mcp,
             fix_mcp,
             export_transcript_md,
@@ -925,6 +1053,7 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 window.state::<TerminalState>().stop_all();
                 window.state::<SuperviseState>().stop_all();
+                persist_tasks(window.app_handle());
             }
         })
         .run(tauri::generate_context!())
@@ -968,19 +1097,30 @@ mod tests {
     }
 
     #[test]
-    fn task_info_serializes_to_snake_case() {
+    fn task_info_serializes_to_snake_case_and_roundtrips() {
         let info = TaskInfo {
             id: "task-1".into(),
             work_dir: "D:\\work".into(),
+            task: "写一个计算器".into(),
             kind: TaskKind::Engine,
             status: TaskStatus::Running,
             rounds: 0,
             last_reason: String::new(),
+            log: vec!["line1".into(), "line2".into()],
             started_at_ms: now_ms(),
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["kind"], "engine");
         assert_eq!(json["status"], "running");
+        assert_eq!(json["task"], "写一个计算器");
+        assert_eq!(json["log"], serde_json::json!(["line1", "line2"]));
+
+        // 持久化依赖反序列化：round-trip 后字段保持一致
+        let restored: TaskInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.task, info.task);
+        assert_eq!(restored.log, info.log);
+        assert_eq!(restored.kind, info.kind);
+        assert_eq!(restored.status, info.status);
     }
 
     #[test]
