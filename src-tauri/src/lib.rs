@@ -726,6 +726,10 @@ async fn run_supervise_terminal(
     let rounds = level_rounds(request.level.as_deref(), request.max_rounds);
     let model = request.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
     let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
+    // 令牌需单次运行唯一：task_id 在应用重启后从头计数，若令牌只带 task_id，
+    // 前一次运行的陈旧会话会与新任务同令牌、被预钉误命中（真实事故：同目录
+    // 二次运行 task-2，注入实际落进新会话，引擎却钉死旧会话，审查/确认全对着错文件）
+    let started_at = now_ms();
 
     // 产物按 task 隔离；Stop marker 仍共享根目录（引擎靠 task_token 预钉 session）
     let supervise_dir = std::path::Path::new(&request.work_dir).join(".supervise");
@@ -772,7 +776,7 @@ async fn run_supervise_terminal(
         rounds: 0,
         last_reason: String::new(),
         log: Vec::new(),
-        started_at_ms: now_ms(),
+        started_at_ms: started_at,
     });
     persist_tasks(&app);
 
@@ -781,7 +785,7 @@ async fn run_supervise_terminal(
         work_dir: request.work_dir.clone(),
         max_rounds: rounds,
         artifacts_dir: Some(artifacts_dir),
-        task_token: Some(task_id.clone()),
+        task_token: Some(format!("{task_id}:{started_at}")),
         reviewer_label: match (request.mock, model) {
             (true, _) => "mock".to_string(),
             (false, Some(m)) => m.to_string(),

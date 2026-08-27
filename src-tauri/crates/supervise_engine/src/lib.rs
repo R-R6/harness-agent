@@ -941,6 +941,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 令牌唯一化回归：应用重启后 task_id 从头计数（新旧两次都是 task-2），
+    /// 令牌若只带 task_id，旧会话会被新任务误命中（真实事故：二次运行 task-2，
+    /// 注入实际落进新会话，引擎却钉死旧会话，审查/送达确认全对着错文件）。
+    /// 令牌带 started_at 后，新旧 token 必须互不命中。
+    #[test]
+    fn find_session_containing_distinguishes_same_task_id_across_runs() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv-engine-find-token-runs-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let slug = "proj";
+        let slug_dir = dir.join(slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let old = slug_dir.join("old-run.jsonl");
+        let new = slug_dir.join("new-run.jsonl");
+        std::fs::write(&old, "x [supervise-task:task-2:1000] y\n").unwrap();
+        std::fs::write(&new, "z [supervise-task:task-2:2000] w\n").unwrap();
+
+        assert_eq!(
+            find_session_containing(&dir, slug, "[supervise-task:task-2:2000]"),
+            Some(new),
+            "新令牌必须只命中新会话"
+        );
+        assert_eq!(
+            find_session_containing(&dir, slug, "[supervise-task:task-2:1000]"),
+            Some(old),
+            "旧令牌必须只命中旧会话"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn marker_source_only_reads_new_lines() {
         let dir = tmp_dir("markers");
