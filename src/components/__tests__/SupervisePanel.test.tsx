@@ -3,6 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { SupervisePanel } from "../SupervisePanel";
+import type { TaskInfo } from "../../types";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -14,12 +15,29 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.dialogOpen }));
 
+function makeTask(overrides: Partial<TaskInfo> = {}): TaskInfo {
+  return {
+    id: "task-1",
+    work_dir: "D:\\work",
+    task: "写一个计算器",
+    kind: "engine",
+    status: "accepted",
+    rounds: 2,
+    last_reason: "",
+    log: [],
+    started_at_ms: Date.now(),
+    ...overrides,
+  };
+}
+
 /** 受控宿主：面板的 workDir 由父组件持有（与 App 中的用法一致） */
 function renderPanel(
   initialDir = "D:\\work",
   extra: {
     onDriveStarted?: () => void;
     prepareDriveTerminal?: (workDir: string) => Promise<string>;
+    focusedTask?: TaskInfo | null;
+    onNewTask?: () => void;
   } = {},
 ) {
   const onStarted = vi.fn();
@@ -35,6 +53,8 @@ function renderPanel(
         workDir={dir}
         onWorkDirChange={handleDirChange}
         onStarted={onStarted}
+        focusedTask={extra.focusedTask}
+        onNewTask={extra.onNewTask}
         onDriveStarted={extra.onDriveStarted}
         prepareDriveTerminal={extra.prepareDriveTerminal}
       />
@@ -86,17 +106,13 @@ describe("SupervisePanel", () => {
     });
   });
 
-  it("启动成功即以当前目录回调 onStarted（看板从运行起就指向正确目录）", async () => {
+  it("启动成功即以 task_id 回调 onStarted", async () => {
     mocks.invoke.mockResolvedValue("task-7");
     const { onStarted } = renderPanel("D:\\initial");
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
-    // 挂载后修改目录再启动：回调必须带新目录，而不是挂载时的旧值（stale 闭包回归）
-    const dirInput = screen.getByPlaceholderText(/浏览选择/);
-    await userEvent.clear(dirInput);
-    await userEvent.type(dirInput, "D:\\changed");
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalled());
-    expect(onStarted).toHaveBeenCalledWith("D:\\changed");
+    expect(onStarted).toHaveBeenCalledWith("task-7");
   });
 
   it("点📁浏览 → 打开目录选择器并填入选中的目录", async () => {
@@ -125,27 +141,6 @@ describe("SupervisePanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     expect(screen.getByText(/工作目录不能为空/)).toBeInTheDocument();
     expect(mocks.invoke).not.toHaveBeenCalled();
-  });
-
-  it("done 事件带非 0 退出码 → 显示任务失败", async () => {
-    mocks.invoke.mockResolvedValue("task-9");
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let doneHandler: any = null;
-    mocks.listen.mockImplementation((ev: string, cb: (e: never) => void) => {
-      if (ev === "supervise-done") {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        doneHandler = cb as any;
-      }
-      return Promise.resolve(() => {});
-    });
-    renderPanel("D:\\work");
-    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
-    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
-    await waitFor(() =>
-      expect(mocks.invoke).toHaveBeenCalledWith("run_supervise", expect.anything()),
-    );
-    doneHandler?.({ payload: { taskId: "task-9", exitCode: 1 } });
-    expect(await screen.findByText(/任务失败（退出码 1）/)).toBeInTheDocument();
   });
 
   it("mock 关闭时 request.mock=false", async () => {
@@ -179,64 +174,21 @@ describe("SupervisePanel", () => {
     await waitFor(() => expect(onDriveStarted).toHaveBeenCalledTimes(1));
   });
 
-  it("收到 supervise-log 事件 → 渲染日志行", async () => {
-    // 捕获 listen 注册的回调
-    let logHandler: ((e: { payload: { taskId: string; line: string } }) => void) | undefined;
-    mocks.listen.mockImplementation((event: string, cb: (e: never) => void) => {
-      if (event === "supervise-log") logHandler = cb as never;
-      return Promise.resolve(() => {});
+  it("查看态：渲染只读描述与日志，不渲染表单", () => {
+    renderPanel("D:\\work", {
+      focusedTask: makeTask({ task: "写个爬虫", log: ["[PASS] 验收通过"] }),
     });
-    mocks.invoke.mockResolvedValue("task-1");
-
-    renderPanel();
-    await waitFor(() => expect(logHandler).toBeDefined());
-    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "t");
-    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalled());
-    logHandler?.({ payload: { taskId: "task-1", line: "[PASS] 验收通过" } });
-    expect(await screen.findByText("[PASS] 验收通过")).toBeInTheDocument();
+    expect(screen.getByText("写个爬虫")).toBeInTheDocument();
+    expect(screen.getByText("[PASS] 验收通过")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "启动监督闭环" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "新建任务" })).toBeInTheDocument();
   });
 
-  it("启动成功后仍可再开任务，表单不再出现取消按钮", async () => {
-    mocks.invoke.mockResolvedValueOnce("task-1").mockResolvedValueOnce("task-2");
-    renderPanel("D:\\work");
-    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
-    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
-    expect(screen.getByRole("button", { name: "启动监督闭环" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /取消任务/ })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(2));
-  });
-
-  it("日志只保留最近一次启动的 taskId；切目录后清空", async () => {
-    let logHandler: ((e: { payload: { taskId: string; line: string } }) => void) | undefined;
-    mocks.listen.mockImplementation((event: string, cb: (e: never) => void) => {
-      if (event === "supervise-log") logHandler = cb as never;
-      return Promise.resolve(() => {});
-    });
-    mocks.invoke.mockResolvedValueOnce("task-1").mockResolvedValueOnce("task-2");
-    const { onWorkDirChange } = renderPanel("D:\\work");
-    await waitFor(() => expect(logHandler).toBeDefined());
-    await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务A");
-    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
-    logHandler?.({ payload: { taskId: "task-1", line: "log-from-1" } });
-    expect(await screen.findByText("log-from-1")).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(2));
-    expect(screen.queryByText("log-from-1")).not.toBeInTheDocument();
-    logHandler?.({ payload: { taskId: "task-1", line: "stale-1" } });
-    logHandler?.({ payload: { taskId: "task-2", line: "log-from-2" } });
-    expect(await screen.findByText("log-from-2")).toBeInTheDocument();
-    expect(screen.queryByText("stale-1")).not.toBeInTheDocument();
-
-    const dirInput = screen.getByPlaceholderText(/浏览选择/);
-    await userEvent.clear(dirInput);
-    await userEvent.type(dirInput, "D:\\other");
-    expect(onWorkDirChange).toHaveBeenCalled();
-    expect(screen.queryByText("log-from-2")).not.toBeInTheDocument();
+  it("查看态：点击新建任务 → 回调 onNewTask", async () => {
+    const onNewTask = vi.fn();
+    renderPanel("D:\\work", { focusedTask: makeTask(), onNewTask });
+    await userEvent.click(screen.getByRole("button", { name: "新建任务" }));
+    expect(onNewTask).toHaveBeenCalledTimes(1);
   });
 
   it("启动请求进行中时禁用启动按钮，防止连点", async () => {

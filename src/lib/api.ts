@@ -56,9 +56,14 @@ export async function fetchReviewArtifacts(workDir: string, taskId?: string | nu
   return invoke("read_review_artifacts", args);
 }
 
-/** 列出全部监督任务（含历史终态；重启后清空） */
+/** 列出全部监督任务（含历史终态；持久化后重启仍在） */
 export async function fetchTasks(): Promise<TaskInfo[]> {
   return invoke<TaskInfo[]>("list_supervise_tasks");
+}
+
+/** 删除任务记录（连带删产物；运行中任务后端会拒绝） */
+export async function deleteTask(taskId: string): Promise<void> {
+  return invoke<void>("delete_supervise_task", { taskId });
 }
 
 // ---- MCP 健康检查 ----

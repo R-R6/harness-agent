@@ -14,7 +14,7 @@ import { StatusBar } from "./components/StatusBar";
 import { TerminalWorkspace, type TerminalWorkspaceHandle } from "./components/TerminalWorkspace";
 import { SplitHandle } from "./components/SplitHandle";
 import harnessMark from "./assets/harness-mark.svg";
-import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSupervise } from "./lib/api";
+import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSupervise, deleteTask } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
 import { listenWhileMounted } from "./lib/listenWhileMounted";
@@ -114,15 +114,36 @@ function App() {
   const [terminalRunning, setTerminalRunning] = useState(0);
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const activeTasks = tasksForWorkspace(tasks, projectWorkDir);
-  const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
+  // 焦点按空间记忆：key 缺失=首次进入(默认最新任务)，null=显式编辑态，string=选中任务 id
+  const [focusByWorkspace, setFocusByWorkspace] = useState<Record<string, string | null>>({});
+  const focusEntry = activeWorkspace ? focusByWorkspace[activeWorkspace.id] : undefined;
+  const focusedTaskId = typeof focusEntry === "string" ? focusEntry : null;
+  const focusedTask = activeTasks.find((t) => t.id === focusedTaskId) ?? null;
   const focusedTaskIdEffective = useMemo(() => {
+    if (focusEntry === null) return null; // 显式编辑态（新建任务）
     if (focusedTaskId && activeTasks.some((t) => t.id === focusedTaskId)) return focusedTaskId;
-    const running = activeTasks.filter((t) => t.status === "running");
-    const pool = running.length > 0 ? running : activeTasks;
-    if (pool.length === 0) return null;
-    return [...pool].sort((a, b) => b.started_at_ms - a.started_at_ms)[0].id;
-  }, [activeTasks, focusedTaskId]);
+    if (activeTasks.length === 0) return null;
+    return [...activeTasks].sort((a, b) => b.started_at_ms - a.started_at_ms)[0].id;
+  }, [activeTasks, focusEntry, focusedTaskId]);
   const superviseRunning = tasks.filter((t) => t.status === "running").length;
+
+  /** 选中任务：写入当前空间焦点 */
+  const setFocusedTask = useCallback((taskId: string) => {
+    setFocusByWorkspace((prev) => {
+      const id = activeWorkspace?.id;
+      if (!id) return prev;
+      return { ...prev, [id]: taskId };
+    });
+  }, [activeWorkspace]);
+
+  /** 新建任务：清空当前空间焦点，回到可编辑表单 */
+  const handleNewTask = useCallback(() => {
+    setFocusByWorkspace((prev) => {
+      const id = activeWorkspace?.id;
+      if (!id) return prev;
+      return { ...prev, [id]: null };
+    });
+  }, [activeWorkspace]);
 
   // 目录上报（终端 pane 输入/续聊）：与侧栏「+」同语义——命中既有空间→激活；
   // 不命中→新建空间并激活；绝不原地改写既有空间路径（杜绝覆盖事故）
@@ -208,6 +229,19 @@ function App() {
     return stop;
   }, [loadTasks]);
 
+  // 监听 supervise-log 实时追加到对应任务的 log（运行中任务滚动可见；上限与后端一致 500 行）
+  useEffect(() => {
+    const stop = listenWhileMounted<{ taskId: string; line: string }>("supervise-log", (e) => {
+      const { taskId, line } = e.payload;
+      setTasks((prev) =>
+        prev.map((t) =>
+          t.id === taskId && t.log.length < 500 ? { ...t, log: [...t.log, line] } : t,
+        ),
+      );
+    });
+    return stop;
+  }, []);
+
   /** 取消运行中的监督任务 */
   const handleCancelTask = useCallback(async (taskId: string) => {
     try {
@@ -216,6 +250,25 @@ function App() {
       // 取消失败静默
     }
   }, []);
+
+  /** 删除任务记录（连带删产物）；若删的是焦点任务则清焦点 */
+  const handleDeleteTask = useCallback(async (taskId: string) => {
+    try {
+      await deleteTask(taskId);
+    } catch {
+      // 删除失败（如任务已不存在）静默，刷新后自会反映真实状态
+    }
+    setFocusByWorkspace((prev) => {
+      const id = activeWorkspace?.id;
+      if (id && prev[id] === taskId) {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      }
+      return prev;
+    });
+    void loadTasks();
+  }, [activeWorkspace, loadTasks]);
 
   /** 终端驱动监督启动后切到终端 tab */
   const handleDriveStarted = useCallback(() => {
@@ -703,8 +756,9 @@ function App() {
                     <TaskList
                       tasks={activeTasks}
                       onCancel={handleCancelTask}
+                      onDelete={handleDeleteTask}
                       selectedId={focusedTaskIdEffective}
-                      onSelect={setFocusedTaskId}
+                      onSelect={setFocusedTask}
                     />
                   </div>
                   <div
@@ -719,7 +773,12 @@ function App() {
                         workDir={projectWorkDir}
                         onWorkDirChange={handleWorkDirChange}
                         readOnly
-                        onStarted={() => void loadTasks()}
+                        focusedTask={focusedTask}
+                        onNewTask={handleNewTask}
+                        onStarted={(taskId) => {
+                          setFocusedTask(taskId);
+                          void loadTasks();
+                        }}
                         onDriveStarted={handleDriveStarted}
                         prepareDriveTerminal={async (workDir) => {
                           const id = await terminalRef.current?.startClaudeForTask(workDir);

@@ -7,10 +7,12 @@ import type { TaskInfo } from "../../types";
 const makeTask = (overrides: Partial<TaskInfo> = {}): TaskInfo => ({
   id: "task-1",
   work_dir: "D:\\project",
+  task: "写一个计算器",
   kind: "engine",
   status: "running",
   rounds: 2,
   last_reason: "",
+  log: [],
   started_at_ms: Date.now(),
   ...overrides,
 });
@@ -43,6 +45,20 @@ describe("TaskList", () => {
     render(<TaskList tasks={tasks} onCancel={vi.fn()} />);
     expect(screen.getByText("已通过")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /取消/ })).not.toBeInTheDocument();
+  });
+
+  it("终态任务显示删除按钮，点击调用 onDelete", async () => {
+    const onDelete = vi.fn();
+    const tasks = [makeTask({ id: "task-9", status: "accepted" })];
+    render(<TaskList tasks={tasks} onCancel={vi.fn()} onDelete={onDelete} />);
+    await userEvent.click(screen.getByRole("button", { name: /删除/ }));
+    expect(onDelete).toHaveBeenCalledWith("task-9");
+  });
+
+  it("running 任务不显示删除按钮", () => {
+    const tasks = [makeTask({ status: "running" })];
+    render(<TaskList tasks={tasks} onCancel={vi.fn()} onDelete={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /删除/ })).not.toBeInTheDocument();
   });
 
   it("点击取消按钮调用 onCancel", async () => {

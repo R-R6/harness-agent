@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { listenWhileMounted } from "../lib/listenWhileMounted";
 import { runSupervise, runSuperviseTerminal } from "../lib/api";
 import { Icon } from "./Icon";
+import type { TaskInfo, TaskStatus } from "../types";
 
 interface Props {
   /** 工作目录（受控：由 App 持有的项目上下文，与 Claude 终端 pane 同源） */
@@ -10,24 +10,33 @@ interface Props {
   onWorkDirChange: (dir: string) => void;
   /** 只读模式（阶段 C）：目录 = 激活空间，只读展示；换目录=侧栏切空间 */
   readOnly?: boolean;
-  /** 启动成功后回调（携带启动时的目录，供审看看板定位 .supervise 产物） */
-  onStarted: (workDir: string) => void;
-  /** 终端驱动模式启动成功后回调（App 切到终端 tab 让用户看到干活过程） */
+  /** 焦点任务：非空进入查看态（只读描述 + 日志），空则编辑态（表单） */
+  focusedTask?: TaskInfo | null;
+  /** 新建任务：清空焦点回到编辑态 */
+  onNewTask?: () => void;
+  /** 启动成功后回调（携带 task_id） */
+  onStarted: (taskId: string) => void;
+  /** 终端驱动模式启动成功后回调（App 切到终端 tab） */
   onDriveStarted?: () => void;
   /** 驱动前准备 Claude PTY，返回 terminal session id */
   prepareDriveTerminal?: (workDir: string) => Promise<string>;
 }
 
-interface LogLine {
-  taskId: string;
-  line: string;
-}
+const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
+  running: "运行中",
+  accepted: "已通过",
+  rejected: "未通过",
+  cancelled: "已取消",
+  aborted: "已中止",
+};
 
-/** 闭环启动器：任务表单 + 启动 + 最近一次任务的实时日志流 */
+/** 闭环启动器：焦点任务查看（描述/日志）或 任务表单 + 启动 */
 export function SupervisePanel({
   workDir,
   onWorkDirChange,
   readOnly = false,
+  focusedTask,
+  onNewTask,
   onStarted,
   onDriveStarted,
   prepareDriveTerminal,
@@ -37,41 +46,13 @@ export function SupervisePanel({
   const [mock, setMock] = useState(true);
   const [driveTerminal, setDriveTerminal] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [logs, setLogs] = useState<LogLine[]>([]);
   const [error, setError] = useState("");
   const logEndRef = useRef<HTMLDivElement>(null);
-  const lastTaskIdRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    const stopLog = listenWhileMounted<LogLine>("supervise-log", (e) => {
-      if (e.payload.taskId !== lastTaskIdRef.current) return;
-      setLogs((prev) => [...prev.slice(-499), e.payload]);
-    });
-    const stopDone = listenWhileMounted<{ taskId: string; exitCode?: number | null }>(
-      "supervise-done",
-      (e) => {
-        if (e.payload.taskId !== lastTaskIdRef.current) return;
-        const code = e.payload.exitCode;
-        if (code != null && code !== 0) {
-          setError(`任务失败（退出码 ${code}），详见下方日志`);
-        }
-      },
-    );
-    return () => {
-      stopLog();
-      stopDone();
-    };
-  }, []);
-
+  // 运行中任务的日志实时增长时，滚动到底部
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
-
-  useEffect(() => {
-    setLogs([]);
-    lastTaskIdRef.current = null;
-    setError("");
-  }, [workDir]);
+  }, [focusedTask?.log]);
 
   const start = async () => {
     setError("");
@@ -98,9 +79,8 @@ export function SupervisePanel({
       const taskId = driveTerminal
         ? await runSuperviseTerminal(req)
         : await runSupervise(req);
-      lastTaskIdRef.current = taskId;
-      setLogs([]);
-      onStarted(dir);
+      onStarted(taskId);
+      setTask("");
       if (driveTerminal) onDriveStarted?.();
     } catch (e) {
       setError(String(e));
@@ -118,10 +98,39 @@ export function SupervisePanel({
         title: "选择项目工作目录",
       });
       if (typeof dir === "string") onWorkDirChange(dir);
-    } catch (e) {
-      setError(String(e));
+    } catch {
+      // 用户取消选择或无权限
     }
   };
+
+  // 查看态：选中任务 → 只读描述 + 日志
+  if (focusedTask) {
+    return (
+      <div className="supervise-panel">
+        <div className="task-detail">
+          <div className="task-detail__head">
+            <span className={`task-badge task-badge--${focusedTask.status}`}>
+              {TASK_STATUS_LABEL[focusedTask.status]}
+            </span>
+            <button type="button" className="link-button" onClick={onNewTask}>
+              新建任务
+            </button>
+          </div>
+          <pre className="task-detail__desc">{focusedTask.task}</pre>
+        </div>
+        {focusedTask.log.length > 0 ? (
+          <div className="log-stream">
+            {focusedTask.log.map((l, i) => (
+              <div key={i} className={`log-line ${logClass(l)}`}>{l}</div>
+            ))}
+            <div ref={logEndRef} />
+          </div>
+        ) : (
+          <div className="log-stream log-stream--empty">暂无日志</div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="supervise-panel">
@@ -169,7 +178,7 @@ export function SupervisePanel({
             />
             模拟模式（不花钱）
           </label>
-          <label className="checkbox" title="任务注入运行中的 Claude 终端 pane：干活全程可见、可随时插手；需先在终端工作台以该目录启动 Claude CLI">
+          <label className="checkbox" title="任务注入 Claude 终端 pane：自动新开 Claude PTY（一任务一会话），干活全程可见、可随时插手">
             <input
               type="checkbox"
               checked={driveTerminal}
@@ -186,17 +195,6 @@ export function SupervisePanel({
           </button>
         </div>
       </div>
-
-      {logs.length > 0 && (
-        <div className="log-stream">
-          {logs.map((l, i) => (
-            <div key={i} className={`log-line ${logClass(l.line)}`}>
-              {l.line}
-            </div>
-          ))}
-          <div ref={logEndRef} />
-        </div>
-      )}
     </div>
   );
 }

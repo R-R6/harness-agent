@@ -6,6 +6,8 @@ interface Props {
   tasks: TaskInfo[];
   /** 取消运行中的任务（复用 cancel_supervise） */
   onCancel: (taskId: string) => void;
+  /** 删除任务记录（仅终态任务显示删除按钮） */
+  onDelete?: (taskId: string) => void;
   selectedId?: string | null;
   onSelect?: (taskId: string) => void;
 }
@@ -34,7 +36,7 @@ export function formatTaskTime(ms: number): string {
 }
 
 /** 监督闭环任务列表：状态/轮数/目录/开始时间；运行中带「取消」 */
-export function TaskList({ tasks, onCancel, selectedId, onSelect }: Props) {
+export function TaskList({ tasks, onCancel, onDelete, selectedId, onSelect }: Props) {
   if (tasks.length === 0) {
     return (
       <div className="task-list task-list--empty">
@@ -69,7 +71,7 @@ export function TaskList({ tasks, onCancel, selectedId, onSelect }: Props) {
               )}
             </div>
           </div>
-          {t.status === "running" && (
+          {t.status === "running" ? (
             <button
               type="button"
               className="task-row__cancel"
@@ -80,7 +82,18 @@ export function TaskList({ tasks, onCancel, selectedId, onSelect }: Props) {
             >
               <Icon name="stop" size={12} /> 取消
             </button>
-          )}
+          ) : onDelete ? (
+            <button
+              type="button"
+              className="task-row__cancel task-row__delete"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete(t.id);
+              }}
+            >
+              <Icon name="trash" size={12} /> 删除
+            </button>
+          ) : null}
         </li>
       ))}
     </ul>

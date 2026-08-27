@@ -36,10 +36,14 @@ export type TaskKind = "ps1" | "engine";
 export interface TaskInfo {
   id: string;
   work_dir: string;
+  /** 任务描述（登记时写入，选中任务时只读展示） */
+  task: string;
   kind: TaskKind;
   status: TaskStatus;
   rounds: number;
   last_reason: string;
+  /** 监督日志（每任务限 500 行，持久化） */
+  log: string[];
   started_at_ms: number;
 }
 
