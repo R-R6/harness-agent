@@ -372,6 +372,18 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
   background: color-mix(in srgb, var(--claude) 14%, #0b0f14);
   color: #eef2f8;
 }
+.terminal-claude-tab--add {
+  width: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #687687;
+}
+.terminal-claude-tab--add:hover {
+  border-color: color-mix(in srgb, var(--claude) 55%, #26303b);
+  color: #eef2f8;
+}
 .terminal-claude-surfaces { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; }
 .terminal-surface-slot { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; }
 .terminal-claude-stack {

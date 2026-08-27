@@ -37,6 +37,11 @@ const initialPane = (): PaneState => ({
   error: "",
 });
 
+/** 退出码 → 面板错误文案；0 / 主动停止(null) 不视为异常 */
+function exitErrorMessage(code?: number | null) {
+  return code != null && code !== 0 ? `CLI 异常退出（代码 ${code}）` : "";
+}
+
 interface ClaudeTab {
   id: string;
   pane: PaneState;
@@ -97,6 +102,8 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   const pendingOutputRef = useRef(new Map<string, { sessionId: string; data: string }>());
   /** sessionId → 尚未绑定到 pane 的输出（start_terminal 返回前 PTY 已可能吐字） */
   const orphanOutputRef = useRef(new Map<string, string>());
+  /** sessionId → 早于 pane 绑定到达的退出事件（CLI 秒退/崩溃时 terminal-exit 先于 invoke 返回） */
+  const orphanExitRef = useRef(new Map<string, { code?: number | null }>());
   const outputFrameRef = useRef<number | null>(null);
   const claudeStartChainRef = useRef(Promise.resolve());
   const [codexWorkDir, setCodexWorkDir] = useStoredString("ha-workdir-codex", "");
@@ -225,6 +232,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     outputFrameRef.current = null;
     pendingOutputRef.current.clear();
     orphanOutputRef.current.clear();
+    orphanExitRef.current.clear();
   }, []);
 
   const runningCount =
@@ -259,13 +267,20 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     const stopExit = listenWhileMounted<{ sessionId: string; code?: number | null }>(
       "terminal-exit",
       (event) => {
-        const paneKey = findPaneKeyBySession(event.payload.sessionId);
-        if (!paneKey) return;
-        const code = event.payload.code;
+        const { sessionId, code } = event.payload;
+        const paneKey = findPaneKeyBySession(sessionId);
+        if (!paneKey) {
+          // CLI 在 start_terminal 返回、session 绑定到 pane 之前就退出了（例如二进制
+          // 秒退/崩溃）。此时会话尚未写入 tabs/pane，直接丢弃会永久卡在"运行中"：
+          // 先缓冲，等 startPane 拿到 session 后立即应用。
+          orphanExitRef.current.set(sessionId, { code });
+          return;
+        }
+        orphanExitRef.current.delete(sessionId);
         const patch = {
           status: "exited" as const,
           session: null,
-          error: code != null && code !== 0 ? `CLI 异常退出（代码 ${code}）` : "",
+          error: exitErrorMessage(code),
         };
         if (paneKey === CODEX_KEY) patchCodex(patch);
         else patchClaudeTab(paneKey, patch);
@@ -338,6 +353,20 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           rows: Math.max(rows, 24),
           args: opts?.args,
         });
+        const orphanExit = orphanExitRef.current.get(session.id);
+        if (orphanExit) {
+          orphanExitRef.current.delete(session.id);
+          // 退出前若有残余输出也一并回放，避免"已退出但缺最后一帧"
+          claimOrphanOutput(paneKey, session.id);
+          const patch = {
+            status: "exited" as const,
+            session: null,
+            error: exitErrorMessage(orphanExit.code),
+          };
+          if (paneKey === CODEX_KEY) patchCodex(patch);
+          else patchClaudeTab(paneKey, patch);
+          return null;
+        }
         if (paneKey === CODEX_KEY) patchCodex({ session, status: "running", error: "" });
         else patchClaudeTab(paneKey, { session, status: "running", error: "" });
         claimOrphanOutput(paneKey, session.id);
@@ -505,23 +534,30 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         style={{ "--terminal-primary-size": `${ratio}%` } as CSSProperties}
       >
         <div className="terminal-claude-stack">
-          {claudeTabs.length > 1 && (
-            <div className="terminal-claude-tabs" role="tablist" aria-label="Claude 终端标签">
-              {claudeTabs.map((tab, index) => (
-                <button
-                  key={tab.id}
-                  type="button"
-                  role="tab"
-                  aria-selected={tab.id === activeClaudeId}
-                  className={`terminal-claude-tab ${tab.id === activeClaudeId ? "is-active" : ""}`}
-                  onClick={() => focusClaudeTab(tab.id)}
-                >
-                  Claude {index + 1}
-                  {tab.pane.status === "running" ? " · 运行中" : ""}
-                </button>
-              ))}
-            </div>
-          )}
+          <div className="terminal-claude-tabs" role="tablist" aria-label="Claude 终端标签">
+            {claudeTabs.map((tab, index) => (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={tab.id === activeClaudeId}
+                className={`terminal-claude-tab ${tab.id === activeClaudeId ? "is-active" : ""}`}
+                onClick={() => focusClaudeTab(tab.id)}
+              >
+                Claude {index + 1}
+                {tab.pane.status === "running" ? " · 运行中" : ""}
+              </button>
+            ))}
+            <button
+              type="button"
+              className="terminal-claude-tab terminal-claude-tab--add"
+              onClick={addClaudeTab}
+              aria-label="新增 Claude 终端"
+              title="新增一个 Claude 终端会话"
+            >
+              <Icon name="plus" size={13} />
+            </button>
+          </div>
           {claudeTabs.map((tab) => (
             <div
               key={tab.id}

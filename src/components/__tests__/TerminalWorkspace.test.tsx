@@ -417,6 +417,78 @@ describe("TerminalWorkspace", () => {
     });
   });
 
+  it("start_terminal 返回前 CLI 已退出：面板进入 exited 而非永久 running", async () => {
+    const startPromise = deferred<{
+      id: string;
+      agent: string;
+      work_dir: string;
+      status: string;
+    }>();
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "start_terminal") return startPromise.promise;
+      return Promise.resolve(undefined);
+    });
+
+    renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+    await waitFor(() => expect(mocks.listeners.get("terminal-exit")).toHaveLength(1));
+
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+    // CLI 在 invoke 返回前就退出（坏二进制秒退：exit code 0，无输出）
+    emitEvent("terminal-exit", { sessionId: "terminal-claude-early", code: 0 });
+
+    await act(async () => {
+      startPromise.resolve({
+        id: "terminal-claude-early",
+        agent: "claude",
+        work_dir: PROJECT_DIR,
+        status: "running",
+      });
+      await startPromise.promise;
+    });
+
+    // 不得卡在"运行中"（无停止按钮）；应回到可再次启动的 exited 状态
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "停止 Claude CLI" })).not.toBeInTheDocument();
+    });
+    expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled();
+  });
+
+  it("start_terminal 返回前 CLI 异常退出：显示退出码而非卡 running", async () => {
+    const startPromise = deferred<{
+      id: string;
+      agent: string;
+      work_dir: string;
+      status: string;
+    }>();
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "start_terminal") return startPromise.promise;
+      return Promise.resolve(undefined);
+    });
+
+    renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+    await waitFor(() => expect(mocks.listeners.get("terminal-exit")).toHaveLength(1));
+
+    await userEvent.click(screen.getAllByRole("button", { name: "启动" })[0]);
+    emitEvent("terminal-exit", { sessionId: "terminal-claude-early", code: 1 });
+
+    await act(async () => {
+      startPromise.resolve({
+        id: "terminal-claude-early",
+        agent: "claude",
+        work_dir: PROJECT_DIR,
+        status: "running",
+      });
+      await startPromise.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("alert")[0]).toHaveTextContent("CLI 异常退出（代码 1）");
+    });
+    expect(screen.queryByRole("button", { name: "停止 Claude CLI" })).not.toBeInTheDocument();
+  });
+
   it("startClaudeForTask 可连续两次启动，不出现「终端已在运行」", async () => {
     let startCount = 0;
     mocks.invoke.mockImplementation((command: string) => {
@@ -456,6 +528,20 @@ describe("TerminalWorkspace", () => {
     expect(secondId).toBe("terminal-claude-2");
     expect(mocks.invoke.mock.calls.filter((call) => call[0] === "start_terminal")).toHaveLength(2);
     expect(screen.queryByText(/终端已在运行/)).not.toBeInTheDocument();
+  });
+
+  it("点击 + 新增一个空闲的 Claude 终端标签", async () => {
+    renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+
+    // 初始只有一个 Claude 标签
+    expect(screen.getAllByRole("tab")).toHaveLength(1);
+
+    await userEvent.click(screen.getByRole("button", { name: "新增 Claude 终端" }));
+
+    // 新增后有两个标签，新标签为空闲态（可再启动）
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
+    expect(screen.getByRole("tab", { name: /Claude 2/ })).toBeInTheDocument();
   });
 
   it("停止与自行退出竞态：invoke 失败不再回滚 running 卡死面板", async () => {
