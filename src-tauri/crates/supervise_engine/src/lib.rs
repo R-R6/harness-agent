@@ -587,31 +587,36 @@ fn run_loop(
         // 不重新注入（见下方审查重试循环），first_inject 只认第一次真正注入。
         // 反计划模式指令：真实事故——工人对"补测试"自作主张进入计划模式，
         // 写完计划等确认卡死，静默判停把"等确认"当"干完"，白烧一轮
+        // 注入文本去提交键：Ink TUI 把「正文+回车」当整块粘贴，尾部 \r 会被当
+        // 粘贴结束吞掉，正文停在输入栏等手动回车（真实反馈：任务/返工意见都要
+        // 手动回车才执行，且送达确认误报「注入未确认」）。提交键由 send_inject
+        // 单独发送；返工意见合成单行（不再中间 \r 打点）。
         let inject = if first_inject {
             match opts.task_token.as_deref().filter(|s| !s.is_empty()) {
                 Some(tok) => format!(
-                    "[supervise-task:{tok}] {}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）\r",
+                    "[supervise-task:{tok}] {}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）",
                     opts.task
                 ),
                 None => format!(
-                    "{}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）\r",
+                    "{}（直接执行并直接创建/修改文件，不要进入计划模式，不要等待确认）",
                     opts.task
                 ),
             }
         } else {
             format!(
-                "上一轮审查未通过，请按要求返工：{}\r（直接动手修改文件并运行验证，禁止进入计划模式或等待确认；如已在计划模式请立即退出并执行）\r",
+                "上一轮审查未通过，请按要求返工：{}（直接动手修改文件并运行验证，禁止进入计划模式或等待确认；如已在计划模式请立即退出并执行）",
                 last_reason
             )
         };
         first_inject = false;
-        // 唤醒回车 + 正文一起封装：确认失败重发时复用同一序列
+        // 唤醒回车 → 正文 → 稍候 → 独立提交回车。正文与提交键分开发送，避免
+        // 粘贴块吞掉 \r；唤醒等待加长覆盖 Claude Code 启动期（1-3s）未就绪吞键。
         let send_inject = |pane: &Arc<dyn PaneIo>| -> Result<(), String> {
-            // 先敲空回车唤醒 TUI：Claude Code 空闲/away 状态可能吞掉直接注入的
-            // 文本（真实事故：第 2/3 轮返工意见未进入会话，工人无动作被冤枉）
-            let _ = pane.write("\r");
-            std::thread::sleep(Duration::from_millis(300));
-            pane.write(&inject)
+            let _ = pane.write("\r"); // 唤醒：Claude 空闲/未就绪时可能吞掉直接输入的文本
+            std::thread::sleep(Duration::from_millis(800));
+            pane.write(&inject)?;
+            std::thread::sleep(Duration::from_millis(400)); // 等正文渲染稳定
+            pane.write("\r") // 提交键独立发送
         };
         if let Err(e) = send_inject(&pane) {
             let msg = format!("注入失败：{e}");
@@ -644,24 +649,44 @@ fn run_loop(
             opts.max_rounds
         ));
 
-        // 首轮：用注入令牌在会话文件中预钉 Claude session，避免多引擎抢同一 Stop
+        // 首轮：用注入令牌在会话文件中预钉 Claude session，避免多引擎抢同一 Stop。
+        // 注入可能落在 TUI 未就绪窗口导致令牌没落盘（需手动回车才执行的真实反馈）：
+        // 确认窗口内没找到令牌就重发一次注入（首轮送达确认），仍找不到才中止——
+        // 不直接误中止、也不会钉到陈旧会话。
         if session_pin.is_none() {
             if let Some(tok) = opts.task_token.as_deref().filter(|s| !s.is_empty()) {
                 let token = format!("[supervise-task:{tok}]");
-                let deadline = Instant::now() + opts.delivery_confirm;
-                while Instant::now() < deadline && session_pin.is_none() {
-                    if cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if let Some(path) = find_session_containing(projects_root, &slug, &token) {
-                        if let Some(sid) = session_id_of_transcript(&path) {
-                            on_log(&format!("[ENGINE] 已预钉 Claude 会话 {sid}"));
-                            session_pin = Some(sid);
-                            known_transcript = Some(path);
+                for attempt in 0..2 {
+                    let deadline = Instant::now() + opts.delivery_confirm;
+                    while Instant::now() < deadline && session_pin.is_none() {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Some(path) = find_session_containing(projects_root, &slug, &token) {
+                            if let Some(sid) = session_id_of_transcript(&path) {
+                                on_log(&format!("[ENGINE] 已预钉 Claude 会话 {sid}"));
+                                session_pin = Some(sid);
+                                known_transcript = Some(path);
+                            }
+                        }
+                        if session_pin.is_none() {
+                            std::thread::sleep(opts.poll_interval);
                         }
                     }
-                    if session_pin.is_none() {
-                        std::thread::sleep(opts.poll_interval);
+                    if session_pin.is_some() {
+                        break;
+                    }
+                    if attempt == 0 {
+                        on_log("[ENGINE] 令牌未落盘，重发首轮注入…");
+                        if let Err(e) = send_inject(&pane) {
+                            let msg = format!("重发首轮注入失败：{e}");
+                            on_log(&format!("[ENGINE] {msg}"));
+                            return EngineOutcome {
+                                status: EngineStatus::Aborted(msg),
+                                rounds: round - 1,
+                                last_reason,
+                            };
+                        }
                     }
                 }
                 if session_pin.is_none() {
@@ -1254,17 +1279,25 @@ mod tests {
             let mut seen_rounds = 0;
             let start = Instant::now();
             loop {
-                let writes = pane2.writes.lock().unwrap().len();
-                if writes > seen_rounds {
+                // 按「每轮正文写」计数（唤醒/提交都是 "\r"），对注入写次数鲁棒，
+                // 不因 send_inject 拆分提交键（2 次→3 次写）而把轮次判断写坏
+                let writes = pane2.writes.lock().unwrap();
+                let text_writes = writes
+                    .iter()
+                    .filter(|w| !w.is_empty() && w.as_str() != "\r")
+                    .count();
+                drop(writes);
+                if text_writes > seen_rounds {
                     let delay = if seen_rounds == 0 {
                         Duration::from_millis(150) // 第 1 轮：很快写 marker
                     } else {
-                        // 第 2 轮：故意延迟 2.5s——需大于 V2 送达确认+重发的
-                        // 开销（约 1s：200ms 窗口 + 300ms 唤醒 + 200ms 窗口），
-                        // 否则注入日志到 marker 的可测窗口会被开销吃掉
-                        Duration::from_millis(2500)
+                        // 第 2 轮：故意延迟 4s——需大于本轮注入的总开销
+                        // （提交键 400ms + 交付确认 200ms + 重发唤醒/正文/提交 1.2s
+                        //  + 二次确认 200ms ≈ 2s），否则「已注入」日志点到 marker
+                        // 落盘的可测窗口被开销吃掉；确保第 2 轮 ≥1.2s 才等到新 marker
+                        Duration::from_millis(4000)
                     };
-                    seen_rounds = writes;
+                    seen_rounds = text_writes;
                     std::thread::sleep(delay);
                     std::fs::write(
                         &transcript2,
@@ -1350,6 +1383,115 @@ mod tests {
             duration.is_some_and(|d| d >= Duration::from_millis(1200)),
             "第 2 轮耗时应 ≥ 1.2s（等新 marker），实际 {duration:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 首轮注入重发回归：首次注入的令牌没落盘（TUI 未就绪/注入被吞，需手动回车才能
+    /// 执行的场景）时，引擎应在确认窗口后重发注入，而不是直接「未能按令牌预钉」中止；
+    /// 重发后令牌落盘 → 正常预钉并推进。修复前：首次注入不见令牌即中止。
+    #[test]
+    fn first_round_resends_injection_when_token_not_landed() {
+        let dir = tmp_dir("first-round-resend");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("session-1.jsonl");
+        let marker_file = dir.join("markers.jsonl");
+        std::fs::write(&marker_file, "").unwrap();
+
+        let pane = Arc::new(FakePane {
+            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
+            writes: Mutex::new(vec![]),
+            fail_write: AtomicBool::new(false),
+        });
+        let pane2 = pane.clone();
+        let marker2 = marker_file.clone();
+        let transcript2 = transcript.clone();
+        let token = "[supervise-task:task-x]".to_string();
+        std::thread::spawn(move || {
+            let mut responded = false;
+            let start = Instant::now();
+            loop {
+                let writes = pane2.writes.lock().unwrap();
+                let text_writes = writes
+                    .iter()
+                    .filter(|w| !w.is_empty() && w.as_str() != "\r")
+                    .count();
+                drop(writes);
+                // 第二次注入（重发）发出后，才把令牌写进 transcript + 写 marker：
+                // 首轮第一次注入期间令牌不可见，模拟 TUI 未就绪吞掉首次注入
+                if !responded && text_writes >= 2 {
+                    std::fs::create_dir_all(&slug_dir).unwrap();
+                    std::fs::write(
+                        &transcript2,
+                        format!(
+                            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{token} 任务开始\"}}}}\n"
+                        ),
+                    )
+                    .unwrap();
+                    use std::io::Write;
+                    let marker = serde_json::json!({
+                        "session_id": "s1",
+                        "transcript_path": transcript2.to_string_lossy(),
+                    });
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&marker2)
+                        .unwrap();
+                    writeln!(f, "{marker}").unwrap();
+                    responded = true;
+                    std::thread::sleep(Duration::from_millis(30));
+                    continue;
+                }
+                if start.elapsed() > Duration::from_secs(25) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let reviewer = MockReviewer::always(Ok(Verdict { pass: true, reason: "ok".into() }));
+        let cancel = AtomicBool::new(false);
+        let all_logs = Arc::new(Mutex::new(vec![]));
+        let logs2 = all_logs.clone();
+        let on_log: OnLog = Arc::new(move |l: &str| logs2.lock().unwrap().push(l.to_string()));
+        let src = MarkerSource::new(marker_file);
+        let mut opts = quick_opts(&dir, 2);
+        opts.task_token = Some("task-x".into());
+
+        let outcome = run(
+            &opts,
+            pane.clone(),
+            Arc::new(reviewer),
+            &src,
+            &projects_root,
+            &cancel,
+            &on_log,
+        );
+
+        assert_eq!(
+            outcome.status,
+            EngineStatus::Accepted,
+            "首轮重发后应正常推进而非中止；logs: {:?}",
+            all_logs.lock().unwrap()
+        );
+        assert!(
+            all_logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("令牌未落盘，重发首轮注入")),
+            "应重发首轮注入: {:?}",
+            all_logs.lock().unwrap()
+        );
+        let writes = pane.writes.lock().unwrap();
+        let text_writes = writes
+            .iter()
+            .filter(|w| !w.is_empty() && w.as_str() != "\r")
+            .count();
+        assert_eq!(text_writes, 2, "应注入两次（首+重发）: {writes:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
