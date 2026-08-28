@@ -196,7 +196,7 @@ describe("TerminalWorkspace", () => {
     expect(mocks.terminals[0].options).toEqual(expect.objectContaining({
       convertEol: false,
       cursorBlink: false,
-      scrollback: 0,
+      scrollback: 2000,
     }));
   });
 

@@ -63,9 +63,10 @@ export function buildXtermOptions(env?: NavigatorLike): ITerminalOptions {
     fontFamily: "Cascadia Mono, Consolas, NSimSun, SimSun, monospace",
     fontSize: 13,
     lineHeight: 1,
-    // ConPTY + windowsPty pushes the old viewport into scrollback when rows
-    // grow (maximize/fit). Ink/ratatui then look like two stacked UIs.
-    scrollback: 0,
+    // 备用屏（TUI）历史滚动需 xterm 有 scrollback；此前置 0 是为规避
+    // ConPTY+windowsPty 在 resize 时把旧视口推入 scrollback 的「叠影」。
+    // 放开到 2000 换取上下滚动看历史（叠影是否复现需真机实测，Option A）。
+    scrollback: 2000,
     // Overlapping CJK fallback glyphs get squashed into one cell and Ink's
     // cursor then appears a row away from 你好.
     rescaleOverlappingGlyphs: false,
