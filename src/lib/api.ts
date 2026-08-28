@@ -44,6 +44,18 @@ export async function runSuperviseTerminal(req: SuperviseRequest): Promise<strin
   return invoke<string>("run_supervise_terminal", { request: req });
 }
 
+export interface SuperviseContinueRequest {
+  taskId: string;
+  workDir: string;
+}
+
+/** 「再来一轮」：rejected 任务复用原 Claude 会话追加一轮完整闭环 */
+export async function continueSuperviseTerminal(
+  req: SuperviseContinueRequest,
+): Promise<string> {
+  return invoke<string>("continue_supervise_terminal", { request: req });
+}
+
 /** 取消运行中的监督任务 */
 export async function cancelSupervise(taskId: string): Promise<void> {
   return invoke<void>("cancel_supervise", { taskId });

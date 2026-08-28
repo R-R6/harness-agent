@@ -25,6 +25,7 @@ function makeTask(overrides: Partial<TaskInfo> = {}): TaskInfo {
     rounds: 2,
     last_reason: "",
     log: [],
+    mock: false,
     started_at_ms: Date.now(),
     ...overrides,
   };
@@ -37,6 +38,7 @@ function renderPanel(
     onDriveStarted?: () => void;
     prepareDriveTerminal?: (workDir: string) => Promise<string>;
     focusedTask?: TaskInfo | null;
+    onContinue?: (taskId: string) => void;
   } = {},
 ) {
   const onStarted = vi.fn();
@@ -55,6 +57,7 @@ function renderPanel(
         focusedTask={extra.focusedTask}
         onDriveStarted={extra.onDriveStarted}
         prepareDriveTerminal={extra.prepareDriveTerminal}
+        onContinue={extra.onContinue}
       />
     );
   };
@@ -179,6 +182,32 @@ describe("SupervisePanel", () => {
     expect(screen.getByText("写个爬虫")).toBeInTheDocument();
     expect(screen.getByText("[PASS] 验收通过")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "启动监督闭环" })).not.toBeInTheDocument();
+  });
+
+  it("查看态（未通过）：显示「再来一轮」，点击调用 continue_supervise_terminal 并回调 onContinue", async () => {
+    mocks.invoke.mockResolvedValue("task-1");
+    const onContinue = vi.fn();
+    renderPanel("D:\\work", {
+      focusedTask: makeTask({ status: "rejected", last_reason: "请修复 xxx" }),
+      onContinue,
+    });
+    const btn = screen.getByRole("button", { name: "再来一轮" });
+    expect(btn).toBeInTheDocument();
+    expect(screen.getByText(/注入上轮审查意见/)).toBeInTheDocument();
+
+    await userEvent.click(btn);
+    expect(mocks.invoke).toHaveBeenCalledWith(
+      "continue_supervise_terminal",
+      expect.objectContaining({
+        request: expect.objectContaining({ taskId: "task-1", workDir: "D:\\work" }),
+      }),
+    );
+    await waitFor(() => expect(onContinue).toHaveBeenCalledWith("task-1"));
+  });
+
+  it("查看态（已通过/运行中）：不显示「再来一轮」", () => {
+    renderPanel("D:\\work", { focusedTask: makeTask({ status: "accepted" }) });
+    expect(screen.queryByRole("button", { name: "再来一轮" })).not.toBeInTheDocument();
   });
 
   it("启动请求进行中时禁用启动按钮，防止连点", async () => {

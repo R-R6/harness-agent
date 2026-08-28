@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { runSupervise, runSuperviseTerminal } from "../lib/api";
+import { continueSuperviseTerminal, runSupervise, runSuperviseTerminal } from "../lib/api";
 import { Icon } from "./Icon";
 import type { TaskInfo, TaskStatus } from "../types";
 
@@ -14,6 +14,8 @@ interface Props {
   focusedTask?: TaskInfo | null;
   /** 启动成功后回调（携带 task_id） */
   onStarted: (taskId: string) => void;
+  /** 「再来一轮」：rejected 任务追加一轮完整闭环（回调用于刷新任务列表） */
+  onContinue?: (taskId: string) => void;
   /** 终端驱动模式启动成功后回调（App 切到终端 tab） */
   onDriveStarted?: () => void;
   /** 驱动前准备 Claude PTY，返回 terminal session id */
@@ -35,6 +37,7 @@ export function SupervisePanel({
   readOnly = false,
   focusedTask,
   onStarted,
+  onContinue,
   onDriveStarted,
   prepareDriveTerminal,
 }: Props) {
@@ -44,6 +47,8 @@ export function SupervisePanel({
   const [driveTerminal, setDriveTerminal] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
+  const [continuing, setContinuing] = useState(false);
+  const [continueError, setContinueError] = useState("");
   const logEndRef = useRef<HTMLDivElement>(null);
 
   // 运行中任务的日志实时增长时，滚动到底部
@@ -86,6 +91,24 @@ export function SupervisePanel({
     }
   };
 
+  /** 「再来一轮」：注入上轮审查意见，复用原 Claude 会话跑一轮完整闭环 */
+  const continueRound = async () => {
+    if (!focusedTask) return;
+    setContinuing(true);
+    setContinueError("");
+    try {
+      await continueSuperviseTerminal({
+        taskId: focusedTask.id,
+        workDir: focusedTask.work_dir,
+      });
+      onContinue?.(focusedTask.id);
+    } catch (e) {
+      setContinueError(String(e));
+    } finally {
+      setContinuing(false);
+    }
+  };
+
   const browseDir = async () => {
     setError("");
     try {
@@ -121,6 +144,23 @@ export function SupervisePanel({
           </div>
         ) : (
           <div className="log-stream log-stream--empty">暂无日志</div>
+        )}
+        {focusedTask.status === "rejected" && (
+          <div className="task-continue">
+            {continueError && <div className="error">{continueError}</div>}
+            <button
+              type="button"
+              className="task-continue__btn"
+              onClick={() => void continueRound()}
+              disabled={continuing}
+            >
+              <Icon name="refresh" size={14} />
+              {continuing ? "再来一轮…" : "再来一轮"}
+            </button>
+            <span className="task-continue__hint">
+              注入上轮审查意见，Claude 同会话继续落地并重新审查
+            </span>
+          </div>
         )}
       </div>
     );

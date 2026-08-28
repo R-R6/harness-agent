@@ -13,6 +13,7 @@ const makeTask = (overrides: Partial<TaskInfo> = {}): TaskInfo => ({
   rounds: 2,
   last_reason: "",
   log: [],
+  mock: false,
   started_at_ms: Date.now(),
   ...overrides,
 });

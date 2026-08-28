@@ -331,7 +331,7 @@ describe("App 集成", () => {
       if (cmd === "read_review_artifacts") return Promise.resolve([]);
       if (cmd === "list_supervise_tasks") {
         return Promise.resolve([
-          { id: "task-1", work_dir: "D:\\space-alpha", task: "写计算器", kind: "ps1", status: "accepted", rounds: 1, last_reason: "", log: [], started_at_ms: 1 },
+          { id: "task-1", work_dir: "D:\\space-alpha", task: "写计算器", kind: "ps1", status: "accepted", rounds: 1, last_reason: "", log: [], mock: false, started_at_ms: 1 },
         ]);
       }
       return Promise.resolve(null);
@@ -427,6 +427,7 @@ describe("App 集成", () => {
             kind: "ps1",
             task: "测试任务",
             log: [],
+            mock: false,
             status: "accepted",
             rounds: 1,
             last_reason: "",
@@ -438,6 +439,7 @@ describe("App 集成", () => {
             kind: "ps1",
             task: "测试任务",
             log: [],
+            mock: false,
             status: "running",
             rounds: 0,
             last_reason: "",
@@ -487,6 +489,7 @@ describe("App 集成", () => {
             kind: "ps1",
             task: "测试任务",
             log: [],
+            mock: false,
             status: "running",
             rounds: 0,
             last_reason: "",
@@ -498,6 +501,7 @@ describe("App 集成", () => {
             kind: "ps1",
             task: "测试任务",
             log: [],
+            mock: false,
             status: "running",
             rounds: 0,
             last_reason: "",
@@ -537,6 +541,7 @@ describe("App 集成", () => {
             kind: "ps1",
             task: "测试任务",
             log: [],
+            mock: false,
             status: "accepted",
             rounds: 1,
             last_reason: "",
@@ -548,6 +553,7 @@ describe("App 集成", () => {
             kind: "ps1",
             task: "测试任务",
             log: [],
+            mock: false,
             status: "accepted",
             rounds: 1,
             last_reason: "",

@@ -793,6 +793,7 @@ function App() {
                           setFocusedTask(taskId);
                           void loadTasks();
                         }}
+                        onContinue={() => void loadTasks()}
                         onDriveStarted={handleDriveStarted}
                         prepareDriveTerminal={async (workDir) => {
                           const id = await terminalRef.current?.startClaudeForTask(workDir);

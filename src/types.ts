@@ -44,6 +44,8 @@ export interface TaskInfo {
   last_reason: string;
   /** 监督日志（每任务限 500 行，持久化） */
   log: string[];
+  /** 模拟模式（续跑「再来一轮」沿用同一审查方式） */
+  mock: boolean;
   started_at_ms: number;
 }
 

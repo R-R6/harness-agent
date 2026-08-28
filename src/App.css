@@ -619,4 +619,38 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .task-detail__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .task-detail__desc { margin: 0; white-space: pre-wrap; color: var(--text); font-size: 12px; line-height: 1.5; font-family: inherit; }
 .task-row__delete:hover { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
-.log-stream--empty { color: var(--text-muted); font-size: 12px; padding: 10px 12px; }
+.log-stream--empty { color: var(--text-muted); font-size: 12px; padding: 10px 12px; }.task-continue {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+}
+.task-continue__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 120ms, color 120ms, background 120ms;
+}
+.task-continue__btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--claude) 55%, var(--border));
+  color: var(--text);
+  background: color-mix(in srgb, var(--claude) 8%, var(--surface));
+}
+.task-continue__btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.task-continue__hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
