@@ -38,6 +38,14 @@ pub struct SuperviseRequest {
     pub terminal_session_id: Option<String>,
 }
 
+/// 「再来一轮」请求：rejected 任务复用原 Claude 会话追加一轮完整闭环
+/// （注入上轮审查意见 → 落地 → Stop hook → codex 审查 → verdict）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuperviseContinueRequest {
+    pub task_id: String,
+    pub work_dir: String,
+}
+
 /// final-report.json 里的单轮审查记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerdictEntry {

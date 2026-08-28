@@ -38,6 +38,8 @@ pub struct EngineOptions {
     /// pane 必须绑定的目录（绑定校验用，注入前逐轮检查）
     pub work_dir: String,
     pub max_rounds: i64,
+    /// 起始轮次偏移（默认 0）：「再来一轮」续跑时从原轮数继续（原 3 轮 → 第 4/4 轮）
+    pub starting_round: i64,
     /// JSONL 静默兜底阈值（默认 180s。实测 Claude 跑长工具/测试时 2 分钟
     /// 不写会话文件是常态，120s 会把还在干活的轮次误判成"已完成"）
     pub silence: Duration,
@@ -67,6 +69,7 @@ impl Default for EngineOptions {
             task: String::new(),
             work_dir: String::new(),
             max_rounds: 3,
+            starting_round: 0,
             silence: Duration::from_secs(180),
             round_timeout: Duration::from_secs(15 * 60),
             poll_interval: Duration::from_millis(500),
@@ -575,7 +578,7 @@ fn run_loop(
     // （大小+mtime，供复读守卫判定"会话无变化"）
     let mut known_transcript: Option<PathBuf> = None;
     let mut last_review_stat: Option<(u64, Option<SystemTime>)> = None;
-    let mut round: i64 = 0;
+    let mut round: i64 = opts.starting_round;
     while round < opts.max_rounds {
         if cancel.load(Ordering::Relaxed) {
             on_log("[ENGINE] 已取消");
@@ -960,6 +963,7 @@ mod tests {
             artifacts_dir: None,
             task_token: None,
             reviewer_label: "mock".into(),
+            starting_round: 0,
         }
     }
 
@@ -1536,6 +1540,96 @@ mod tests {
             .filter(|w| !w.is_empty() && w.as_str() != "\r")
             .count();
         assert_eq!(text_writes, 2, "应注入两次（首+重发）: {writes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「再来一轮」续跑回归：starting_round 使轮次从原轮数继续（原 3 轮 →
+    /// 第 4/4 轮），首轮注入为续跑返工文本，通过后 rounds=4（而非从 1 重数）。
+    #[test]
+    fn continuation_offsets_round_count_from_starting_round() {
+        let dir = tmp_dir("continue");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("session-1.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let marker_file = dir.join("markers.jsonl");
+        std::fs::write(&marker_file, "").unwrap();
+
+        let pane = Arc::new(FakePane {
+            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
+            writes: Mutex::new(vec![]),
+            fail_write: AtomicBool::new(false),
+        });
+        let pane2 = pane.clone();
+        let transcript2 = transcript.clone();
+        let marker2 = marker_file.clone();
+        std::thread::spawn(move || {
+            let mut seen = 0;
+            let start = Instant::now();
+            loop {
+                let writes = pane2.writes.lock().unwrap().len();
+                if writes > seen {
+                    seen = writes;
+                    std::thread::sleep(Duration::from_millis(150));
+                    std::fs::write(
+                        &transcript2,
+                        format!(
+                            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"round {seen}\"}}}}\n"
+                        ),
+                    )
+                    .unwrap();
+                    let marker = serde_json::json!({
+                        "session_id": "s1",
+                        "transcript_path": transcript2.to_string_lossy(),
+                    });
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&marker2)
+                        .unwrap();
+                    writeln!(f, "{marker}").unwrap();
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let reviewer = MockReviewer::always(Ok(Verdict { pass: true, reason: "ok".into() }));
+        let cancel = AtomicBool::new(false);
+        let all_logs = Arc::new(Mutex::new(vec![]));
+        let logs2 = all_logs.clone();
+        let on_log: OnLog = Arc::new(move |l: &str| logs2.lock().unwrap().push(l.to_string()));
+        let src = MarkerSource::new(marker_file);
+        let mut opts = quick_opts(&dir, 4); // max_rounds = 原 3 + 续 1
+        opts.starting_round = 3; // 原 3 轮后「再来一轮」
+        opts.task = "上一轮审查未通过，请按要求返工：xxx".into();
+
+        let outcome = run(
+            &opts,
+            pane.clone(),
+            Arc::new(reviewer),
+            &src,
+            &projects_root,
+            &cancel,
+            &on_log,
+        );
+
+        assert_eq!(outcome.status, EngineStatus::Accepted);
+        assert_eq!(outcome.rounds, 4, "续跑轮次应从 3 继续到 4: {outcome:?}");
+        assert!(
+            all_logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("第 4/4 轮已注入")),
+            "日志应显示第 4/4 轮: {:?}",
+            all_logs.lock().unwrap()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -4,7 +4,7 @@ use supervise_engine::{
     hook::{ensure_stop_hook, remove_stop_hook}, CodexReviewer, EngineOptions, MarkerSource,
     MockReviewer, PaneIo, Reviewer, Verdict,
 };
-use supervise_runner::{ReviewArtifact, SuperviseRequest};
+use supervise_runner::{ReviewArtifact, SuperviseContinueRequest, SuperviseRequest};
 use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command, wait as wait_terminal_process, write_input as write_terminal_input};
 
 use std::collections::{HashMap, HashSet};
@@ -49,6 +49,9 @@ struct TaskInfo {
     rounds: i64,
     last_reason: String,
     log: Vec<String>,
+    /// 模拟模式（续跑「再来一轮」沿用同一审查方式）
+    #[serde(default)]
+    mock: bool,
     started_at_ms: u64,
 }
 
@@ -521,6 +524,7 @@ async fn run_supervise(
         rounds: 0,
         last_reason: String::new(),
         log: Vec::new(),
+        mock: request.mock,
         started_at_ms: now_ms(),
     });
     persist_tasks(&app);
@@ -776,6 +780,7 @@ async fn run_supervise_terminal(
         rounds: 0,
         last_reason: String::new(),
         log: Vec::new(),
+        mock: request.mock,
         started_at_ms: started_at,
     });
     persist_tasks(&app);
@@ -802,10 +807,42 @@ async fn run_supervise_terminal(
     } else {
         Arc::new(CodexReviewer::new(model, &request.task))    };
 
+    spawn_engine_thread(
+        &app,
+        task_id.clone(),
+        session_id,
+        home,
+        hook_installed,
+        settings,
+        marker_file,
+        opts,
+        reviewer,
+        cancel,
+    );
+
+    Ok(task_id)
+}
+
+/// 引擎线程通用接线：标记源、pane 适配器、日志追加（emit + TaskInfo.log）、
+/// panic 兜底、收尾清理（engine_cancels/busy/hook 引用）、终态写回、done 事件。
+/// run_supervise_terminal 与 continue_supervise_terminal（「再来一轮」）共用。
+#[allow(clippy::too_many_arguments)]
+fn spawn_engine_thread(
+    app: &AppHandle,
+    task_id: String,
+    session_id: String,
+    home: String,
+    hook_installed: bool,
+    settings: std::path::PathBuf,
+    marker_file: std::path::PathBuf,
+    opts: supervise_engine::EngineOptions,
+    reviewer: Arc<dyn supervise_engine::Reviewer>,
+    cancel: Arc<AtomicBool>,
+) {
     let app2 = app.clone();
-    let task_id2 = task_id.clone();
+    let task_id2 = task_id;
     let session_id2 = session_id.clone();
-    let settings2 = settings.clone();
+    let settings2 = settings;
     let marker_file2 = marker_file.clone();
     std::thread::spawn(move || {
         let markers = MarkerSource::new(marker_file);
@@ -903,8 +940,164 @@ async fn run_supervise_terminal(
             serde_json::json!({ "taskId": task_id2, "exitCode": code, "reason": outcome.last_reason }),
         );
     });
+}
 
-    Ok(task_id)
+/// 「再来一轮」：rejected 任务复用原 Claude 会话追加一轮完整闭环。
+/// 注入上轮审查意见 → Claude 同会话落地 → Stop hook → codex 审查 → verdict。
+/// 复用原 artifacts/marker/令牌，轮次从原 rounds 继续（第 N+1 轮）。
+#[tauri::command]
+async fn continue_supervise_terminal(
+    app: AppHandle,
+    state: State<'_, SuperviseState>,
+    request: SuperviseContinueRequest,
+) -> Result<String, String> {
+    // 1) 校验：任务存在、engine 类型、rejected 终态、有上轮审查意见
+    let (task, work_dir, last_reason, started_at, mock) = {
+        let tasks = state.tasks.lock().map_err(|_| "任务状态锁已损坏".to_string())?;
+        let t = tasks
+            .get(&request.task_id)
+            .ok_or_else(|| format!("任务不存在: {}", request.task_id))?;
+        if t.kind != TaskKind::Engine {
+            return Err("仅驱动 Claude 终端的任务支持「再来一轮」".into());
+        }
+        if t.status != TaskStatus::Rejected {
+            return Err("任务当前不是「未通过」状态，无法再来一轮".into());
+        }
+        (
+            t.clone(),
+            t.work_dir.clone(),
+            t.last_reason.clone(),
+            t.started_at_ms,
+            t.mock,
+        )
+    };
+    if last_reason.trim().is_empty() {
+        return Err("任务没有上轮审查意见，无法再来一轮".into());
+    }
+    let work_dir = normalize_path(&work_dir);
+    if work_dir.is_empty() || !std::path::Path::new(&work_dir).is_dir() {
+        return Err(format!("工作目录不存在: {work_dir}"));
+    }
+
+    // 2) 复用原 Claude pane：FAIL 后引擎已释放占用，按目录直接命中空闲 pane
+    let session_id = {
+        let term = app.state::<TerminalState>();
+        let sessions = term.sessions.lock().map_err(|_| "终端状态锁已损坏")?;
+        let mut busy = state.engine_busy_sessions.lock().unwrap();
+        let id = sessions
+            .iter()
+            .find(|(id, p)| {
+                p.agent == "claude"
+                    && normalize_path(&p.work_dir) == work_dir
+                    && engine_session_available(&busy, id)
+            })
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| {
+                "未找到原 Claude 终端（可能已被关闭）。请重开 Claude 后手动处理最后意见。"
+                    .to_string()
+            })?;
+        busy.insert(id.clone());
+        id
+    };
+
+    // 3) 复用产物/marker 目录（与原始任务同路径）
+    let supervise_dir = std::path::Path::new(&work_dir).join(".supervise");
+    let artifacts_dir = supervise_dir.join("tasks").join(&request.task_id);
+    if let Err(e) = std::fs::create_dir_all(&artifacts_dir) {
+        release_engine_session(&state, &session_id);
+        return Err(format!("创建任务产物目录失败: {e}"));
+    }
+    let marker_file = supervise_dir.join("stop-markers.jsonl");
+    if let Err(e) = std::fs::create_dir_all(&supervise_dir) {
+        release_engine_session(&state, &session_id);
+        return Err(format!("创建 .supervise 失败: {e}"));
+    }
+
+    // 4) Stop hook 重装（真实模式；原任务 FAIL 后已卸载）
+    let home = match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        Ok(h) => h,
+        Err(_) => {
+            release_engine_session(&state, &session_id);
+            return Err("无法定位用户主目录（USERPROFILE/HOME 均缺失）".into());
+        }
+    };
+    let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
+    let hook_installed = !mock;
+    if hook_installed {
+        if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
+            release_engine_session(&state, &session_id);
+            return Err(format!("安装 Stop hook 失败（可重试）: {e}"));
+        }
+        *state.engine_hook_refs.lock().unwrap() += 1;
+    }
+
+    // 5) 状态 → running，追加续跑日志
+    let extra = 1i64;
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .engine_cancels
+        .lock()
+        .unwrap()
+        .insert(request.task_id.clone(), cancel.clone());
+    {
+        let mut tasks = state.tasks.lock().unwrap();
+        if let Some(t) = tasks.get_mut(&request.task_id) {
+            t.status = TaskStatus::Running;
+        }
+    }
+    persist_tasks(&app);
+    {
+        let line = format!(
+            "[ENGINE] 监督引擎续跑：再来 {extra} 轮（第 {} 轮起），复用原 Claude 会话…",
+            task.rounds + 1
+        );
+        if let Ok(mut tasks) = state.tasks.lock() {
+            if let Some(t) = tasks.get_mut(&request.task_id) {
+                if t.log.len() < TASK_LOG_MAX_LINES {
+                    t.log.push(line);
+                }
+            }
+        }
+        persist_tasks(&app);
+    }
+
+    // 6) opts + reviewer（沿用原令牌/审查方式；首轮注入 = 上轮审查意见）
+    let rework_text = format!("上一轮审查未通过，请按要求返工：{last_reason}");
+    let opts = supervise_engine::EngineOptions {
+        task: rework_text.clone(),
+        work_dir: work_dir.clone(),
+        max_rounds: task.rounds + extra,
+        starting_round: task.rounds,
+        artifacts_dir: Some(artifacts_dir),
+        task_token: Some(format!("{}:{started_at}", request.task_id)),
+        reviewer_label: if mock { "mock".into() } else { "codex 默认模型".into() },
+        ..Default::default()
+    };
+    let reviewer: Arc<dyn supervise_engine::Reviewer> = if mock {
+        Arc::new(supervise_engine::MockReviewer::always(Ok(
+            supervise_engine::Verdict {
+                pass: true,
+                reason: "（模拟）续跑验收通过".into(),
+            },
+        )))
+    } else {
+        Arc::new(supervise_engine::CodexReviewer::new(None, &rework_text))
+    };
+
+    // 7) 启动引擎线程（与首发共用接线）
+    spawn_engine_thread(
+        &app,
+        request.task_id.clone(),
+        session_id,
+        home,
+        hook_installed,
+        settings,
+        marker_file,
+        opts,
+        reviewer,
+        cancel,
+    );
+    Ok(request.task_id)
 }
 
 /// 读取监督闭环产物（.supervise 目录；无头任务可指定 task_id 读子目录）
@@ -1046,6 +1239,7 @@ pub fn run() {
             run_supervise,
             cancel_supervise,
             run_supervise_terminal,
+            continue_supervise_terminal,
             read_review_artifacts,
             list_supervise_tasks,
             delete_supervise_task,
@@ -1111,6 +1305,7 @@ mod tests {
             rounds: 0,
             last_reason: String::new(),
             log: vec!["line1".into(), "line2".into()],
+            mock: true,
             started_at_ms: now_ms(),
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -1118,6 +1313,7 @@ mod tests {
         assert_eq!(json["status"], "running");
         assert_eq!(json["task"], "写一个计算器");
         assert_eq!(json["log"], serde_json::json!(["line1", "line2"]));
+        assert_eq!(json["mock"], true);
 
         // 持久化依赖反序列化：round-trip 后字段保持一致
         let restored: TaskInfo = serde_json::from_value(json).unwrap();
