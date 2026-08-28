@@ -578,6 +578,26 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .supervise-tasks { padding: 12px 20px 0; border-bottom: 1px solid var(--border); }
 .supervise-tasks__head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .supervise-tasks__head h4 { margin: 0; font-size: 13px; font-weight: 650; }
+.supervise-tasks__new {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 120ms, color 120ms, background 120ms;
+}
+.supervise-tasks__new:hover {
+  border-color: color-mix(in srgb, var(--claude) 55%, var(--border));
+  color: var(--text);
+  background: color-mix(in srgb, var(--claude) 8%, var(--surface));
+}
 .task-list { list-style: none; margin: 0; padding: 0 0 8px; max-height: 200px; overflow: auto; }
 .task-list--empty { padding: 14px 0; color: var(--text-faint); font-size: 12px; }
 .task-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-sm); cursor: pointer; }

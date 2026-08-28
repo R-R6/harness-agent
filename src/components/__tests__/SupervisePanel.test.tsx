@@ -37,7 +37,6 @@ function renderPanel(
     onDriveStarted?: () => void;
     prepareDriveTerminal?: (workDir: string) => Promise<string>;
     focusedTask?: TaskInfo | null;
-    onNewTask?: () => void;
   } = {},
 ) {
   const onStarted = vi.fn();
@@ -54,7 +53,6 @@ function renderPanel(
         onWorkDirChange={handleDirChange}
         onStarted={onStarted}
         focusedTask={extra.focusedTask}
-        onNewTask={extra.onNewTask}
         onDriveStarted={extra.onDriveStarted}
         prepareDriveTerminal={extra.prepareDriveTerminal}
       />
@@ -181,14 +179,6 @@ describe("SupervisePanel", () => {
     expect(screen.getByText("写个爬虫")).toBeInTheDocument();
     expect(screen.getByText("[PASS] 验收通过")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "启动监督闭环" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "新建任务" })).toBeInTheDocument();
-  });
-
-  it("查看态：点击新建任务 → 回调 onNewTask", async () => {
-    const onNewTask = vi.fn();
-    renderPanel("D:\\work", { focusedTask: makeTask(), onNewTask });
-    await userEvent.click(screen.getByRole("button", { name: "新建任务" }));
-    expect(onNewTask).toHaveBeenCalledTimes(1);
   });
 
   it("启动请求进行中时禁用启动按钮，防止连点", async () => {

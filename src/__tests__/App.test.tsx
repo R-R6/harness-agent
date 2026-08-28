@@ -322,6 +322,36 @@ describe("App 集成", () => {
     expect(screen.queryByTitle("打开资源管理器选择目录")).not.toBeInTheDocument();
   });
 
+  it("任务记录头部常驻「新建任务」按钮；点击回到可编辑表单", async () => {
+    const wsA = { id: "ws-a", path: "D:\\space-alpha", name: "space-alpha", position: 0, createdAt: 1 };
+    localStorage.setItem("ha-workspaces", JSON.stringify([wsA]));
+    localStorage.setItem("ha-active-workspace", "ws-a");
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_sessions") return Promise.resolve(sessions);
+      if (cmd === "read_review_artifacts") return Promise.resolve([]);
+      if (cmd === "list_supervise_tasks") {
+        return Promise.resolve([
+          { id: "task-1", work_dir: "D:\\space-alpha", task: "写计算器", kind: "ps1", status: "accepted", rounds: 1, last_reason: "", log: [], started_at_ms: 1 },
+        ]);
+      }
+      return Promise.resolve(null);
+    });
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    // 等任务加载完成（首次进入默认查看最新任务 → 详情态出现任务描述）
+    await screen.findByText("写计算器");
+
+    // 头部「新建任务」按钮常驻（任务记录标题行右侧）
+    const newTaskBtn = screen.getByRole("button", { name: "新建任务" });
+    expect(newTaskBtn).toBeInTheDocument();
+    // 查看态：无启动表单
+    expect(screen.queryByRole("button", { name: "启动监督闭环" })).not.toBeInTheDocument();
+    // 点「新建任务」→ 回到可编辑表单
+    await userEvent.click(newTaskBtn);
+    expect(screen.getByRole("button", { name: "启动监督闭环" })).toBeInTheDocument();
+  });
+
   it("添加工作空间需信任确认；确认后创建空间并持久化", async () => {
     render(<App />);
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
@@ -395,6 +425,8 @@ describe("App 集成", () => {
             id: "task-a",
             work_dir: "D:\\space-alpha",
             kind: "ps1",
+            task: "测试任务",
+            log: [],
             status: "accepted",
             rounds: 1,
             last_reason: "",
@@ -404,6 +436,8 @@ describe("App 集成", () => {
             id: "task-b",
             work_dir: "D:\\space-beta",
             kind: "ps1",
+            task: "测试任务",
+            log: [],
             status: "running",
             rounds: 0,
             last_reason: "",
@@ -451,6 +485,8 @@ describe("App 集成", () => {
             id: "task-1",
             work_dir: "D:\\space-alpha",
             kind: "ps1",
+            task: "测试任务",
+            log: [],
             status: "running",
             rounds: 0,
             last_reason: "",
@@ -460,6 +496,8 @@ describe("App 集成", () => {
             id: "task-2",
             work_dir: "D:\\space-alpha",
             kind: "ps1",
+            task: "测试任务",
+            log: [],
             status: "running",
             rounds: 0,
             last_reason: "",
@@ -497,6 +535,8 @@ describe("App 集成", () => {
             id: "task-a",
             work_dir: "D:\\projA\\app",
             kind: "ps1",
+            task: "测试任务",
+            log: [],
             status: "accepted",
             rounds: 1,
             last_reason: "",
@@ -506,6 +546,8 @@ describe("App 集成", () => {
             id: "task-b",
             work_dir: "D:\\projB\\app",
             kind: "ps1",
+            task: "测试任务",
+            log: [],
             status: "accepted",
             rounds: 1,
             last_reason: "",

@@ -12,8 +12,6 @@ interface Props {
   readOnly?: boolean;
   /** 焦点任务：非空进入查看态（只读描述 + 日志），空则编辑态（表单） */
   focusedTask?: TaskInfo | null;
-  /** 新建任务：清空焦点回到编辑态 */
-  onNewTask?: () => void;
   /** 启动成功后回调（携带 task_id） */
   onStarted: (taskId: string) => void;
   /** 终端驱动模式启动成功后回调（App 切到终端 tab） */
@@ -36,7 +34,6 @@ export function SupervisePanel({
   onWorkDirChange,
   readOnly = false,
   focusedTask,
-  onNewTask,
   onStarted,
   onDriveStarted,
   prepareDriveTerminal,
@@ -112,9 +109,6 @@ export function SupervisePanel({
             <span className={`task-badge task-badge--${focusedTask.status}`}>
               {TASK_STATUS_LABEL[focusedTask.status]}
             </span>
-            <button type="button" className="link-button" onClick={onNewTask}>
-              新建任务
-            </button>
           </div>
           <pre className="task-detail__desc">{focusedTask.task}</pre>
         </div>

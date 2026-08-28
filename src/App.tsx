@@ -118,7 +118,14 @@ function App() {
   const [focusByWorkspace, setFocusByWorkspace] = useState<Record<string, string | null>>({});
   const focusEntry = activeWorkspace ? focusByWorkspace[activeWorkspace.id] : undefined;
   const focusedTaskId = typeof focusEntry === "string" ? focusEntry : null;
-  const focusedTask = activeTasks.find((t) => t.id === focusedTaskId) ?? null;
+  // 首次进入（focusEntry undefined）默认聚焦最新任务：与列表高亮/审查看板一致；
+  // 显式新建（focusEntry null）才显示表单
+  const focusedTask = useMemo(() => {
+    if (focusEntry === null) return null; // 显式编辑态（新建任务）
+    if (focusedTaskId) return activeTasks.find((t) => t.id === focusedTaskId) ?? null;
+    if (activeTasks.length === 0) return null;
+    return [...activeTasks].sort((a, b) => b.started_at_ms - a.started_at_ms)[0];
+  }, [activeTasks, focusEntry, focusedTaskId]);
   const focusedTaskIdEffective = useMemo(() => {
     if (focusEntry === null) return null; // 显式编辑态（新建任务）
     if (focusedTaskId && activeTasks.some((t) => t.id === focusedTaskId)) return focusedTaskId;
@@ -752,6 +759,14 @@ function App() {
                       <span className="eyebrow">ACTIVE</span>
                       <h4>任务记录</h4>
                       <span className="count-pill">{activeTasks.length}</span>
+                      <button
+                        type="button"
+                        className="supervise-tasks__new"
+                        onClick={handleNewTask}
+                        title="新建监督任务"
+                      >
+                        <Icon name="plus" size={14} /> 新建任务
+                      </button>
                     </div>
                     <TaskList
                       tasks={activeTasks}
@@ -774,7 +789,6 @@ function App() {
                         onWorkDirChange={handleWorkDirChange}
                         readOnly
                         focusedTask={focusedTask}
-                        onNewTask={handleNewTask}
                         onStarted={(taskId) => {
                           setFocusedTask(taskId);
                           void loadTasks();
