@@ -47,6 +47,10 @@ pub struct EngineOptions {
     /// 注入送达确认窗口（默认 15s）：注入后在会话文件里等它变成新的用户行，
     /// 超时则重发一次（真实事故：空闲/away 的 TUI 吞掉注入文本，工人整轮空转）
     pub delivery_confirm: Duration,
+    /// 首轮额外确认窗口（默认 30s）：Claude Code 冷启动（加载原生程序+连 API）
+    /// 在输入就绪前可达十几秒，单发 \r 会被吞、正文停在输入栏；首轮确认用
+    /// delivery_confirm + 本字段，期间每 2s 补回车，覆盖启动期。
+    pub first_inject_confirm: Duration,
     /// 产物目录（.supervise/tasks/<id> 或测试目录）：逐轮 review-N.md + final-report.json。
     /// None 则不落盘（纯测试用）。只清 review-*.md/final-report.json，不整目录删。
     pub artifacts_dir: Option<PathBuf>,
@@ -67,6 +71,7 @@ impl Default for EngineOptions {
             round_timeout: Duration::from_secs(15 * 60),
             poll_interval: Duration::from_millis(500),
             delivery_confirm: Duration::from_secs(15),
+            first_inject_confirm: Duration::from_secs(30),
             artifacts_dir: None,
             task_token: None,
             reviewer_label: String::new(),
@@ -174,15 +179,31 @@ fn count_user_inputs(path: &Path) -> Option<usize> {
 }
 
 /// 等 path 的用户行计数超过 before（截止 deadline 前轮询）
-fn wait_user_input_grown(path: &Path, before: usize, deadline: Instant, poll: Duration) -> bool {
-    let grown = || count_user_inputs(path).is_some_and(|n| n > before);
+/// 注入提交器：等待 confirm() 为 true，期间每 2s 补一个回车，把暂留在 Claude 输入栏
+/// 的正文提交。Claude TUI 未就绪/渲染中会吞掉单次 \r（真实事故：正文停在输入栏等
+/// 手动回车；重写正文又造成「任务两遍」）——窗口内只补回车、不重写正文，故不会两遍。
+fn confirm_inject<F: FnMut() -> bool>(
+    mut confirm: F,
+    pane: &Arc<dyn PaneIo>,
+    deadline: Instant,
+    poll: Duration,
+    cancel: Option<&AtomicBool>,
+) -> bool {
+    let mut last_enter = Instant::now();
     while Instant::now() < deadline {
-        if grown() {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return false;
+        }
+        if confirm() {
             return true;
+        }
+        if last_enter.elapsed() >= Duration::from_millis(2000) {
+            let _ = pane.write("\r");
+            last_enter = Instant::now();
         }
         std::thread::sleep(poll);
     }
-    grown()
+    !cancel.is_some_and(|c| c.load(Ordering::Relaxed)) && confirm()
 }
 
 fn read_lines(path: &Path) -> Vec<String> {    match std::fs::read(path) {
@@ -609,14 +630,13 @@ fn run_loop(
             )
         };
         first_inject = false;
-        // 唤醒回车 → 正文 → 稍候 → 独立提交回车。正文与提交键分开发送，避免
-        // 粘贴块吞掉 \r；唤醒等待加长覆盖 Claude Code 启动期（1-3s）未就绪吞键。
+        // 唤醒回车 + 正文（不写提交键）：提交由 confirm_inject 的「每 2s 补回车」完成。
+        // 单发 \r 会被 TUI 吞掉、正文停在输入栏等手动回车；若重写正文又造成「两遍」
+        //（真实证据：任务文字被提交两次）。唤醒回车仅让 away/未就绪的 TUI 进入可输入态。
         let send_inject = |pane: &Arc<dyn PaneIo>| -> Result<(), String> {
             let _ = pane.write("\r"); // 唤醒：Claude 空闲/未就绪时可能吞掉直接输入的文本
             std::thread::sleep(Duration::from_millis(800));
-            pane.write(&inject)?;
-            std::thread::sleep(Duration::from_millis(400)); // 等正文渲染稳定
-            pane.write("\r") // 提交键独立发送
+            pane.write(&inject)
         };
         if let Err(e) = send_inject(&pane) {
             let msg = format!("注入失败：{e}");
@@ -634,12 +654,27 @@ fn run_loop(
             known_transcript.as_deref(),
             known_transcript.as_deref().and_then(count_user_inputs),
         ) {
-            let deadline = Instant::now() + opts.delivery_confirm;
-            if !wait_user_input_grown(path, before, deadline, opts.poll_interval) {
+            let path = path.to_path_buf();
+            let mut confirmed = confirm_inject(
+                || count_user_inputs(&path).is_some_and(|n| n > before),
+                &pane,
+                Instant::now() + opts.delivery_confirm,
+                opts.poll_interval,
+                None,
+            );
+            if !confirmed {
                 on_log("[ENGINE] 注入未在会话中确认，重发一次…");
-                let _ = send_inject(&pane);
-                let deadline = Instant::now() + opts.delivery_confirm;
-                if !wait_user_input_grown(path, before, deadline, opts.poll_interval) {
+                if let Err(e) = send_inject(&pane) {
+                    on_log(&format!("[ENGINE] 重发注入失败：{e}"));
+                }
+                confirmed = confirm_inject(
+                    || count_user_inputs(&path).is_some_and(|n| n > before),
+                    &pane,
+                    Instant::now() + opts.delivery_confirm,
+                    opts.poll_interval,
+                    None,
+                );
+                if !confirmed {
                     on_log("[ENGINE] 警告：注入疑似被终端空闲状态吞掉，工人本轮可能空转");
                 }
             }
@@ -649,32 +684,40 @@ fn run_loop(
             opts.max_rounds
         ));
 
-        // 首轮：用注入令牌在会话文件中预钉 Claude session，避免多引擎抢同一 Stop。
-        // 注入可能落在 TUI 未就绪窗口导致令牌没落盘（需手动回车才执行的真实反馈）：
-        // 确认窗口内没找到令牌就重发一次注入（首轮送达确认），仍找不到才中止——
-        // 不直接误中止、也不会钉到陈旧会话。
+        // 首轮：用注入令牌预钉 Claude session（避免多引擎抢同一 Stop）。
+        // 提交由 confirm_inject 补回车完成；窗口 = delivery_confirm + first_inject_confirm
+        //（覆盖 Claude 冷启动十几秒）。窗口内未确认 = 正文被吞（输入栏空）→ 重写正文
+        // 再等一个窗口。窗口内只补回车不重写，故不会「任务两遍」。
         if session_pin.is_none() {
             if let Some(tok) = opts.task_token.as_deref().filter(|s| !s.is_empty()) {
                 let token = format!("[supervise-task:{tok}]");
+                let window = opts.delivery_confirm + opts.first_inject_confirm;
                 for attempt in 0..2 {
-                    let deadline = Instant::now() + opts.delivery_confirm;
-                    while Instant::now() < deadline && session_pin.is_none() {
-                        if cancel.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if let Some(path) = find_session_containing(projects_root, &slug, &token) {
-                            if let Some(sid) = session_id_of_transcript(&path) {
-                                on_log(&format!("[ENGINE] 已预钉 Claude 会话 {sid}"));
-                                session_pin = Some(sid);
-                                known_transcript = Some(path);
+                    let pinned = confirm_inject(
+                        || {
+                            if let Some(path) = find_session_containing(projects_root, &slug, &token) {
+                                if let Some(sid) = session_id_of_transcript(&path) {
+                                    on_log(&format!("[ENGINE] 已预钉 Claude 会话 {sid}"));
+                                    session_pin = Some(sid);
+                                    known_transcript = Some(path);
+                                }
                             }
-                        }
-                        if session_pin.is_none() {
-                            std::thread::sleep(opts.poll_interval);
-                        }
-                    }
-                    if session_pin.is_some() {
+                            session_pin.is_some()
+                        },
+                        &pane,
+                        Instant::now() + window,
+                        opts.poll_interval,
+                        Some(cancel),
+                    );
+                    if pinned {
                         break;
+                    }
+                    if cancel.load(Ordering::Relaxed) {
+                        return EngineOutcome {
+                            status: EngineStatus::Cancelled,
+                            rounds: round - 1,
+                            last_reason,
+                        };
                     }
                     if attempt == 0 {
                         on_log("[ENGINE] 令牌未落盘，重发首轮注入…");
@@ -913,6 +956,7 @@ mod tests {
             round_timeout: Duration::from_secs(20),
             poll_interval: Duration::from_millis(30),
             delivery_confirm: Duration::from_millis(200),
+            first_inject_confirm: Duration::from_millis(0),
             artifacts_dir: None,
             task_token: None,
             reviewer_label: "mock".into(),
