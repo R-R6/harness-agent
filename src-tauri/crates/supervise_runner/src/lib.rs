@@ -34,6 +34,9 @@ pub struct SuperviseRequest {
     /// 模拟模式（不真调 claude/codex）
     #[serde(default)]
     pub mock: bool,
+    /// 监督方（审查者）Agent id（agent_registry；缺省 codex）
+    #[serde(default)]
+    pub reviewer_agent: Option<String>,
     /// 终端驱动：绑定的 Claude PTY session id（一任务一进程）
     #[serde(default)]
     pub terminal_session_id: Option<String>,
@@ -591,6 +594,7 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            reviewer_agent: None,
             terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, None).expect("spawn 成功");
@@ -648,6 +652,7 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            reviewer_agent: None,
             terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, None).expect("spawn 成功");
@@ -789,6 +794,7 @@ mod tests {
             max_rounds: None,
             model: None,
             mock: true,
+            reviewer_agent: None,
             terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, Some("task-9")).expect("spawn");

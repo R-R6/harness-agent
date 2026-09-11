@@ -18,6 +18,11 @@ pub mod review;
 
 pub use review::{CodexReviewer, MockReviewer, Reviewer, Verdict};
 
+/// 注册表查询转发（审查命令构造需要 profile 声明）
+pub fn agent_profile(id: &str) -> Option<agent_registry::AgentProfile> {
+    agent_registry::get(id).copied()
+}
+
 // ---------------- 引擎契约 ----------------
 
 /// 终端 pane 的 IO 通道（lib.rs 用 TerminalState 的 PTY writer 实现）

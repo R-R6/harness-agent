@@ -57,6 +57,9 @@ struct TaskInfo {
     /// 模拟模式（续跑「再来一轮」沿用同一审查方式）
     #[serde(default)]
     mock: bool,
+    /// 监督方 Agent id（多 Agent 监督；缺省 codex，续跑沿用）
+    #[serde(default)]
+    reviewer_agent: Option<String>,
     started_at_ms: u64,
 }
 
@@ -660,6 +663,7 @@ async fn run_supervise(
         last_reason: String::new(),
         log: Vec::new(),
         mock: request.mock,
+        reviewer_agent: None,
         started_at_ms: now_ms(),
     });
     persist_tasks(&app);
@@ -833,6 +837,20 @@ async fn run_supervise_terminal(
     // 启动前预检 Claude CLI 端点可用（403/未登录等在此拦下，不烧任务轮次）
     supervise_runner::preflight_claude(&work_dir)?;
 
+    // 监督方（审查者）按注册表解析：默认 codex（兼容旧前端）。
+    // 先校验（不占 pane）；构造推迟到任务登记处以复用 model 解析结果。
+    let reviewer_agent = request
+        .reviewer_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("codex");
+    let reviewer_profile = agent_registry::get(reviewer_agent)
+        .ok_or_else(|| format!("未注册的监督方 Agent: {reviewer_agent}"))?;
+    if !reviewer_profile.can_review {
+        return Err(format!("{} 不支持作为监督方（无 headless 模式）", reviewer_profile.name));
+    }
+
     // 一任务一 Claude PTY：优先用请求里的 terminal_session_id；否则取该目录
     // 上尚未被引擎占用的 Claude pane（兼容旧前端）。解析与占用同一把锁，防竞态。
     let session_id = {
@@ -936,6 +954,7 @@ async fn run_supervise_terminal(
         last_reason: String::new(),
         log: Vec::new(),
         mock: request.mock,
+        reviewer_agent: Some(reviewer_agent.to_string()),
         started_at_ms: started_at,
     });
     persist_tasks(&app);
@@ -949,7 +968,7 @@ async fn run_supervise_terminal(
         reviewer_label: match (request.mock, model) {
             (true, _) => "mock".to_string(),
             (false, Some(m)) => m.to_string(),
-            (false, None) => "codex 默认模型".to_string(),
+            (false, None) => format!("{} 默认模型", reviewer_profile.name),
         },
         ..Default::default()
     };
@@ -960,7 +979,12 @@ async fn run_supervise_terminal(
             Ok(Verdict { pass: true, reason: "（模拟）校验已补齐，验收通过。".into() }),
         ]))
     } else {
-        Arc::new(CodexReviewer::new(model, &request.task))    };
+        Arc::new(supervise_engine::CodexReviewer::for_agent(
+            reviewer_agent,
+            model,
+            &request.task,
+        )?)
+    };
 
     spawn_engine_thread(
         &app,
@@ -1126,7 +1150,7 @@ async fn continue_supervise_terminal(
     request: SuperviseContinueRequest,
 ) -> Result<String, String> {
     // 1) 校验：任务存在、engine 类型、可续跑终态（未通过=返工；中止/取消=重启）
-    let (task, work_dir, last_reason, started_at, mock, is_rework) = {
+    let (task, work_dir, last_reason, started_at, mock, is_rework, reviewer_agent) = {
         let tasks = state.tasks.lock().map_err(|_| "任务状态锁已损坏".to_string())?;
         let t = tasks
             .get(&request.task_id)
@@ -1142,6 +1166,7 @@ async fn continue_supervise_terminal(
             t.started_at_ms,
             t.mock,
             is_rework,
+            t.reviewer_agent.clone().unwrap_or_else(|| "codex".to_string()),
         )
     };
     let work_dir = normalize_path(&work_dir);
@@ -1258,7 +1283,7 @@ async fn continue_supervise_terminal(
             },
         )))
     } else {
-        Arc::new(supervise_engine::CodexReviewer::new(None, &rework_text))
+        Arc::new(supervise_engine::CodexReviewer::for_agent(&reviewer_agent, None, &rework_text)?)
     };
 
     // 7) 启动引擎线程（与首发共用接线）
@@ -1484,6 +1509,7 @@ mod tests {
             last_reason: String::new(),
             log: vec!["line1".into(), "line2".into()],
             mock: true,
+            reviewer_agent: Some("codex".into()),
             started_at_ms: now_ms(),
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -1492,6 +1518,7 @@ mod tests {
         assert_eq!(json["task"], "写一个计算器");
         assert_eq!(json["log"], serde_json::json!(["line1", "line2"]));
         assert_eq!(json["mock"], true);
+        assert_eq!(json["reviewer_agent"], "codex");
 
         // 持久化依赖反序列化：round-trip 后字段保持一致
         let restored: TaskInfo = serde_json::from_value(json).unwrap();
@@ -1521,6 +1548,7 @@ mod tests {
             last_reason: String::new(),
             log: vec![],
             mock: false,
+            reviewer_agent: None,
             started_at_ms: 1,
         }
     }

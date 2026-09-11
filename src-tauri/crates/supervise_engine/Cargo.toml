@@ -8,6 +8,7 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 path_util = { path = "../path_util" }
+agent_registry = { path = "../agent_registry" }
 
 [dev-dependencies]
 # 契约测试：引擎产物必须能被审查看板的数据链（read_artifacts）解析

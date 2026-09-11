@@ -20,10 +20,13 @@ pub trait Reviewer: Send + Sync {
     fn review(&self, transcript: &Path, round: i64, cancel: &AtomicBool) -> Result<Verdict, String>;
 }
 
-// ---------------- codex exec 审查（移植自 supervise.ps1 Invoke-CodexReview） ----------------
+// ---------------- CLI headless 审查（多 Agent：codex exec / claude -p / gemini -p / ...） ----------------
 
 pub struct CodexReviewer {
-    /// 审查模型。None = 不传 -m，用 codex 自己配置的默认模型——硬编码模型名
+    /// 审查 Agent（agent_registry id）。名字保留 CodexReviewer 以减少波次改动，
+    /// 实际支持任意 can_review 的注册表 Agent（for_agent 构造）。
+    pub agent: &'static str,
+    /// 审查模型。None = 不传 -m，用 CLI 自己配置的默认模型——硬编码模型名
     /// 在中转服务/账号分组变更时会 404（真实事故：gpt-5.6-luna 不被支持）
     pub model: Option<String>,
     pub task: String,
@@ -31,34 +34,60 @@ pub struct CodexReviewer {
     pub retry_wait_secs: u64,
 }
 
+impl std::fmt::Debug for CodexReviewer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexReviewer")
+            .field("agent", &self.agent)
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
 impl CodexReviewer {
     pub fn new(model: Option<&str>, task: &str) -> Self {
-        Self {
+        Self::for_agent("codex", model, task).expect("codex 在注册表且可审查")
+    }
+
+    /// 按注册表 Agent 构造审查器。codex 保留专属 bypass 旗标（历史行为），
+    /// 其余走 profile.review_args 通用模板。
+    pub fn for_agent(agent_id: &str, model: Option<&str>, task: &str) -> Result<Self, String> {
+        let profile = crate::agent_profile(agent_id)
+            .ok_or_else(|| format!("未注册的 Agent: {agent_id}"))?;
+        if !profile.can_review {
+            return Err(format!("{} 不支持作为监督方（无 headless 模式）", profile.name));
+        }
+        Ok(Self {
+            agent: profile.id,
             model: model.filter(|m| !m.trim().is_empty()).map(String::from),
             task: task.to_string(),
             retries: 5,
             retry_wait_secs: 8,
-        }
+        })
     }
 
     fn prompt(&self, transcript: &Path) -> String {
-        // codex exec 有文件系统访问（bypass 模式），直接读会话文件，不依赖 MCP
+        // codex exec 有文件系统访问（bypass 模式），直接读会话文件，不依赖 MCP；
+        // 其余 CLI 的 headless 同样具备工作区读权限。措辞工人无关。
         format!(
             "你是监督者。读取会话文件 {}，审查任务「{}」的完成情况：1) 任务完成度 \
              2) 方案合理性 3) 风险/遗漏。最后一行必须输出 [VERDICT] PASS 或 \
-             [VERDICT] REVIEW + 一句 Claude 能直接执行的返工指令。",
+             [VERDICT] REVIEW + 一句工人 CLI 能直接执行的返工指令。",
             transcript.display(),
             self.task
         )
     }
 }
 
-/// 构造 codex exec 命令行。Windows 上 npm 安装的 codex 是 .cmd 垫片，裸名
-/// spawn 找不到（CreateProcessW 不解析 PATHEXT，只会找 codex.exe）——必须走
+/// 构造审查命令行。Windows 上 npm 安装的 CLI 是 .cmd 垫片，裸名
+/// spawn 找不到（CreateProcessW 不解析 PATHEXT，只会找 .exe）——必须走
 /// cmd.exe /c 转发（与 terminal_host::launch 启动 CLI 同款方案）。
 /// 真实事故：裸名 spawn 连续 5 次 os error 2，整场监督以"审查失败"中止。
-/// model 为 None 时不传 -m：跟随 codex 配置的默认模型（硬编码模型名遇
+/// model 为 None 时不传 -m：跟随 CLI 配置的默认模型（硬编码模型名遇
 /// 中转分组不支持时报 404）。
+///
+/// codex 保留专属旗标（exec + bypass 审批沙箱，移植自 supervise.ps1）；
+/// 其余注册表 Agent 用 profile.review_args 模板（claude/gemini/grok: `-p`，
+/// dsh: `--profile headless`），prompt 恒为最后一个参数。
 pub fn build_codex_command(model: Option<&str>, prompt: &str) -> (String, Vec<String>) {
     let mut base = vec![
         "exec".to_string(),
@@ -70,13 +99,35 @@ pub fn build_codex_command(model: Option<&str>, prompt: &str) -> (String, Vec<St
         base.push(model.to_string());
     }
     base.push(prompt.to_string());
+    wrap_cmd_shim("codex", base)
+}
+
+/// 通用模板版：按注册表 id 构造 headless 审查命令
+pub fn build_agent_review_command(agent_id: &str, model: Option<&str>, prompt: &str) -> Result<(String, Vec<String>), String> {
+    if agent_id == "codex" {
+        return Ok(build_codex_command(model, prompt));
+    }
+    let profile = crate::agent_profile(agent_id)
+        .ok_or_else(|| format!("未注册的 Agent: {agent_id}"))?;
+    let mut base: Vec<String> = profile.review_args.iter().map(|s| s.to_string()).collect();
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        // gemini/grok/claude 均支持 -m 指定模型；dsh 的模型在插件层配置，-m 透传无害
+        base.push("-m".to_string());
+        base.push(model.to_string());
+    }
+    base.push(prompt.to_string());
+    Ok(wrap_cmd_shim(profile.command, base))
+}
+
+/// cmd.exe 垫片包装（仅 Windows；其他平台直接裸命令）
+fn wrap_cmd_shim(command: &str, args: Vec<String>) -> (String, Vec<String>) {
     if cfg!(windows) {
         let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-        let mut args = vec!["/d".into(), "/s".into(), "/c".into(), "codex".into()];
-        args.extend(base);
-        (comspec, args)
+        let mut wrapped = vec!["/d".into(), "/s".into(), "/c".into(), command.to_string()];
+        wrapped.extend(args);
+        (comspec, wrapped)
     } else {
-        ("codex".to_string(), base)
+        (command.to_string(), args)
     }
 }
 
@@ -95,10 +146,11 @@ impl Reviewer for CodexReviewer {
             if cancel.load(Ordering::Relaxed) {
                 return Err("已取消".into());
             }
-            // stdin 置 null：codex 在非 TTY 环境会读 stdin 附加输入而挂起；
+            // stdin 置 null：CLI 在非 TTY 环境会读 stdin 附加输入而挂起；
             // CREATE_NO_WINDOW：发布版 GUI 子系统不弹控制台；
-            // 命令走 build_codex_command（Windows 需 cmd.exe 垫片解析 codex.cmd）
-            let (program, args) = build_codex_command(self.model.as_deref(), &prompt);
+            // 命令走 build_agent_review_command（Windows 需 cmd.exe 垫片解析 .cmd）
+            let (program, args) =
+                build_agent_review_command(self.agent, self.model.as_deref(), &prompt)?;
             let mut command = Command::new(&program);
             path_util::no_console_window(&mut command);
             let mut child = command
@@ -106,10 +158,10 @@ impl Reviewer for CodexReviewer {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 // stderr 后台消费（防写满挂死）并留尾部：审查失败时能看到
-                // codex 到底报了什么，而不是只有一个退出码
+                // CLI 到底报了什么，而不是只有一个退出码
                 .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|e| format!("spawn codex 失败（{program}，请确认 codex CLI 已安装）: {e}"))?;
+                .map_err(|e| format!("spawn {} 失败（{program}，请确认 CLI 已安装）: {e}", self.agent))?;
 
             let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             {
@@ -160,20 +212,20 @@ impl Reviewer for CodexReviewer {
                             .clone();
                         last_err = match status.code() {
                             Some(0) => format!(
-                                "第 {attempt} 次未解析到 VERDICT。codex 输出尾部: {}",
+                                "第 {attempt} 次未解析到 VERDICT。{} 输出尾部: {}", self.agent,
                                 tail(&out, 200)
                             ),
                             Some(code) => format!(
-                                "codex 退出码 {code}（第 {attempt} 次）。stderr 尾部: {}",
+                                "{} 退出码 {code}（第 {attempt} 次）。stderr 尾部: {}", self.agent,
                                 tail(&stderr_tail, 200)
                             ),
-                            None => format!("codex 被信号终止（第 {attempt} 次）"),
+                            None => format!("{} 被信号终止（第 {attempt} 次）", self.agent),
                         };
                         break;
                     }
                     Ok(None) => std::thread::sleep(Duration::from_millis(200)),
                     Err(e) => {
-                        last_err = format!("等待 codex 失败: {e}");
+                        last_err = format!("等待 {} 失败: {e}", self.agent);
                         break;
                     }
                 }
@@ -182,7 +234,7 @@ impl Reviewer for CodexReviewer {
                 std::thread::sleep(Duration::from_secs(self.retry_wait_secs));
             }
         }
-        Err(format!("codex 审查连续 {} 次失败：{last_err}", self.retries))
+        Err(format!("{} 审查连续 {} 次失败：{last_err}", self.agent, self.retries))
     }
 }
 
@@ -330,5 +382,41 @@ mod tests {
     fn tail_keeps_last_chars() {
         assert_eq!(tail("abcdefghij", 3), "hij");
         assert_eq!(tail("ab", 5), "ab");
+    }
+
+    /// 多 Agent：通用模板构造（claude/gemini 用 -p，dsh 用 --profile headless）
+    #[test]
+    fn agent_review_command_follows_registry_template() {
+        for (agent, flag) in [("claude", "-p"), ("gemini", "-p"), ("grok", "-p")] {
+            let (program, args) = build_agent_review_command(agent, None, "审查").unwrap();
+            assert!(program.to_lowercase().ends_with("cmd.exe"), "{program}");
+            assert_eq!(args[3], agent);
+            assert!(args.contains(&flag.to_string()), "{args:?}");
+            assert_eq!(args.last().unwrap(), "审查");
+        }
+        let (_p, dsh_args) = build_agent_review_command("dsh", None, "审查").unwrap();
+        assert!(dsh_args.contains(&"--profile".to_string()));
+        assert!(dsh_args.contains(&"headless".to_string()));
+        assert_eq!(dsh_args.last().unwrap(), "审查");
+    }
+
+    /// 多 Agent：model 走 -m 且保持在 prompt 之前
+    #[test]
+    fn agent_review_command_inserts_model_flag() {
+        let (_p, args) = build_agent_review_command("claude", Some("gemini-2x"), "审查").unwrap();
+        let m = args.iter().position(|a| a == "-m").expect("-m 存在");
+        assert_eq!(args[m + 1], "gemini-2x");
+        assert_eq!(args.last().unwrap(), "审查");
+    }
+
+    /// 多 Agent：for_agent 校验注册表与能力
+    #[test]
+    fn for_agent_validates_registry_and_capability() {
+        assert!(CodexReviewer::for_agent("claude", None, "任务").is_ok());
+        assert!(CodexReviewer::for_agent("gemini", None, "任务").is_ok());
+        let err = CodexReviewer::for_agent("nope", None, "任务").unwrap_err();
+        assert!(err.contains("未注册"), "{err}");
+        // 注册表里没有 can_review=false 的条目，构造不可达——直接断言 err 文案路径
+        assert!(CodexReviewer::new(None, "任务").agent == "codex", "默认仍是 codex");
     }
 }
