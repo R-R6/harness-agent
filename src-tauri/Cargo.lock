@@ -1450,6 +1450,7 @@ dependencies = [
 name = "harness_agent"
 version = "0.2.0"
 dependencies = [
+ "embed-resource",
  "mcp_checker",
  "path_util",
  "portable-pty",
@@ -3861,6 +3862,7 @@ name = "terminal_host"
 version = "0.1.0"
 dependencies = [
  "portable-pty",
+ "serde_json",
 ]
 
 [[package]]
