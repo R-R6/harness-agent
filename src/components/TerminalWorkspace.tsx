@@ -6,8 +6,8 @@ import "@xterm/xterm/css/xterm.css";
 import { resizeTerminal, startTerminal, stopTerminal, writeTerminal } from "../lib/terminalApi";
 import { buildXtermOptions, CODEX_CURSOR_PIN, createOutputStabilizer, loadXtermRuntime, pinCursorSteady } from "../lib/xtermRuntime";
 import { listenWhileMounted } from "../lib/listenWhileMounted";
-import { fetchAgentCatalog } from "../lib/api";
-import type { AgentCatalogEntry, TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
+import { useAgentCatalog } from "../lib/useAgentCatalog";
+import type { TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
 import { basenameOf, samePath } from "../lib/workspaces";
 import { Icon, IconButton } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
@@ -98,7 +98,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     { id: "claude-1", agentId: "claude", pane: initialPane() },
   ]);
   /** Agent 注册表状态（工作台启动条 + tab 标题），挂载时拉取一次 */
-  const [catalog, setCatalog] = useState<AgentCatalogEntry[]>([]);  const [activeClaudeId, setActiveClaudeId] = useState("claude-1");
+  const catalog = useAgentCatalog();  const [activeClaudeId, setActiveClaudeId] = useState("claude-1");
   const [codexPane, setCodexPane] = useState<PaneState>(initialPane);
   /** 后端通知横幅（预信任失败等：不致命，但用户必须在启动终端前看见） */
   const [terminalNotice, setTerminalNotice] = useState("");
@@ -343,22 +343,6 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       stopNotice();
     };
   }, [enqueueOutput, findPaneKeyBySession, patchClaudeTab, patchCodex]);
-
-  // Agent 注册表：挂载拉取一次（工作台启动条 + 工人 tab 标题）。
-  // Promise.resolve + Array.isArray 防御：invoke 在测试桩/异常环境可能返回非 promise 或 undefined
-  useEffect(() => {
-    let alive = true;
-    Promise.resolve(fetchAgentCatalog())
-      .then((entries) => {
-        if (alive && Array.isArray(entries)) setCatalog(entries);
-      })
-      .catch(() => {
-        // 注册表拉取失败不影响既有 claude/codex 使用（走静态 AGENTS 兜底）
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
 
   const startPane = useCallback(
     async (

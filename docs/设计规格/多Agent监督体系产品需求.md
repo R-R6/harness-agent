@@ -1,6 +1,6 @@
 # 产品需求：多 Agent 监督体系（Multi-Agent Supervision）
 
-> 状态：已定稿 v1 · 2026-09-12
+> 状态：已定稿 v1 · 2026-09-12（v1.1 评审修订：明确引擎适配边界）
 > 来源：调研 vibe-kanban / claude-squad / opencode / goose 的编排模式 + Gemini CLI / Grok Build / DeepSeek DSH 官方文档
 > 关联分支：feature/multi-agent-supervision
 
@@ -29,7 +29,7 @@
 ### P1 Agent 注册表（可扩展的根基）
 - 系统内置 Agent 注册表：claude、codex、gemini、grok、dsh。每条 profile 声明：显示名、交互命令、能否当工人（can_work）、能否当审查者（can_review）、headless 审查命令模板、会话根目录、停轮策略、信任策略。
 - **新增一家 CLI = 注册表加一条 profile + （可选）一个会话适配器**，不改引擎、不改 UI 框架。
-- 工作台展示每个 Agent 的本机状态：未安装 / 已安装（版本）/ 探测中。
+- 工作台展示每个 Agent 的本机状态：未安装 / 已安装（v1 简化：不 spawn 探测版本号）。
 
 ### P2 谁监督谁（角色选择）
 - 任务创建表单提供两个选择器：**被监督方**（can_work 且当前目录有空闲 pane 的 Agent）、**监督方**（can_review 的 Agent）。
@@ -43,9 +43,9 @@
 - 信任/预信任按 Agent 策略处理：Claude 写 hasTrustDialogAccepted；Gemini 写 trustedFolders.json；其他跳过（弹框由 wait_for_input_ready 的人工等待兜底）。
 
 ### P4 跨 Agent 会话管理
-- 会话浏览按 **Agent 来源** 分组筛选（现有 Claude/Codex 下拉自然扩展）。
-- 会话列表统一 schema：{agent, 会话 id, 标题, cwd, 时间}；transcript 阅读器 v1 支持 claude/codex，其他 Agent 展示列表 + 原始文件定位（阅读器后续补）。
-- 会话格式未适配的 Agent：列表位置显示"已检测到 CLI，会话格式适配中"，不出假数据。
+- 会话浏览按 **Agent 来源** 分组筛选（下拉 = 有会话适配器的 Agent；claude/codex 常驻）。
+- 会话列表统一 schema：{agent, 会话 id, 标题, cwd, 时间}；transcript 阅读器 v1 支持 claude/codex，gemini/grok 的会话列表经适配器接入（transcript 正文阅读后续补）。
+- 会话格式未适配的 Agent（dsh）：不出现在筛选下拉（不出假数据）；后续接入时补"格式适配中"提示。
 
 ### P5 非功能
 - 工人端点预检按 profile 模板执行（现有 preflight 机制泛化）。
@@ -61,5 +61,5 @@
 ## 5. 验收标准
 1. 注册表驱动：新 Agent 加入后，工作台能启动它、任务表单能选它当工人/审查者、会话浏览出现它的来源筛选项（有适配器时）。
 2. claude+codex 组合全流程回归不变（含真机两轮闭环）。
-3. gemini 当审查者、claude 当工人（或反之）在本机可跑通一轮（若本机已安装）。
+3. gemini 当审查者 + claude 当工人：命令模板就绪，本机安装 gemini 后可跑通；"非 claude 工人"需引擎会话适配（Wave 6+），v1 显式阻断并提示。
 4. cargo + vitest 全绿；每个功能点独立提交推送。

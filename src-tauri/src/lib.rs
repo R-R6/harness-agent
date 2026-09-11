@@ -850,6 +850,15 @@ async fn run_supervise_terminal(
     if !worker_profile.can_work {
         return Err(format!("{} 不支持作为被监督方（无交互终端模式）", worker_profile.name));
     }
+    // v1 引擎边界：令牌预钉/Stop hook/会话定位均为 Claude Code 专属链路，
+    // 其他工人的会话适配（engine 按 session_roots 定位）接入前显式阻断，
+    // 避免任务启动后每轮 Timeout 空转
+    if worker_agent != "claude" {
+        return Err(format!(
+            "{} 作为被监督方的会话适配尚未接入（当前仅支持 Claude Code 被监督）；可先将其添加为监督方",
+            worker_profile.name
+        ));
+    }
     // 启动前预检工人 CLI 端点可用（403/未登录等在此拦下，不烧任务轮次）
     supervise_runner::preflight_agent(worker_agent, &work_dir)?;
 
@@ -949,8 +958,10 @@ async fn run_supervise_terminal(
         }
     };
     let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
-    // Stop hook 是 Claude Code 专属：其他工人靠引擎的会话静默兜底判定轮末
-    let hook_installed = !request.mock && worker_agent == "claude";
+    // Stop hook 安装按注册表停轮策略（当前仅 claude=Hook；其余静默兜底）
+    let hook_installed = !request.mock
+        && agent_registry::get(worker_agent)
+            .is_some_and(|p| p.round_end == agent_registry::RoundEnd::Hook);
     if hook_installed {
         if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
             release_engine_session(&state, &session_id);
@@ -1243,7 +1254,9 @@ async fn continue_supervise_terminal(
         }
     };
     let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
-    let hook_installed = !mock;
+    let hook_installed = !mock
+        && agent_registry::get(&worker_agent)
+            .is_some_and(|p| p.round_end == agent_registry::RoundEnd::Hook);
     if hook_installed {
         if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
             release_engine_session(&state, &session_id);

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { continueSuperviseTerminal, fetchAgentCatalog, runSupervise, runSuperviseTerminal } from "../lib/api";
+import { continueSuperviseTerminal, runSupervise, runSuperviseTerminal } from "../lib/api";
+import { useAgentCatalog } from "../lib/useAgentCatalog";
 import { Icon } from "./Icon";
-import type { AgentCatalogEntry, SuperviseRequest, TaskInfo, TaskStatus } from "../types";
+import type { SuperviseRequest, TaskInfo, TaskStatus } from "../types";
 
 interface Props {
   /** 工作目录（受控：由 App 持有的项目上下文，与 Claude 终端 pane 同源） */
@@ -51,27 +52,13 @@ export function SupervisePanel({
   const [continueError, setContinueError] = useState("");
   const logEndRef = useRef<HTMLDivElement>(null);
   // 多 Agent：注册表 + 角色选择（记忆上次选择）
-  const [catalog, setCatalog] = useState<AgentCatalogEntry[]>([]);
+  const catalog = useAgentCatalog();
   const [workerAgent, setWorkerAgent] = useState(
     () => localStorage.getItem("ha-worker-agent") || "claude",
   );
   const [reviewerAgent, setReviewerAgent] = useState(
     () => localStorage.getItem("ha-reviewer-agent") || "codex",
   );
-
-  useEffect(() => {
-    let alive = true;
-    Promise.resolve(fetchAgentCatalog())
-      .then((entries) => {
-        if (alive && Array.isArray(entries)) setCatalog(entries);
-      })
-      .catch(() => {
-        // 注册表不可用时选择器只显示默认 claude/codex
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
 
   const workerOptions = catalog.filter((c) => c.can_work);
   const reviewerOptions = catalog.filter((c) => c.can_review);

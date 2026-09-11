@@ -51,7 +51,8 @@ impl CodexReviewer {
     /// 按注册表 Agent 构造审查器。codex 保留专属 bypass 旗标（历史行为），
     /// 其余走 profile.review_args 通用模板。
     pub fn for_agent(agent_id: &str, model: Option<&str>, task: &str) -> Result<Self, String> {
-        let profile = crate::agent_profile(agent_id)
+        let profile = agent_registry::get(agent_id)
+            .copied()
             .ok_or_else(|| format!("未注册的 Agent: {agent_id}"))?;
         if !profile.can_review {
             return Err(format!("{} 不支持作为监督方（无 headless 模式）", profile.name));
@@ -104,17 +105,16 @@ pub fn build_codex_command(model: Option<&str>, prompt: &str) -> (String, Vec<St
 
 /// 通用模板版：按注册表 id 构造 headless 审查命令
 pub fn build_agent_review_command(agent_id: &str, model: Option<&str>, prompt: &str) -> Result<(String, Vec<String>), String> {
+    let _ = model; // codex 路径透传 model；通用路径 v1 不透传（见下）
     if agent_id == "codex" {
         return Ok(build_codex_command(model, prompt));
     }
-    let profile = crate::agent_profile(agent_id)
+    let profile = agent_registry::get(agent_id)
+        .copied()
         .ok_or_else(|| format!("未注册的 Agent: {agent_id}"))?;
     let mut base: Vec<String> = profile.review_args.iter().map(|s| s.to_string()).collect();
-    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
-        // gemini/grok/claude 均支持 -m 指定模型；dsh 的模型在插件层配置，-m 透传无害
-        base.push("-m".to_string());
-        base.push(model.to_string());
-    }
+    // 注意：非 codex 路径不透传 model——各家 CLI 的模型 flag 形态不一（--model / 插件层配置），
+    // 盲推 -m 未经验证；v1 一律跟随该 CLI 自己配置的默认模型
     base.push(prompt.to_string());
     Ok(wrap_cmd_shim(profile.command, base))
 }
@@ -400,12 +400,12 @@ mod tests {
         assert_eq!(dsh_args.last().unwrap(), "审查");
     }
 
-    /// 多 Agent：model 走 -m 且保持在 prompt 之前
+    /// 多 Agent：通用路径 v1 不透传模型（各家 CLI 模型 flag 形态不一，盲推 -m
+    /// 未经验证；跟随该 CLI 自己配置的默认模型——-m 404 事故教训）
     #[test]
-    fn agent_review_command_inserts_model_flag() {
+    fn agent_review_command_ignores_model_flag() {
         let (_p, args) = build_agent_review_command("claude", Some("gemini-2x"), "审查").unwrap();
-        let m = args.iter().position(|a| a == "-m").expect("-m 存在");
-        assert_eq!(args[m + 1], "gemini-2x");
+        assert!(!args.contains(&"-m".to_string()), "{args:?}");
         assert_eq!(args.last().unwrap(), "审查");
     }
 

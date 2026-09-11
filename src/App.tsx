@@ -14,12 +14,13 @@ import { StatusBar } from "./components/StatusBar";
 import { TerminalWorkspace, type TerminalWorkspaceHandle } from "./components/TerminalWorkspace";
 import { SplitHandle } from "./components/SplitHandle";
 import harnessMark from "./assets/harness-mark.svg";
-import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, fetchAgentCatalog, cancelSupervise, deleteTask } from "./lib/api";
+import { fetchSessions, fetchTranscript, searchSessions, fetchTasks, cancelSupervise, deleteTask } from "./lib/api";
 import { formatFull } from "./lib/formatTime";
 import { useElementSize, useMediaQuery, useStoredNumber } from "./lib/layoutPreferences";
 import { listenWhileMounted } from "./lib/listenWhileMounted";
+import { useAgentCatalog } from "./lib/useAgentCatalog";
 import { addWorkspace, initWorkspaces, saveWorkspaces, tasksForWorkspace } from "./lib/workspaces";
-import type { AgentCatalogEntry, SessionInfo, TaskInfo, TranscriptEntry } from "./types";
+import type { SessionInfo, TaskInfo, TranscriptEntry } from "./types";
 import pkg from "../package.json";
 import "./App.css";
 
@@ -103,23 +104,11 @@ function App() {
   const [sessionLimit, setSessionLimit] = useState(50);
   const [agentFilter, setAgentFilter] = useState<AgentFilter>("all");
   /// Agent 注册表状态（来源筛选下拉：检测到会话目录的 agent 才出现）
-  const [agentCatalog, setAgentCatalog] = useState<AgentCatalogEntry[]>([]);
+  const agentCatalog = useAgentCatalog();
   const [mcpHealth, setMcpHealth] = useState<McpHealth>("checking");
   const transcriptCache = useRef(new Map<string, { entries: TranscriptEntry[]; hasMore: boolean }>());
   const activeFileRef = useRef<string | null>(null); // 翻页期间切走会话时丢弃过期结果
 
-  // Agent 注册表：挂载拉取一次（会话浏览来源筛选的动态项）
-  useEffect(() => {
-    let alive = true;
-    Promise.resolve(fetchAgentCatalog())
-      .then((entries) => {
-        if (alive && Array.isArray(entries)) setAgentCatalog(entries);
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, []);
 
   // ---- 监督闭环状态（常驻 App）----
   // 工作空间一级实体（Codex Project 精神）：path 为身份、position 保序；
