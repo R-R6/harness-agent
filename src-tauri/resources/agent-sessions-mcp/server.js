@@ -5,6 +5,8 @@
  * 适配器（adapter 模式，未来可加 cursor 等）：
  *  - claude: ~/.claude/projects/<项目slug>/<uuid>.jsonl
  *  - codex : ~/.codex/sessions/<年>/<月>/<日>/rollout-*.jsonl
+ *  - gemini: ~/.gemini/tmp/<projectHash>/chats/sessions-*.jsonl
+ *  - grok  : ~/.grok/sessions/**（官方 Grok Build；结构未完全稳定，best-effort）
  *
  * 工具：
  *  - list_sessions({ agent? })        列出最近会话（各 agent 前 20 个）
@@ -32,7 +34,7 @@ const LIST_LIMIT = 20;                 // list_sessions 每 agent 条数
 
 // ---------------- 文件遍历 ----------------
 
-function walkJsonl(root, { excludeDirs = [] } = {}) {
+function walkJsonl(root, { excludeDirs = [], exts = ['.jsonl'] } = {}) {
   const out = [];
   if (!fs.existsSync(root)) return out;
   const stack = [root];
@@ -48,7 +50,7 @@ function walkJsonl(root, { excludeDirs = [] } = {}) {
       const p = path.join(dir, e.name);
       if (e.isDirectory()) {
         if (!excludeDirs.includes(e.name)) stack.push(p);
-      } else if (e.name.endsWith('.jsonl')) {
+      } else if (exts.some((ext) => e.name.endsWith(ext))) {
         try {
           out.push({ file: p, mtime: fs.statSync(p).mtimeMs });
         } catch { /* 忽略瞬时错误 */ }
@@ -121,8 +123,53 @@ function parseCodex(obj) {
   return null;
 }
 
+/// Gemini CLI chat recording：消息行 type=user/gemini，content 为字符串或 [{text}]；
+/// 元数据行（sessionId/projectHash/kind）无对话内容，自然被丢弃
+function parseGemini(obj) {
+  const t = obj && obj.type;
+  if (t !== 'user' && t !== 'gemini' && t !== 'model') return null;
+  const role = t === 'user' ? 'user' : 'assistant';
+  const c = obj.content;
+  if (typeof c === 'string' && c.trim()) return { type: role, text: c };
+  if (Array.isArray(c)) {
+    const parts = [];
+    for (const piece of c) {
+      if (typeof piece === 'string') parts.push(piece);
+      else if (piece && typeof piece.text === 'string') parts.push(piece.text);
+    }
+    if (parts.length) return { type: role, text: parts.join('\n') };
+  }
+  return null;
+}
+
+/// Grok Build sessions：官方结构未完全稳定，best-effort——
+/// 识别 {role, content} / {type:'message', role, content} / {type:'user'|'assistant', text|message}
+function parseGrok(obj) {
+  const role = obj && (obj.role || (obj.type === 'message' && obj.message && obj.message.role));
+  if (role !== 'user' && role !== 'assistant') {
+    if (obj && (obj.type === 'user' || obj.type === 'assistant')) {
+      const text = typeof obj.text === 'string' ? obj.text : typeof obj.message === 'string' ? obj.message : '';
+      if (text.trim()) return { type: obj.type, text };
+    }
+    return null;
+  }
+  const content = (obj.message && obj.message.content) || obj.content;
+  if (typeof content === 'string' && content.trim()) {
+    return { type: role === 'user' ? 'user' : 'assistant', text: content };
+  }
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const piece of content) {
+      if (typeof piece === 'string') parts.push(piece);
+      else if (piece && typeof piece.text === 'string') parts.push(piece.text);
+    }
+    if (parts.length) return { type: role === 'user' ? 'user' : 'assistant', text: parts.join('\n') };
+  }
+  return null;
+}
+
 function parseEither(obj) {
-  return parseClaude(obj) || parseCodex(obj) || null;
+  return parseClaude(obj) || parseCodex(obj) || parseGemini(obj) || parseGrok(obj) || null;
 }
 
 // ---------------- 适配器 ----------------
@@ -130,6 +177,8 @@ function parseEither(obj) {
 // 数据根目录：默认指向真实会话目录；可用环境变量覆盖（模拟/测试用，不影响真实环境）
 const CLAUDE_ROOT = process.env.AGENT_SESSIONS_CLAUDE_ROOT || path.join(HOME, '.claude', 'projects');
 const CODEX_ROOT = process.env.AGENT_SESSIONS_CODEX_ROOT || path.join(HOME, '.codex', 'sessions');
+const GEMINI_ROOT = process.env.AGENT_SESSIONS_GEMINI_ROOT || path.join(HOME, '.gemini', 'tmp');
+const GROK_ROOT = process.env.AGENT_SESSIONS_GROK_ROOT || path.join(HOME, '.grok', 'sessions');
 
 const adapters = {
   claude: {
@@ -141,6 +190,14 @@ const adapters = {
   codex: {
     label: 'Codex',
     files: () => walkJsonl(CODEX_ROOT),
+  },
+  gemini: {
+    label: 'Gemini CLI',
+    files: () => walkJsonl(GEMINI_ROOT),
+  },
+  grok: {
+    label: 'Grok Build',
+    files: () => walkJsonl(GROK_ROOT, { exts: ['.jsonl', '.json'] }),
   },
 };
 
@@ -160,7 +217,7 @@ function localISO(d) {
 // 规范化路径前缀匹配（大小写不敏感，Windows）
 function isWithinSessionsRoot(file) {
   const norm = path.normalize(file).toLowerCase();
-  return [CLAUDE_ROOT, CODEX_ROOT].some(root =>
+  return [CLAUDE_ROOT, CODEX_ROOT, GEMINI_ROOT, GROK_ROOT].some(root =>
     norm === root.toLowerCase() || norm.startsWith(root.toLowerCase() + path.sep)
   );
 }
@@ -355,6 +412,11 @@ function isSearchableContent(obj) {
   // Codex：对话消息（response_item.message）与 agent/user_message 事件
   if (t === 'response_item' && obj.payload && obj.payload.type === 'message') return true;
   if (t === 'event_msg' && obj.payload && (obj.payload.type === 'agent_message' || obj.payload.type === 'user_message')) return true;
+  // Gemini：user/gemini 消息行
+  if (t === 'user' || t === 'gemini' || t === 'model') return true;
+  // Grok：role 型消息（best-effort）
+  const role = obj && obj.role;
+  if (role === 'user' || role === 'assistant') return true;
   return false;
 }
 
@@ -366,7 +428,7 @@ const TOOLS = [
     description: '列出本机 AI Agent 的最近会话（Claude Code / Codex），返回文件路径与更新时间',
     inputSchema: {
       type: 'object',
-      properties: { agent: { type: 'string', enum: ['claude', 'codex'], description: '可选，只列某个 agent' } },
+      properties: { agent: { type: 'string', enum: ['claude', 'codex', 'gemini', 'grok'], description: '可选，只列某个 agent' } },
     },
   },
   {

@@ -238,11 +238,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let (claude_root, codex_root) = build_fake_sessions(&tmp);
+        // Gemini：~/.gemini/tmp/<hash>/chats/sessions-*.jsonl（首行元数据 + 消息行）
+        let gemini_root = tmp.join("fake_gemini");
+        let gemini_dir = gemini_root.join("abc123hash").join("chats");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        std::fs::write(
+            gemini_dir.join("sessions-2026-09-12T00-00-00-abc12345.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"content\":\"帮我把列表去重\",\"cwd\":\"F:\\\\work\\\\proj\"}\n",
+                "{\"type\":\"gemini\",\"content\":\"好的，我来去重\"}\n",
+            ),
+        )
+        .unwrap();
+        // Grok：~/.grok/sessions/**（.json 也在遍历范围；best-effort role 解析）
+        let grok_root = tmp.join("fake_grok");
+        std::fs::create_dir_all(&grok_root).unwrap();
+        std::fs::write(
+            grok_root.join("session-def.json"),
+            "{\"role\":\"user\",\"content\":{\"text\":\"grok 你好\"}}\n",
+        )
+        .unwrap();
         // 必须还原旧值，测试间互不污染
         let old_claude = std::env::var("AGENT_SESSIONS_CLAUDE_ROOT").ok();
         let old_codex = std::env::var("AGENT_SESSIONS_CODEX_ROOT").ok();
+        let old_gemini = std::env::var("AGENT_SESSIONS_GEMINI_ROOT").ok();
+        let old_grok = std::env::var("AGENT_SESSIONS_GROK_ROOT").ok();
         std::env::set_var("AGENT_SESSIONS_CLAUDE_ROOT", &claude_root);
         std::env::set_var("AGENT_SESSIONS_CODEX_ROOT", &codex_root);
+        std::env::set_var("AGENT_SESSIONS_GEMINI_ROOT", &gemini_root);
+        std::env::set_var("AGENT_SESSIONS_GROK_ROOT", &grok_root);
         let r = f();
         match old_claude {
             Some(v) => std::env::set_var("AGENT_SESSIONS_CLAUDE_ROOT", v),
@@ -252,8 +276,40 @@ mod tests {
             Some(v) => std::env::set_var("AGENT_SESSIONS_CODEX_ROOT", v),
             None => std::env::remove_var("AGENT_SESSIONS_CODEX_ROOT"),
         }
+        match old_gemini {
+            Some(v) => std::env::set_var("AGENT_SESSIONS_GEMINI_ROOT", v),
+            None => std::env::remove_var("AGENT_SESSIONS_GEMINI_ROOT"),
+        }
+        match old_grok {
+            Some(v) => std::env::set_var("AGENT_SESSIONS_GROK_ROOT", v),
+            None => std::env::remove_var("AGENT_SESSIONS_GROK_ROOT"),
+        }
         let _ = std::fs::remove_dir_all(&tmp);
         r
+    }
+
+    /// Gemini 会话：JSONL 消息行（type=user/gemini），cwd 从消息行提取
+    #[test]
+    fn list_sessions_includes_gemini_sessions() {
+        with_fake_sessions(|| {
+            let rows = list_sessions(Some("gemini".into()), None).expect("应成功");
+            assert!(!rows.is_empty(), "应列出 gemini 会话: {rows:?}");
+            let row = &rows[0];
+            assert_eq!(row.agent, "gemini");
+            assert_eq!(row.agent_label, "Gemini CLI");
+            assert_eq!(row.cwd, r"F:\work\proj");
+        });
+    }
+
+    /// Grok 会话：.json 也在遍历范围，role 型消息 best-effort 提取 cwd/正文
+    #[test]
+    fn list_sessions_includes_grok_sessions() {
+        with_fake_sessions(|| {
+            let rows = list_sessions(Some("grok".into()), None).expect("应成功");
+            assert!(!rows.is_empty(), "应列出 grok 会话: {rows:?}");
+            assert_eq!(rows[0].agent, "grok");
+            assert_eq!(rows[0].agent_label, "Grok Build");
+        });
     }
 
     #[test]
