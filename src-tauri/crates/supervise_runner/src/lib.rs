@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +118,110 @@ fn supervise_script_path() -> PathBuf {
             "/../../resources/supervise-loop-script/supervise.ps1"
         ),
     )
+}
+
+// ---------------- Claude CLI 端点预检 ----------------
+
+/// 预检超时：覆盖 npm shim 冷启动 + API 往返。
+pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// 预检结果分类（纯函数，可测）：
+/// 端点/凭据配置散落在环境变量与 CLI 自己的 settings 里，应用侧复刻解析必然漂移，
+/// 所以直接让 claude CLI 跑一次最小 headless 查询，由它自己回答"通不通"。
+/// 真机事故：API 中转被 Cloudflare 拦截（403）时引擎照常注入并空转数轮才中止。
+fn classify_preflight(timed_out: bool, exit: Option<i32>, output: &str) -> Result<(), String> {
+    if timed_out {
+        return Err(format!(
+            "Claude 预检超时（{}s）：CLI 或端点无响应，请检查网络后重试",
+            PREFLIGHT_TIMEOUT.as_secs()
+        ));
+    }
+    match exit {
+        Some(0) => Ok(()),
+        Some(code) => {
+            let lower = output.to_ascii_lowercase();
+            if lower.contains("403") || lower.contains("cloudflare") {
+                Err("Claude API 端点被拦截（403/Cloudflare）：请检查 API 中转地址/网络后重试".into())
+            } else if lower.contains("run /login")
+                || lower.contains("not logged in")
+                || lower.contains("invalid api key")
+                || lower.contains("unauthorized")
+                || lower.contains("401")
+            {
+                Err("Claude 未登录或凭据无效：请在终端登录 Claude Code 后重试".into())
+            } else if lower.contains("enoent")
+                || lower.contains("不是内部或外部命令")
+                // cmd 的"不是内部或外部命令"是 GBK 字节，lossy 解码后成替换字符
+                || (output.contains('\u{fffd}') && output.contains('\''))
+            {
+                Err("未找到 claude CLI：请先安装 Claude Code 或确认其在 PATH 中".into())
+            } else {
+                let head: String = output.trim().chars().take(200).collect();
+                Err(format!("Claude 预检失败（退出码 {code}）：{head}"))
+            }
+        }
+        None => Err("Claude 预检进程被终止".into()),
+    }
+}
+
+/// 任务启动前预检 Claude CLI 端到端可用。SUPERVISE_SKIP_PREFLIGHT=1 可跳过
+/// （离线开发/CI）。
+pub fn preflight_claude(work_dir: &str) -> Result<(), String> {
+    if std::env::var("SUPERVISE_SKIP_PREFLIGHT").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let args = [
+        "-p".to_string(),
+        "ping".to_string(),
+        "--max-turns".to_string(),
+        "1".to_string(),
+    ];
+    let (command, cmd_args) =
+        terminal_host::terminal_command("claude", &args).map_err(|e| format!("Claude 预检: {e}"))?;
+    let mut child = Command::new(&command)
+        .args(&cmd_args)
+        .current_dir(work_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Claude 预检启动失败: {e}"))?;
+    // stderr 必须有人读：写满管道会挂死子进程。
+    // 字节读 + lossy 解码：CLI 错误输出可能混 ANSI/GBK 字节，read_to_string 会静默失败
+    let mut stderr_pipe = child.stderr.take();
+    let mut stdout_pipe = child.stdout.take();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = std::io::Read::read_to_end(pipe, &mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = std::io::Read::read_to_end(pipe, &mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let deadline = Instant::now() + PREFLIGHT_TIMEOUT;
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(code)) => break Some(code.code().unwrap_or(-1) as i32),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return Err(format!("Claude 预检等待失败: {e}")),
+        }
+    };
+    let timed_out = exit.is_none();
+    let output = format!("{}{}", stdout_reader.join().unwrap_or_default(), stderr_reader.join().unwrap_or_default());
+    classify_preflight(timed_out, exit, &output)
 }
 
 // ---------------- 进程桥 ----------------
@@ -429,6 +534,29 @@ mod tests {
     }
 
     // ---- 进程桥（fake ps1 fixture） ----
+
+    #[test]
+    fn preflight_classifies_exit_codes_and_errors() {
+        use super::classify_preflight;
+        assert!(classify_preflight(false, Some(0), "ok").is_ok());
+        let cf = classify_preflight(false, Some(1), "API Error: 403 cf-ray: a384e9")
+            .unwrap_err();
+        assert!(cf.contains("403"), "{cf}");
+        let login = classify_preflight(false, Some(1), "Please run /login").unwrap_err();
+        assert!(login.contains("登录"), "{login}");
+        let missing = classify_preflight(false, Some(1), "program not found ENOENT").unwrap_err();
+        assert!(missing.contains("未找到"), "{missing}");
+        let other = classify_preflight(false, Some(7), "boom").unwrap_err();
+        assert!(other.contains('7'), "{other}");
+        assert!(classify_preflight(true, None, "").unwrap_err().contains("超时"));
+    }
+
+    #[test]
+    fn preflight_skips_via_env() {
+        std::env::set_var("SUPERVISE_SKIP_PREFLIGHT", "1");
+        assert!(super::preflight_claude("C:\\").is_ok());
+        std::env::remove_var("SUPERVISE_SKIP_PREFLIGHT");
+    }
 
     #[test]
     fn spawn_supervise_passes_args_and_captures_stdout() {

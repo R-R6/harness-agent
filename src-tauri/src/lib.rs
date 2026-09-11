@@ -444,7 +444,16 @@ fn start_terminal(
         if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
             let cfg = claude_config_path(std::path::Path::new(&home));
             if let Err(error) = ensure_folder_trusted(&cfg, &request.work_dir) {
-                eprintln!("[terminal] 预信任 Claude 工作目录失败: {error}");
+                // 预信任失败不阻断启动（Claude 会弹信任框，用户手动选 Yes 即可），
+                // 但必须让用户看见，而不是只进控制台日志
+                let _ = app.emit(
+                    "terminal-notice",
+                    serde_json::json!({
+                        "agent": request.agent,
+                        "workDir": request.work_dir,
+                        "message": format!("工作目录预信任失败（{error}）；Claude 可能弹信任对话框，请手动选 Yes"),
+                    }),
+                );
             }
         }
     }
@@ -593,6 +602,8 @@ async fn run_supervise(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
+    // 无头模式启动前同样预检端点可用
+    supervise_runner::preflight_claude(&work_dir)?;
     // 无头模式：同目录可并发（产物按 task_id 隔离）。先分配 id 再 spawn，
     // 以便 SUPERVISE_TASK_ID 进入子进程环境。id 必须越过注册表/磁盘已有编号。
     let task_id = {
@@ -789,6 +800,9 @@ async fn run_supervise_terminal(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
+
+    // 启动前预检 Claude CLI 端点可用（403/未登录等在此拦下，不烧任务轮次）
+    supervise_runner::preflight_claude(&work_dir)?;
 
     // 一任务一 Claude PTY：优先用请求里的 terminal_session_id；否则取该目录
     // 上尚未被引擎占用的 Claude pane（兼容旧前端）。解析与占用同一把锁，防竞态。
@@ -1054,6 +1068,25 @@ fn spawn_engine_thread(
     });
 }
 
+/// 「再来一轮」状态门控（纯函数，可测）：
+/// Rejected → 注入上轮审查意见返工；Aborted/Cancelled → 以原任务重启
+/// （真机：中止常发生在"输入栏未就绪/端点不可用"，任务正文从未落地，
+/// 用户此前只能删任务重来）。Running/Accepted 不允许续跑。
+fn validate_continue_status(status: TaskStatus, last_reason: &str) -> Result<bool, String> {
+    match status {
+        TaskStatus::Rejected => {
+            if last_reason.trim().is_empty() {
+                Err("任务没有上轮审查意见，无法再来一轮".into())
+            } else {
+                Ok(true)
+            }
+        }
+        TaskStatus::Aborted | TaskStatus::Cancelled => Ok(false),
+        TaskStatus::Running => Err("任务仍在运行中，无法再来一轮".into()),
+        TaskStatus::Accepted => Err("任务已通过验收，无需再来一轮".into()),
+    }
+}
+
 /// 「再来一轮」：rejected 任务复用原 Claude 会话追加一轮完整闭环。
 /// 注入上轮审查意见 → Claude 同会话落地 → Stop hook → codex 审查 → verdict。
 /// 复用原 artifacts/marker/令牌，轮次从原 rounds 继续（第 N+1 轮）。
@@ -1063,8 +1096,8 @@ async fn continue_supervise_terminal(
     state: State<'_, SuperviseState>,
     request: SuperviseContinueRequest,
 ) -> Result<String, String> {
-    // 1) 校验：任务存在、engine 类型、rejected 终态、有上轮审查意见
-    let (task, work_dir, last_reason, started_at, mock) = {
+    // 1) 校验：任务存在、engine 类型、可续跑终态（未通过=返工；中止/取消=重启）
+    let (task, work_dir, last_reason, started_at, mock, is_rework) = {
         let tasks = state.tasks.lock().map_err(|_| "任务状态锁已损坏".to_string())?;
         let t = tasks
             .get(&request.task_id)
@@ -1072,24 +1105,22 @@ async fn continue_supervise_terminal(
         if t.kind != TaskKind::Engine {
             return Err("仅驱动 Claude 终端的任务支持「再来一轮」".into());
         }
-        if t.status != TaskStatus::Rejected {
-            return Err("任务当前不是「未通过」状态，无法再来一轮".into());
-        }
+        let is_rework = validate_continue_status(t.status, &t.last_reason)?;
         (
             t.clone(),
             t.work_dir.clone(),
             t.last_reason.clone(),
             t.started_at_ms,
             t.mock,
+            is_rework,
         )
     };
-    if last_reason.trim().is_empty() {
-        return Err("任务没有上轮审查意见，无法再来一轮".into());
-    }
     let work_dir = normalize_path(&work_dir);
     if work_dir.is_empty() || !std::path::Path::new(&work_dir).is_dir() {
         return Err(format!("工作目录不存在: {work_dir}"));
     }
+    // 续跑前同样预检端点可用，避免白装 hook 再中止
+    supervise_runner::preflight_claude(&work_dir)?;
 
     // 2) 复用原 Claude pane：FAIL 后引擎已释放占用，按目录直接命中空闲 pane
     let session_id = {
@@ -1173,8 +1204,13 @@ async fn continue_supervise_terminal(
         persist_tasks(&app);
     }
 
-    // 6) opts + reviewer（沿用原令牌/审查方式；首轮注入 = 上轮审查意见）
-    let rework_text = format!("上一轮审查未通过，请按要求返工：{last_reason}");
+    // 6) opts + reviewer（沿用原令牌/审查方式；未通过注入审查意见返工，
+    // 中止/取消以原任务正文重启——中止时 last_reason 是失败原因，不是审查意见）
+    let rework_text = if is_rework {
+        format!("上一轮审查未通过，请按要求返工：{last_reason}")
+    } else {
+        task.task.clone()
+    };
     let opts = supervise_engine::EngineOptions {
         task: rework_text.clone(),
         work_dir: work_dir.clone(),
@@ -1468,6 +1504,25 @@ mod tests {
         let s = buf.lock().unwrap().clone();
         assert!(s.len() <= 24_000 + 12);
         assert!(s.chars().next().is_some());
+    }
+
+    #[test]
+    fn continue_gate_allows_rework_and_restart() {
+        // 未通过：有意见 → 返工；无意见 → 拒绝
+        assert_eq!(
+            validate_continue_status(TaskStatus::Rejected, "缺少输入校验"),
+            Ok(true)
+        );
+        assert!(validate_continue_status(TaskStatus::Rejected, "  ").is_err());
+        // 中止/取消 → 以原任务重启（含意见为空）
+        assert_eq!(validate_continue_status(TaskStatus::Aborted, ""), Ok(false));
+        assert_eq!(
+            validate_continue_status(TaskStatus::Cancelled, "用户取消"),
+            Ok(false)
+        );
+        // 运行中/已通过不允许
+        assert!(validate_continue_status(TaskStatus::Running, "x").is_err());
+        assert!(validate_continue_status(TaskStatus::Accepted, "x").is_err());
     }
 
     #[test]
