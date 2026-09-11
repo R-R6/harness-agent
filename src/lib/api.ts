@@ -1,6 +1,7 @@
 // 调用 Rust 侧 tauri commands（对应 lib.rs 的 list_sessions / get_transcript / search_sessions）
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AgentCatalogEntry,
   McpFixResult,
   McpStatus,
   ReviewArtifact,
@@ -9,6 +10,11 @@ import type {
   TaskInfo,
   TranscriptEntry,
 } from "../types";
+
+/** Agent 注册表状态（多 Agent 监督：角色能力 + 本机安装/会话探测） */
+export async function fetchAgentCatalog(): Promise<AgentCatalogEntry[]> {
+  return invoke<AgentCatalogEntry[]>("agent_catalog");
+}
 
 export async function fetchSessions(agent?: string, limit?: number): Promise<SessionInfo[]> {
   const args: Record<string, string | number> = {};

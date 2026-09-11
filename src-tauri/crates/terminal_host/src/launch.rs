@@ -8,8 +8,11 @@ pub fn terminal_command(agent: &str, extra_args: &[String]) -> Result<(String, V
     #[cfg(windows)]
     {
         match agent {
+            // claude 特判：优先解析 npm 目录里的原生 exe（PTT 交互性能与 ANSI 兼容）
             "claude" => windows_claude_command(extra_args),
-            "codex" => windows_cmd_agent("codex", extra_args),
+            // 其余 agent（codex/gemini/grok/dsh…）都是 npm/安装器提供的 .cmd shim，
+            // 走 cmd.exe 让 PATHEXT 解析；是否在注册表由调用方（agent_registry）校验
+            other if !other.trim().is_empty() => windows_cmd_agent(other, extra_args),
             other => Err(format!("不支持的终端 Agent: {other}")),
         }
     }
@@ -17,6 +20,7 @@ pub fn terminal_command(agent: &str, extra_args: &[String]) -> Result<(String, V
     {
         match agent {
             "claude" | "codex" => Ok((agent.to_string(), extra_args.to_vec())),
+            other if !other.trim().is_empty() => Ok((other.to_string(), extra_args.to_vec())),
             other => Err(format!("不支持的终端 Agent: {other}")),
         }
     }

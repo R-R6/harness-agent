@@ -543,7 +543,38 @@ describe("TerminalWorkspace", () => {
 
     // 新增后有两个标签，新标签为空闲态（可再启动）
     expect(screen.getAllByRole("tab")).toHaveLength(2);
-    expect(screen.getByRole("tab", { name: /Claude 2/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Claude CLI 2/ })).toBeInTheDocument();
+  });
+
+  it("agent 启动条：注册表渲染芯片，点击新开对应 Agent 标签", async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "agent_catalog") {
+        return Promise.resolve([
+          { id: "claude", name: "Claude Code", can_work: true, can_review: true, installed: true, sessions_present: true },
+          { id: "gemini", name: "Gemini CLI", can_work: true, can_review: true, installed: true, sessions_present: false },
+          { id: "dsh", name: "DeepSeek DSH", can_work: true, can_review: true, installed: false, sessions_present: false },
+        ]);
+      }
+      if (command === "start_terminal") {
+        return Promise.resolve({
+          id: "terminal-claude-1",
+          agent: "claude",
+          work_dir: PROJECT_DIR,
+          status: "running",
+        });
+      }
+      return undefined;
+    });
+    renderHost();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
+
+    // 启动条渲染注册表条目（含未安装的 dsh，弱化展示）
+    expect(screen.getByRole("button", { name: /Gemini CLI/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /DeepSeek DSH/ })).toBeInTheDocument();
+
+    // 点击 gemini 芯片 → 新开 Gemini 标签（工人列泛化）
+    await userEvent.click(screen.getByRole("button", { name: /Gemini CLI/ }));
+    expect(await screen.findByRole("tab", { name: /Gemini CLI 2/ })).toBeInTheDocument();
   });
 
   it("停止与自行退出竞态：invoke 失败不再回滚 running 卡死面板", async () => {

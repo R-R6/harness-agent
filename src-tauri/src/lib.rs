@@ -6,9 +6,10 @@ use supervise_engine::{
 };
 use supervise_runner::{ReviewArtifact, SuperviseContinueRequest, SuperviseRequest};
 use terminal_host::{
-    claude_config_path, ensure_folder_trusted, kill as kill_terminal_process,
-    resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command,
-    wait as wait_terminal_process, write_input as write_terminal_input,
+    claude_config_path, ensure_folder_trusted, ensure_gemini_folder_trusted,
+    gemini_trusted_folders_path, kill as kill_terminal_process, resize as resize_terminal_pty,
+    spawn as spawn_terminal_pty, terminal_command, wait as wait_terminal_process,
+    write_input as write_terminal_input,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -450,21 +451,39 @@ fn start_terminal(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
-    if request.agent == "claude" {
-        if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-            let cfg = claude_config_path(std::path::Path::new(&home));
-            if let Err(error) = ensure_folder_trusted(&cfg, &request.work_dir) {
-                // 预信任失败不阻断启动（Claude 会弹信任框，用户手动选 Yes 即可），
-                // 但必须让用户看见，而不是只进控制台日志
-                let _ = app.emit(
-                    "terminal-notice",
-                    serde_json::json!({
-                        "agent": request.agent,
-                        "workDir": request.work_dir,
-                        "message": format!("工作目录预信任失败（{error}）；Claude 可能弹信任对话框，请手动选 Yes"),
-                    }),
-                );
+    // agent 必须在注册表且能当工人（多 Agent 监督：claude/codex/gemini/grok/dsh…）
+    let profile = agent_registry::get(&request.agent)
+        .ok_or_else(|| format!("未注册的 Agent: {}", request.agent))?;
+    if !profile.can_work {
+        return Err(format!("{} 不支持作为被监督方/交互终端", profile.name));
+    }
+    let home_dir = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .ok();
+    // 预信任按 Agent 策略：失败不阻断启动（弹框由注入前的人工等待兜底），
+    // 但必须让用户看见，而不是只进控制台日志
+    if let Some(home) = home_dir.as_deref() {
+        let trust_result = match profile.trust {
+            agent_registry::Trust::ClaudeJson => {
+                let cfg = claude_config_path(home);
+                ensure_folder_trusted(&cfg, &request.work_dir)
             }
+            agent_registry::Trust::GeminiTrustedFolders => {
+                let cfg = gemini_trusted_folders_path(home);
+                ensure_gemini_folder_trusted(&cfg, &request.work_dir)
+            }
+            agent_registry::Trust::None => Ok(()),
+        };
+        if let Err(error) = trust_result {
+            let _ = app.emit(
+                "terminal-notice",
+                serde_json::json!({
+                    "agent": request.agent,
+                    "workDir": request.work_dir,
+                    "message": format!("{} 工作目录预信任失败（{error}）；CLI 可能弹信任对话框，请手动选择信任", profile.name),
+                }),
+            );
         }
     }
     let extra_args: Vec<String> = request

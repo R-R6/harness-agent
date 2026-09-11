@@ -84,8 +84,23 @@ export interface ReviewArtifact {
 
 // ---- 本机 CLI 终端工作台 ----
 
-export type TerminalAgent = "claude" | "codex";
+/** Agent id 来自注册表（agent_registry CATALOG）；保留 claude/codex 字面量便于推断 */
+export type TerminalAgent = "claude" | "codex" | (string & {});
 export type TerminalStatus = "idle" | "starting" | "running" | "stopping" | "exited" | "error";
+
+/** Agent 注册表状态（后端 agent_registry::AgentStatus，snake_case 契约） */
+export interface AgentCatalogEntry {
+  id: string;
+  name: string;
+  /** 可作被监督方（PTY 交互） */
+  can_work: boolean;
+  /** 可作监督方（headless 审查） */
+  can_review: boolean;
+  /** CLI 在本机 PATH 可解析 */
+  installed: boolean;
+  /** 检测到会话根目录 */
+  sessions_present: boolean;
+}
 
 export interface TerminalStartRequest {
   agent: TerminalAgent;

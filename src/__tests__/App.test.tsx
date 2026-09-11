@@ -162,7 +162,13 @@ describe("App 集成", () => {
   });
 
   it("后端报错时显示错误信息", async () => {
-    mocks.invoke.mockRejectedValueOnce(new Error("spawn node 失败"));
+    // 定向拒绝 list_sessions：其余命令委托给 beforeEach 的默认实现
+    // （挂载期还有 agent_catalog / mcp_status 等调用，不能一刀切拒绝）
+    const base = mocks.invoke.getMockImplementation();
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_sessions") return Promise.reject(new Error("spawn node 失败"));
+      return base ? base(cmd) : Promise.resolve([]);
+    });
     render(<App />);
     await waitFor(() => {
       expect(screen.getByText(/spawn node 失败/)).toBeInTheDocument();

@@ -351,6 +351,10 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .terminal-status { display: inline-flex; align-items: center; gap: 6px; color: #788596; font-size: 10px; white-space: nowrap; }
 .terminal-status--starting, .terminal-status--stopping { color: #d8ba76; }
 .terminal-status--error { color: #e88d8d; }
+.terminal-agent-bar { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 2px 8px; }
+.terminal-agent-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--text-muted); font-size: 11px; cursor: pointer; }
+.terminal-agent-chip:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.terminal-agent-chip--missing { opacity: 0.55; }
 .terminal-claude-tabs {
   display: flex;
   flex-wrap: wrap;

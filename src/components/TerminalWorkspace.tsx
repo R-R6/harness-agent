@@ -6,7 +6,8 @@ import "@xterm/xterm/css/xterm.css";
 import { resizeTerminal, startTerminal, stopTerminal, writeTerminal } from "../lib/terminalApi";
 import { buildXtermOptions, CODEX_CURSOR_PIN, createOutputStabilizer, loadXtermRuntime, pinCursorSteady } from "../lib/xtermRuntime";
 import { listenWhileMounted } from "../lib/listenWhileMounted";
-import type { TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
+import { fetchAgentCatalog } from "../lib/api";
+import type { AgentCatalogEntry, TerminalAgent, TerminalSessionInfo, TerminalStatus } from "../types";
 import { basenameOf, samePath } from "../lib/workspaces";
 import { Icon, IconButton } from "./Icon";
 import { SplitHandle } from "./SplitHandle";
@@ -44,6 +45,8 @@ function exitErrorMessage(code?: number | null) {
 
 interface ClaudeTab {
   id: string;
+  /** 该 tab 绑定的 CLI Agent（注册表 id；Claude 列已泛化为工人列） */
+  agentId: string;
   pane: PaneState;
 }
 
@@ -52,7 +55,6 @@ const AGENTS: { id: TerminalAgent; label: string; description: string }[] = [
   { id: "codex", label: "Codex CLI", description: "本机 codex CLI" },
 ];
 
-const CLAUDE_META = AGENTS[0];
 const CODEX_META = AGENTS[1];
 
 function writeIdleBanner(terminal: Terminal, agent: { label: string; description: string }) {
@@ -91,9 +93,10 @@ interface Props {
 export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onProjectWorkDirChange, ref }: Props) {
   const claudeSeqRef = useRef(1);
   const [claudeTabs, setClaudeTabs] = useState<ClaudeTab[]>(() => [
-    { id: "claude-1", pane: initialPane() },
+    { id: "claude-1", agentId: "claude", pane: initialPane() },
   ]);
-  const [activeClaudeId, setActiveClaudeId] = useState("claude-1");
+  /** Agent 注册表状态（工作台启动条 + tab 标题），挂载时拉取一次 */
+  const [catalog, setCatalog] = useState<AgentCatalogEntry[]>([]);  const [activeClaudeId, setActiveClaudeId] = useState("claude-1");
   const [codexPane, setCodexPane] = useState<PaneState>(initialPane);
   /** 后端通知横幅（预信任失败等：不致命，但用户必须在启动终端前看见） */
   const [terminalNotice, setTerminalNotice] = useState("");
@@ -144,10 +147,24 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     setCodexPane(next);
   }, []);
 
-  const addClaudeTab = useCallback(() => {
+  /** tab 标题/横幅用 meta：静态表优先，注册表条目兜底（新 Agent 未适配静态文案时） */
+  const agentMetaFor = useCallback(
+    (agentId: string): { id: TerminalAgent; label: string; description: string } => {
+      const known = AGENTS.find((a) => a.id === agentId);
+      if (known) return known;
+      const entry = catalog.find((c) => c.id === agentId);
+      if (entry) {
+        return { id: agentId, label: entry.name, description: `${entry.name} · 本机 CLI` };
+      }
+      return { id: agentId, label: agentId, description: "本机 CLI" };
+    },
+    [catalog],
+  );
+
+  const addClaudeTab = useCallback((agentId: string = "claude") => {
     claudeSeqRef.current += 1;
     const id = `claude-${claudeSeqRef.current}`;
-    const next = [...claudeTabsRef.current, { id, pane: initialPane() }];
+    const next = [...claudeTabsRef.current, { id, agentId, pane: initialPane() }];
     syncClaudeTabs(next);
     activeClaudeIdRef.current = id;
     setActiveClaudeId(id);
@@ -321,6 +338,22 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       stopNotice();
     };
   }, [enqueueOutput, findPaneKeyBySession, patchClaudeTab, patchCodex]);
+
+  // Agent 注册表：挂载拉取一次（工作台启动条 + 工人 tab 标题）。
+  // Promise.resolve + Array.isArray 防御：invoke 在测试桩/异常环境可能返回非 promise 或 undefined
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve(fetchAgentCatalog())
+      .then((entries) => {
+        if (alive && Array.isArray(entries)) setCatalog(entries);
+      })
+      .catch(() => {
+        // 注册表拉取失败不影响既有 claude/codex 使用（走静态 AGENTS 兜底）
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const startPane = useCallback(
     async (
@@ -578,7 +611,28 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         style={{ "--terminal-primary-size": `${ratio}%` } as CSSProperties}
       >
         <div className="terminal-claude-stack">
-          <div className="terminal-claude-tabs" role="tablist" aria-label="Claude 终端标签">
+          <div className="terminal-agent-bar" role="toolbar" aria-label="Agent 启动条">
+            {catalog
+              .filter((c) => c.can_work)
+              .map((entry) => (
+                <button
+                  key={entry.id}
+                  type="button"
+                  className={`terminal-agent-chip ${entry.installed ? "" : "terminal-agent-chip--missing"}`}
+                  onClick={() => addClaudeTab(entry.id)}
+                  title={
+                    entry.installed
+                      ? `新开一个 ${entry.name} 终端标签`
+                      : `${entry.name} 未检测到安装（仍可尝试启动）`
+                  }
+                >
+                  <Icon name={entry.id === "claude" ? "spark" : "terminal"} size={13} />
+                  {entry.name}
+                  {!entry.installed ? " ·未装" : entry.sessions_present ? " ·有会话" : ""}
+                </button>
+              ))}
+          </div>
+          <div className="terminal-claude-tabs" role="tablist" aria-label="CLI 终端标签">
             {claudeTabs.map((tab, index) => (
               <button
                 key={tab.id}
@@ -588,14 +642,14 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
                 className={`terminal-claude-tab ${tab.id === activeClaudeId ? "is-active" : ""}`}
                 onClick={() => focusClaudeTab(tab.id)}
               >
-                Claude {index + 1}
+                {agentMetaFor(tab.agentId).label} {index + 1}
                 {tab.pane.status === "running" ? " · 运行中" : ""}
               </button>
             ))}
             <button
               type="button"
               className="terminal-claude-tab terminal-claude-tab--add"
-              onClick={addClaudeTab}
+              onClick={() => addClaudeTab("claude")}
               aria-label="新增 Claude 终端"
               title="新增一个 Claude 终端会话"
             >
@@ -610,7 +664,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
               style={{ display: tab.id === activeClaudeId ? "flex" : "none" }}
             >
               <TerminalPane
-                agent={CLAUDE_META}
+                agent={agentMetaFor(tab.agentId)}
                 paneKey={tab.id}
                 workspaceActive={active && tab.id === activeClaudeId}
                 surfaceVisible={tab.id === activeClaudeId}
@@ -619,7 +673,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
                 onMount={(terminal) => mountTerminal(tab.id, terminal)}
                 onUnmount={() => unmountTerminal(tab.id)}
                 onStart={(_agent, cols, rows) => {
-                  void startPane(tab.id, "claude", cols, rows);
+                  void startPane(tab.id, tab.agentId, cols, rows);
                 }}
                 onStop={() => {
                   void handleStop(tab.id);
