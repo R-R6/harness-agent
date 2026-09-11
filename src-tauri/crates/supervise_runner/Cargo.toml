@@ -7,5 +7,6 @@ edition = "2021"
 [dependencies]
 path_util = { path = "../path_util" }
 terminal_host = { path = "../terminal_host" }
+agent_registry = { path = "../agent_registry" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

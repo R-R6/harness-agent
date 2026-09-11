@@ -798,7 +798,16 @@ function App() {
                         }}
                         onContinue={() => void loadTasks()}
                         onDriveStarted={handleDriveStarted}
-                        prepareDriveTerminal={async (workDir) => {
+                        prepareDriveTerminal={async (agentId, workDir) => {
+                          // claude：驱动任务必须换新 PTY（同目录冻在信任菜单的会话不会自恢复）；
+                          // 其他 Agent：复用该目录下已启动的空闲 pane（注册表启动条可开）
+                          if (agentId !== "claude") {
+                            const existing = terminalRef.current?.claimIdleAgentPane(agentId, workDir);
+                            if (!existing) {
+                              throw new Error(`未找到可用的 ${agentId} 终端：请先在工作台启动它`);
+                            }
+                            return existing;
+                          }
                           const id = await terminalRef.current?.startClaudeForTask(workDir);
                           if (!id) throw new Error("无法启动 Claude 终端");
                           return id;

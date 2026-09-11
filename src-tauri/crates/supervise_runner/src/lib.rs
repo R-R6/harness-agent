@@ -37,6 +37,9 @@ pub struct SuperviseRequest {
     /// 监督方（审查者）Agent id（agent_registry；缺省 codex）
     #[serde(default)]
     pub reviewer_agent: Option<String>,
+    /// 被监督方（工人）Agent id（agent_registry；缺省 claude）
+    #[serde(default)]
+    pub worker_agent: Option<String>,
     /// 终端驱动：绑定的 Claude PTY session id（一任务一进程）
     #[serde(default)]
     pub terminal_session_id: Option<String>,
@@ -132,10 +135,10 @@ pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(45);
 /// 端点/凭据配置散落在环境变量与 CLI 自己的 settings 里，应用侧复刻解析必然漂移，
 /// 所以直接让 claude CLI 跑一次最小 headless 查询，由它自己回答"通不通"。
 /// 真机事故：API 中转被 Cloudflare 拦截（403）时引擎照常注入并空转数轮才中止。
-fn classify_preflight(timed_out: bool, exit: Option<i32>, output: &str) -> Result<(), String> {
+fn classify_preflight(timed_out: bool, exit: Option<i32>, output: &str, display: &str) -> Result<(), String> {
     if timed_out {
         return Err(format!(
-            "Claude 预检超时（{}s）：CLI 或端点无响应，请检查网络后重试",
+            "{} 预检超时（{}s）：CLI 或端点无响应，请检查网络后重试", display,
             PREFLIGHT_TIMEOUT.as_secs()
         ));
     }
@@ -144,43 +147,45 @@ fn classify_preflight(timed_out: bool, exit: Option<i32>, output: &str) -> Resul
         Some(code) => {
             let lower = output.to_ascii_lowercase();
             if lower.contains("403") || lower.contains("cloudflare") {
-                Err("Claude API 端点被拦截（403/Cloudflare）：请检查 API 中转地址/网络后重试".into())
+                Err(format!("{} API 端点被拦截（403/Cloudflare）：请检查 API 中转地址/网络后重试", display))
             } else if lower.contains("run /login")
                 || lower.contains("not logged in")
                 || lower.contains("invalid api key")
                 || lower.contains("unauthorized")
                 || lower.contains("401")
             {
-                Err("Claude 未登录或凭据无效：请在终端登录 Claude Code 后重试".into())
+                Err(format!("{} 未登录或凭据无效：请先在终端完成登录后重试", display))
             } else if lower.contains("enoent")
                 || lower.contains("不是内部或外部命令")
                 // cmd 的"不是内部或外部命令"是 GBK 字节，lossy 解码后成替换字符
                 || (output.contains('\u{fffd}') && output.contains('\''))
             {
-                Err("未找到 claude CLI：请先安装 Claude Code 或确认其在 PATH 中".into())
+                Err(format!("未找到 {} CLI：请先安装或确认其在 PATH 中", display))
             } else {
                 let head: String = output.trim().chars().take(200).collect();
-                Err(format!("Claude 预检失败（退出码 {code}）：{head}"))
+                Err(format!("{} 预检失败（退出码 {code}）：{head}", display))
             }
         }
-        None => Err("Claude 预检进程被终止".into()),
+        None => Err(format!("{} 预检进程被终止", display)),
     }
 }
 
-/// 任务启动前预检 Claude CLI 端到端可用。SUPERVISE_SKIP_PREFLIGHT=1 可跳过
+/// 任务启动前预检被监督方 CLI 端到端可用。SUPERVISE_SKIP_PREFLIGHT=1 可跳过
 /// （离线开发/CI）。
 pub fn preflight_claude(work_dir: &str) -> Result<(), String> {
+    preflight_agent("claude", work_dir)
+}
+
+/// 预检任意注册表 Agent（按 profile.preflight_args）。
+pub fn preflight_agent(agent_id: &str, work_dir: &str) -> Result<(), String> {
     if std::env::var("SUPERVISE_SKIP_PREFLIGHT").as_deref() == Ok("1") {
         return Ok(());
     }
-    let args = [
-        "-p".to_string(),
-        "ping".to_string(),
-        "--max-turns".to_string(),
-        "1".to_string(),
-    ];
+    let profile = agent_registry::get(agent_id)
+        .ok_or_else(|| format!("预检失败：未注册的 Agent {agent_id}"))?;
+    let args: Vec<String> = profile.preflight_args.iter().map(|s| s.to_string()).collect();
     let (command, cmd_args) =
-        terminal_host::terminal_command("claude", &args).map_err(|e| format!("Claude 预检: {e}"))?;
+        terminal_host::terminal_command(profile.command, &args).map_err(|e| format!("{} 预检: {e}", profile.name))?;
     let mut child = Command::new(&command)
         .args(&cmd_args)
         .current_dir(work_dir)
@@ -224,7 +229,7 @@ pub fn preflight_claude(work_dir: &str) -> Result<(), String> {
     };
     let timed_out = exit.is_none();
     let output = format!("{}{}", stdout_reader.join().unwrap_or_default(), stderr_reader.join().unwrap_or_default());
-    classify_preflight(timed_out, exit, &output)
+    classify_preflight(timed_out, exit, &output, profile.name)
 }
 
 // ---------------- 进程桥 ----------------
@@ -541,17 +546,17 @@ mod tests {
     #[test]
     fn preflight_classifies_exit_codes_and_errors() {
         use super::classify_preflight;
-        assert!(classify_preflight(false, Some(0), "ok").is_ok());
-        let cf = classify_preflight(false, Some(1), "API Error: 403 cf-ray: a384e9")
+        assert!(classify_preflight(false, Some(0), "ok", "Claude Code").is_ok());
+        let cf = classify_preflight(false, Some(1), "API Error: 403 cf-ray: a384e9", "Claude Code")
             .unwrap_err();
         assert!(cf.contains("403"), "{cf}");
-        let login = classify_preflight(false, Some(1), "Please run /login").unwrap_err();
+        let login = classify_preflight(false, Some(1), "Please run /login", "Claude Code").unwrap_err();
         assert!(login.contains("登录"), "{login}");
-        let missing = classify_preflight(false, Some(1), "program not found ENOENT").unwrap_err();
+        let missing = classify_preflight(false, Some(1), "program not found ENOENT", "Claude Code").unwrap_err();
         assert!(missing.contains("未找到"), "{missing}");
-        let other = classify_preflight(false, Some(7), "boom").unwrap_err();
+        let other = classify_preflight(false, Some(7), "boom", "Claude Code").unwrap_err();
         assert!(other.contains('7'), "{other}");
-        assert!(classify_preflight(true, None, "").unwrap_err().contains("超时"));
+        assert!(classify_preflight(true, None, "", "Claude Code").unwrap_err().contains("超时"));
     }
 
     #[test]
@@ -595,6 +600,7 @@ mod tests {
             model: None,
             mock: true,
             reviewer_agent: None,
+            worker_agent: None,
             terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, None).expect("spawn 成功");
@@ -653,6 +659,7 @@ mod tests {
             model: None,
             mock: true,
             reviewer_agent: None,
+            worker_agent: None,
             terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, None).expect("spawn 成功");
@@ -795,6 +802,7 @@ mod tests {
             model: None,
             mock: true,
             reviewer_agent: None,
+            worker_agent: None,
             terminal_session_id: None,
         };
         let mut child = spawn_supervise(&req, Some("task-9")).expect("spawn");

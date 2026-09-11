@@ -72,6 +72,8 @@ export interface TerminalWorkspaceHandle {
   startWith: (agent: TerminalAgent, opts?: StartOptions) => void;
   /** 始终新建 Claude PTY（驱动任务用），返回 session id */
   startClaudeForTask: (workDir?: string) => Promise<string>;
+  /** 找到指定 Agent 在该目录下的空闲已启动 pane，返回 session id（多 Agent 驱动用） */
+  claimIdleAgentPane: (agentId: string, workDir: string) => string | null;
   focusSession: (sessionId: string) => void;
   /** 把键盘焦点交给当前 Claude xterm（切到终端 tab 后收键） */
   focusActiveClaude: () => void;
@@ -514,6 +516,18 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       },
       focusActiveClaude: () => {
         terminals.current.get(activeClaudeIdRef.current)?.focus();
+      },
+      claimIdleAgentPane: (agentId, workDir) => {
+        const tab = claudeTabsRef.current.find(
+          (t) =>
+            t.agentId === agentId &&
+            t.pane.session?.id &&
+            !isBusyStatus(t.pane.status) &&
+            samePath(t.pane.session.work_dir ?? "", workDir.trim()),
+        );
+        if (!tab) return null;
+        focusClaudeTab(tab.id);
+        return tab.pane.session?.id ?? null;
       },
     }),
     [addClaudeTab, focusClaudeTab, onProjectWorkDirChange, patchClaudeTab, pickClaudeTabForResume, projectWorkDir, startPane],

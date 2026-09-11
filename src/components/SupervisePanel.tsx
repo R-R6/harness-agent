@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { continueSuperviseTerminal, runSupervise, runSuperviseTerminal } from "../lib/api";
+import { continueSuperviseTerminal, fetchAgentCatalog, runSupervise, runSuperviseTerminal } from "../lib/api";
 import { Icon } from "./Icon";
-import type { SuperviseRequest, TaskInfo, TaskStatus } from "../types";
+import type { AgentCatalogEntry, SuperviseRequest, TaskInfo, TaskStatus } from "../types";
 
 interface Props {
   /** 工作目录（受控：由 App 持有的项目上下文，与 Claude 终端 pane 同源） */
@@ -18,8 +18,8 @@ interface Props {
   onContinue?: (taskId: string) => void;
   /** 终端驱动模式启动成功后回调（App 切到终端 tab） */
   onDriveStarted?: () => void;
-  /** 驱动前准备 Claude PTY，返回 terminal session id */
-  prepareDriveTerminal?: (workDir: string) => Promise<string>;
+  /** 驱动前准备工人 PTY（claude 可自动新建；其余 agent 需已有空闲 pane），返回 session id */
+  prepareDriveTerminal?: (agentId: string, workDir: string) => Promise<string>;
 }
 
 const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
@@ -50,6 +50,39 @@ export function SupervisePanel({
   const [continuing, setContinuing] = useState(false);
   const [continueError, setContinueError] = useState("");
   const logEndRef = useRef<HTMLDivElement>(null);
+  // 多 Agent：注册表 + 角色选择（记忆上次选择）
+  const [catalog, setCatalog] = useState<AgentCatalogEntry[]>([]);
+  const [workerAgent, setWorkerAgent] = useState(
+    () => localStorage.getItem("ha-worker-agent") || "claude",
+  );
+  const [reviewerAgent, setReviewerAgent] = useState(
+    () => localStorage.getItem("ha-reviewer-agent") || "codex",
+  );
+
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve(fetchAgentCatalog())
+      .then((entries) => {
+        if (alive && Array.isArray(entries)) setCatalog(entries);
+      })
+      .catch(() => {
+        // 注册表不可用时选择器只显示默认 claude/codex
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const workerOptions = catalog.filter((c) => c.can_work);
+  const reviewerOptions = catalog.filter((c) => c.can_review);
+  const selectWorker = (id: string) => {
+    setWorkerAgent(id);
+    localStorage.setItem("ha-worker-agent", id);
+  };
+  const selectReviewer = (id: string) => {
+    setReviewerAgent(id);
+    localStorage.setItem("ha-reviewer-agent", id);
+  };
 
   // 运行中任务的日志实时增长时，滚动到底部
   useEffect(() => {
@@ -74,9 +107,11 @@ export function SupervisePanel({
         work_dir: dir,
         level,
         mock,
+        worker_agent: workerAgent,
+        reviewer_agent: reviewerAgent,
       };
       if (driveTerminal && prepareDriveTerminal) {
-        req.terminal_session_id = await prepareDriveTerminal(dir);
+        req.terminal_session_id = await prepareDriveTerminal(workerAgent, dir);
         // 先切到终端，让 xterm 挂上并能收键；引擎会等信任对话框结束再注入。
         onDriveStarted?.();
       }
@@ -200,6 +235,35 @@ export function SupervisePanel({
         </label>
         <div className="form-row">
           <label>
+            被监督方
+            <select
+              value={workerAgent}
+              onChange={(e) => selectWorker(e.currentTarget.value)}
+              title="谁来干活：以交互终端被注入任务"
+            >
+              {(workerOptions.length ? workerOptions : [{ id: "claude", name: "Claude Code", installed: true, sessions_present: false, can_work: true, can_review: true }]).map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                  {c.installed ? "" : "（未检测到安装）"}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label title={workerAgent === reviewerAgent ? "同型号自审可能偏软，建议换一个 Agent 审查" : "审查者以无头模式运行，读取会话/工作区后给出验收结论"}>
+            监督方
+            <select
+              value={reviewerAgent}
+              onChange={(e) => selectReviewer(e.currentTarget.value)}
+            >
+              {(reviewerOptions.length ? reviewerOptions : [{ id: "codex", name: "Codex CLI", installed: true, sessions_present: false, can_work: true, can_review: true }]).map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                  {c.installed ? "" : "（未检测到安装）"}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
             分级
             <select value={level} onChange={(e) => setLevel(e.currentTarget.value)}>
               <option value="L0">L0 · 小活（1 轮快审）</option>
@@ -215,13 +279,13 @@ export function SupervisePanel({
             />
             模拟模式（不花钱）
           </label>
-          <label className="checkbox" title="任务注入 Claude 终端 pane：自动新开 Claude PTY（一任务一会话），干活全程可见、可随时插手">
+          <label className="checkbox" title="任务注入被监督方的终端 pane：驱动时自动准备对应 PTY，干活全程可见、可随时插手">
             <input
               type="checkbox"
               checked={driveTerminal}
               onChange={(e) => setDriveTerminal(e.currentTarget.checked)}
             />
-            驱动 Claude 终端
+            驱动终端
           </label>
         </div>
         {error && <div className="error">{error}</div>}

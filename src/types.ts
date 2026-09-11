@@ -24,7 +24,11 @@ export interface SuperviseRequest {
   max_rounds?: number;
   model?: string;
   mock?: boolean;
-  /** 终端驱动：绑定到指定 Claude PTY（一任务一会话） */
+  /** 监督方（审查者）Agent id（agent_registry；缺省 codex） */
+  reviewer_agent?: string;
+  /** 被监督方（工人）Agent id（agent_registry；缺省 claude） */
+  worker_agent?: string;
+  /** 终端驱动：绑定到指定 PTY（一任务一会话） */
   terminal_session_id?: string;
 }
 

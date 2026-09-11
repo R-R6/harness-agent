@@ -60,6 +60,9 @@ struct TaskInfo {
     /// 监督方 Agent id（多 Agent 监督；缺省 codex，续跑沿用）
     #[serde(default)]
     reviewer_agent: Option<String>,
+    /// 被监督方 Agent id（多 Agent 监督；缺省 claude，续跑按此找 pane）
+    #[serde(default)]
+    worker_agent: Option<String>,
     started_at_ms: u64,
 }
 
@@ -664,6 +667,7 @@ async fn run_supervise(
         log: Vec::new(),
         mock: request.mock,
         reviewer_agent: None,
+        worker_agent: None,
         started_at_ms: now_ms(),
     });
     persist_tasks(&app);
@@ -834,8 +838,20 @@ async fn run_supervise_terminal(
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
 
-    // 启动前预检 Claude CLI 端点可用（403/未登录等在此拦下，不烧任务轮次）
-    supervise_runner::preflight_claude(&work_dir)?;
+    // 被监督方（工人）与监督方（审查者）按注册表解析，缺省维持 claude/codex
+    let worker_agent = request
+        .worker_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("claude");
+    let worker_profile = agent_registry::get(worker_agent)
+        .ok_or_else(|| format!("未注册的被监督方 Agent: {worker_agent}"))?;
+    if !worker_profile.can_work {
+        return Err(format!("{} 不支持作为被监督方（无交互终端模式）", worker_profile.name));
+    }
+    // 启动前预检工人 CLI 端点可用（403/未登录等在此拦下，不烧任务轮次）
+    supervise_runner::preflight_agent(worker_agent, &work_dir)?;
 
     // 监督方（审查者）按注册表解析：默认 codex（兼容旧前端）。
     // 先校验（不占 pane）；构造推迟到任务登记处以复用 model 解析结果。
@@ -866,8 +882,11 @@ async fn run_supervise_terminal(
             let proc = sessions.get(want).ok_or_else(|| {
                 format!("指定的终端会话不存在或已退出：{want}")
             })?;
-            if proc.agent != "claude" {
-                return Err(format!("指定会话不是 Claude 终端：{want}"));
+            if proc.agent != worker_agent {
+                return Err(format!(
+                    "指定会话不是 {} 终端：{want}",
+                    worker_profile.name
+                ));
             }
             if normalize_path(&proc.work_dir) != work_dir {
                 return Err(format!(
@@ -883,14 +902,16 @@ async fn run_supervise_terminal(
             sessions
                 .iter()
                 .find(|(id, p)| {
-                    p.agent == "claude"
+                    p.agent == worker_agent
                         && normalize_path(&p.work_dir) == work_dir
                         && engine_session_available(&busy, id)
                 })
                 .map(|(id, _)| id.clone())
                 .ok_or_else(|| {
-                    "未找到可用的 Claude 终端（请先启动 Claude，或传入 terminal_session_id）"
-                        .to_string()
+                    format!(
+                        "未找到可用的 {} 终端（请先在工作台启动，或传入 terminal_session_id）",
+                        worker_profile.name
+                    )
                 })?
         };
         busy.insert(id.clone());
@@ -928,7 +949,8 @@ async fn run_supervise_terminal(
         }
     };
     let settings = std::path::Path::new(&home).join(".claude").join("settings.json");
-    let hook_installed = !request.mock;
+    // Stop hook 是 Claude Code 专属：其他工人靠引擎的会话静默兜底判定轮末
+    let hook_installed = !request.mock && worker_agent == "claude";
     if hook_installed {
         if let Err(e) = ensure_stop_hook(&settings, &marker_file) {
             release_engine_session(&state, &session_id);
@@ -955,6 +977,7 @@ async fn run_supervise_terminal(
         log: Vec::new(),
         mock: request.mock,
         reviewer_agent: Some(reviewer_agent.to_string()),
+        worker_agent: Some(worker_agent.to_string()),
         started_at_ms: started_at,
     });
     persist_tasks(&app);
@@ -1150,7 +1173,7 @@ async fn continue_supervise_terminal(
     request: SuperviseContinueRequest,
 ) -> Result<String, String> {
     // 1) 校验：任务存在、engine 类型、可续跑终态（未通过=返工；中止/取消=重启）
-    let (task, work_dir, last_reason, started_at, mock, is_rework, reviewer_agent) = {
+    let (task, work_dir, last_reason, started_at, mock, is_rework, reviewer_agent, worker_agent) = {
         let tasks = state.tasks.lock().map_err(|_| "任务状态锁已损坏".to_string())?;
         let t = tasks
             .get(&request.task_id)
@@ -1167,14 +1190,15 @@ async fn continue_supervise_terminal(
             t.mock,
             is_rework,
             t.reviewer_agent.clone().unwrap_or_else(|| "codex".to_string()),
+            t.worker_agent.clone().unwrap_or_else(|| "claude".to_string()),
         )
     };
     let work_dir = normalize_path(&work_dir);
     if work_dir.is_empty() || !std::path::Path::new(&work_dir).is_dir() {
         return Err(format!("工作目录不存在: {work_dir}"));
     }
-    // 续跑前同样预检端点可用，避免白装 hook 再中止
-    supervise_runner::preflight_claude(&work_dir)?;
+    // 续跑前按原任务的工人 Agent 预检端点，避免白装 hook 再中止
+    supervise_runner::preflight_agent(&worker_agent, &work_dir)?;
 
     // 2) 复用原 Claude pane：FAIL 后引擎已释放占用，按目录直接命中空闲 pane
     let session_id = {
@@ -1510,6 +1534,7 @@ mod tests {
             log: vec!["line1".into(), "line2".into()],
             mock: true,
             reviewer_agent: Some("codex".into()),
+            worker_agent: Some("claude".into()),
             started_at_ms: now_ms(),
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -1549,6 +1574,7 @@ mod tests {
             log: vec![],
             mock: false,
             reviewer_agent: None,
+            worker_agent: None,
             started_at_ms: 1,
         }
     }

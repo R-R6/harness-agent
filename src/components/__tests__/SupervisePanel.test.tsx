@@ -86,7 +86,8 @@ describe("SupervisePanel", () => {
     renderPanel();
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     expect(screen.getByText("任务描述不能为空")).toBeInTheDocument();
-    expect(mocks.invoke).not.toHaveBeenCalled();
+    // agent_catalog 挂载期会调用；这里只断言没有提交任务
+    expect(mocks.invoke.mock.calls.some((c) => c[0] === "run_supervise")).toBe(false);
   });
 
   it("填写任务 + 工作目录 → 启动调用 run_supervise", async () => {
@@ -103,6 +104,8 @@ describe("SupervisePanel", () => {
         work_dir: "D:\\work",
         level: "L1",
         mock: true,
+        worker_agent: "claude",
+        reviewer_agent: "codex",
       },
     });
   });
@@ -141,7 +144,7 @@ describe("SupervisePanel", () => {
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "测试任务");
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     expect(screen.getByText(/工作目录不能为空/)).toBeInTheDocument();
-    expect(mocks.invoke).not.toHaveBeenCalled();
+    expect(mocks.invoke.mock.calls.some((c) => c[0] === "run_supervise")).toBe(false);
   });
 
   it("mock 关闭时 request.mock=false", async () => {
@@ -150,22 +153,24 @@ describe("SupervisePanel", () => {
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "t");
     await userEvent.click(screen.getByLabelText("模拟模式（不花钱）"));
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
-    const req = mocks.invoke.mock.calls[0][1].request;
+    const req = mocks.invoke.mock.calls.find((c) => c[0] === "run_supervise")?.[1].request;
     expect(req.mock).toBe(false);
   });
 
-  it("勾选「驱动 Claude 终端」→ 调用 run_supervise_terminal 并回调 onDriveStarted", async () => {
+  it("勾选「驱动终端」→ 调用 run_supervise_terminal 并回调 onDriveStarted", async () => {
     mocks.invoke.mockResolvedValue("task-8");
     const onDriveStarted = vi.fn();
     const prepareDriveTerminal = vi.fn().mockResolvedValue("terminal-99");
     renderPanel("D:\\work", { onDriveStarted, prepareDriveTerminal });
     await userEvent.type(screen.getByPlaceholderText(/写一个计算器/), "任务B");
-    await userEvent.click(screen.getByLabelText("驱动 Claude 终端"));
+    await userEvent.click(screen.getByLabelText("驱动终端"));
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
-    await waitFor(() => expect(prepareDriveTerminal).toHaveBeenCalledWith("D:\\work"));
+    await waitFor(() => expect(prepareDriveTerminal).toHaveBeenCalledWith("claude", "D:\\work"));
     await waitFor(() => expect(onDriveStarted).toHaveBeenCalledTimes(1));
+    // 与 agent_catalog 挂载调用无关：只比较 run_supervise_terminal 的调用序
+    const driveCallIdx = mocks.invoke.mock.calls.findIndex((c) => c[0] === "run_supervise_terminal");
     expect(onDriveStarted.mock.invocationCallOrder[0]).toBeLessThan(
-      mocks.invoke.mock.invocationCallOrder[0],
+      mocks.invoke.mock.invocationCallOrder[driveCallIdx],
     );
     expect(mocks.invoke).toHaveBeenCalledWith("run_supervise_terminal", {
       request: {
@@ -173,6 +178,8 @@ describe("SupervisePanel", () => {
         work_dir: "D:\\work",
         level: "L1",
         mock: true,
+        worker_agent: "claude",
+        reviewer_agent: "codex",
         terminal_session_id: "terminal-99",
       },
     });
