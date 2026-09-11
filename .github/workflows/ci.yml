@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "wip/**", "feat/**", "fix/**"]
+  pull_request:
+
+jobs:
+  frontend:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # 单 worker：并发 fork 在受限环境下容易起不来（真机观察）
+      - run: npx vitest run --maxWorkers=1
+
+  rust:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # MSVC 目标由 tauri 自己的 embed_manifest_for_tests 处理 manifest，
+      # windows-gnu 缺口见 src-tauri/build.rs
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --workspace
