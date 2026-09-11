@@ -95,12 +95,15 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   ]);
   const [activeClaudeId, setActiveClaudeId] = useState("claude-1");
   const [codexPane, setCodexPane] = useState<PaneState>(initialPane);
+  /** 后端通知横幅（预信任失败等：不致命，但用户必须在启动终端前看见） */
+  const [terminalNotice, setTerminalNotice] = useState("");
   const claudeTabsRef = useRef(claudeTabs);
   const activeClaudeIdRef = useRef(activeClaudeId);
   const codexPaneRef = useRef(codexPane);
   const terminals = useRef(new Map<string, Terminal>());
   const inputQueuesRef = useRef(new Map<string, Promise<void>>());
   const codexStabilizerRef = useRef(createOutputStabilizer());
+  const noticeTimerRef = useRef<number | null>(null);
   const pendingOutputRef = useRef(new Map<string, { sessionId: string; data: string }>());
   /** sessionId → 尚未绑定到 pane 的输出（start_terminal 返回前 PTY 已可能吐字） */
   const orphanOutputRef = useRef(new Map<string, string>());
@@ -305,10 +308,17 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       },
     );
 
+    const stopNotice = listenWhileMounted<{ message: string }>("terminal-notice", (event) => {
+      setTerminalNotice(event.payload.message);
+      if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+      noticeTimerRef.current = window.setTimeout(() => setTerminalNotice(""), 15_000);
+    });
+
     return () => {
       stopOutput();
       stopExit();
       stopError();
+      stopNotice();
     };
   }, [enqueueOutput, findPaneKeyBySession, patchClaudeTab, patchCodex]);
 
@@ -548,6 +558,20 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           <span>仅调用本机 CLI，不读取或托管凭据</span>
         </div>
       </div>
+      {terminalNotice && (
+        <div className="terminal-notice" role="status">
+          <Icon name="shield" size={14} />
+          <span>{terminalNotice}</span>
+          <button
+            type="button"
+            className="terminal-notice__close"
+            onClick={() => setTerminalNotice("")}
+            aria-label="关闭提示"
+          >
+            ×
+          </button>
+        </div>
+      )}
       <div
         className={`terminal-grid ${stacked ? "terminal-grid--stacked" : ""}`}
         ref={gridRef}

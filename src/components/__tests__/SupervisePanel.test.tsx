@@ -213,6 +213,18 @@ describe("SupervisePanel", () => {
     expect(screen.queryByRole("button", { name: "再来一轮" })).not.toBeInTheDocument();
   });
 
+  it("查看态（已中止/已取消）：也显示「再来一轮」（以原任务重启）", () => {
+    const first = renderPanel("D:\\work", {
+      focusedTask: makeTask({ status: "aborted", last_reason: "输入栏未就绪" }),
+    });
+    expect(screen.getByRole("button", { name: "再来一轮" })).toBeInTheDocument();
+    first.unmount();
+    renderPanel("D:\\work", {
+      focusedTask: makeTask({ status: "cancelled", last_reason: "用户取消" }),
+    });
+    expect(screen.getByRole("button", { name: "再来一轮" })).toBeInTheDocument();
+  });
+
   it("启动请求进行中时禁用启动按钮，防止连点", async () => {
     let resolveStart: ((id: string) => void) | undefined;
     mocks.invoke.mockImplementation(

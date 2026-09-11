@@ -133,13 +133,19 @@ export function SupervisePanel({
             <span className={`task-badge task-badge--${focusedTask.status}`}>
               {TASK_STATUS_LABEL[focusedTask.status]}
             </span>
-            {focusedTask.status === "rejected" && (
+            {(focusedTask.status === "rejected" ||
+              focusedTask.status === "aborted" ||
+              focusedTask.status === "cancelled") && (
               <button
                 type="button"
                 className="task-continue__btn"
                 onClick={() => void continueRound()}
                 disabled={continuing}
-                title="注入上轮审查意见，Claude 同会话继续落地并重新审查"
+                title={
+                  focusedTask.status === "rejected"
+                    ? "注入上轮审查意见，Claude 同会话继续落地并重新审查"
+                    : "以原任务正文重新注入（中止/取消的任务，任务可能尚未执行过）"
+                }
               >
                 <Icon name="refresh" size={14} />
                 {continuing ? "再来一轮…" : "再来一轮"}
