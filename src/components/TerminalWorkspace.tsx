@@ -156,7 +156,10 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       if (known) return known;
       const entry = catalog.find((c) => c.id === agentId);
       if (entry) {
-        return { id: agentId, label: entry.name, description: `${entry.name} · 本机 CLI` };
+        const desc = entry.name.toLowerCase().includes("cli")
+          ? `本机 ${entry.name}`
+          : `本机 ${entry.name} CLI`;
+        return { id: agentId, label: entry.name, description: desc };
       }
       return { id: agentId, label: agentId, description: "本机 CLI" };
     },
