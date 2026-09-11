@@ -5,7 +5,11 @@ use supervise_engine::{
     MockReviewer, PaneIo, Reviewer, Verdict,
 };
 use supervise_runner::{ReviewArtifact, SuperviseContinueRequest, SuperviseRequest};
-use terminal_host::{kill as kill_terminal_process, resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command, wait as wait_terminal_process, write_input as write_terminal_input};
+use terminal_host::{
+    claude_config_path, ensure_folder_trusted, kill as kill_terminal_process,
+    resize as resize_terminal_pty, spawn as spawn_terminal_pty, terminal_command,
+    wait as wait_terminal_process, write_input as write_terminal_input,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read};
@@ -13,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// 监督任务 id 自增计数器（避免毫秒时间戳碰撞）
+/// 监督任务 id 自增计数器（进程内；重启后 alloc_task_id 会越过已有 task-N）
 static TASK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static TERMINAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -127,6 +131,56 @@ impl SuperviseState {
 /// 每任务日志上限（截断旧行，避免 tasks.json 无限膨胀）
 const TASK_LOG_MAX_LINES: usize = 500;
 
+fn parse_task_num(id: &str) -> Option<u64> {
+    id.strip_prefix("task-")?.parse().ok()
+}
+
+fn max_task_num_in_dir(dir: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter_map(|e| parse_task_num(&e.file_name().to_string_lossy()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// 已占用的最大 task-N：注册表全部 id + 本目录及已知工作目录的 `.supervise/tasks/`。
+/// 产物按 `{work_dir}/.supervise/tasks/<id>/` 隔离；id 必须全局唯一，否则
+/// HashMap / 重启后的计数器会把新任务写进第一个空间的 `task-1`（真实事故）。
+fn known_task_num_floor(existing: &HashMap<String, TaskInfo>, work_dir: &str) -> u64 {
+    let mut max = existing
+        .keys()
+        .filter_map(|id| parse_task_num(id))
+        .max()
+        .unwrap_or(0);
+    let mut dirs: HashSet<String> = HashSet::new();
+    if !work_dir.trim().is_empty() {
+        dirs.insert(work_dir.trim().to_string());
+    }
+    for t in existing.values() {
+        if !t.work_dir.trim().is_empty() {
+            dirs.insert(t.work_dir.clone());
+        }
+    }
+    for d in dirs {
+        max = max.max(max_task_num_in_dir(
+            &std::path::Path::new(&d).join(".supervise").join("tasks"),
+        ));
+    }
+    max
+}
+
+fn alloc_task_id(existing: &HashMap<String, TaskInfo>, work_dir: &str) -> String {
+    let floor = known_task_num_floor(existing, work_dir);
+    loop {
+        let n = TASK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if n > floor {
+            return format!("task-{n}");
+        }
+    }
+}
+
 /// 任务注册表落盘路径：{app_data_dir}/supervise/tasks.json
 fn tasks_file_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app
@@ -183,6 +237,12 @@ fn load_tasks(app: &AppHandle) {
         for t in tasks {
             map.insert(t.id.clone(), t);
         }
+        let floor = known_task_num_floor(&map, "");
+        let next = floor.saturating_add(1);
+        let cur = TASK_COUNTER.load(Ordering::Relaxed);
+        if cur <= floor {
+            TASK_COUNTER.store(next, Ordering::Relaxed);
+        }
     }
     persist_tasks(app);
 }
@@ -216,6 +276,7 @@ struct TerminalProcess {
     master: std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     child: std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send>>>,
     pid: Option<u32>,
+    recent_output: Arc<Mutex<String>>,
 }
 
 struct TerminalState {
@@ -240,11 +301,13 @@ fn emit_terminal_output(
     app: &AppHandle,
     session_id: &str,
     pending: &mut Vec<u8>,
+    recent_output: &Arc<Mutex<String>>,
 ) {
     loop {
         match std::str::from_utf8(pending) {
             Ok(data) => {
                 if !data.is_empty() {
+                    append_recent_output(recent_output, data);
                     let _ = app.emit(
                         "terminal-output",
                         serde_json::json!({ "sessionId": session_id, "data": data }),
@@ -258,6 +321,7 @@ fn emit_terminal_output(
                 if valid > 0 {
                     let data = std::str::from_utf8(&pending[..valid])
                         .expect("UTF-8 valid prefix reported by std::str::from_utf8");
+                    append_recent_output(recent_output, data);
                     let _ = app.emit(
                         "terminal-output",
                         serde_json::json!({ "sessionId": session_id, "data": data }),
@@ -267,6 +331,7 @@ fn emit_terminal_output(
                 }
                 if let Some(invalid_len) = error.error_len() {
                     let replacement = String::from_utf8_lossy(&pending[..invalid_len]).to_string();
+                    append_recent_output(recent_output, &replacement);
                     let _ = app.emit(
                         "terminal-output",
                         serde_json::json!({ "sessionId": session_id, "data": replacement }),
@@ -279,6 +344,22 @@ fn emit_terminal_output(
                 return;
             }
         }
+    }
+}
+
+fn append_recent_output(buf: &Arc<Mutex<String>>, data: &str) {
+    const MAX: usize = 24_000;
+    let Ok(mut s) = buf.lock() else {
+        return;
+    };
+    s.push_str(data);
+    if s.len() > MAX {
+        // 截断点必须落在 UTF-8 字符边界（TUI 中文输出是多字节）
+        let mut excess = s.len() - MAX;
+        while !s.is_char_boundary(excess) {
+            excess += 1;
+        }
+        s.drain(..excess);
     }
 }
 
@@ -359,6 +440,14 @@ fn start_terminal(
     if !std::path::Path::new(&request.work_dir).is_dir() {
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
+    if request.agent == "claude" {
+        if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+            let cfg = claude_config_path(std::path::Path::new(&home));
+            if let Err(error) = ensure_folder_trusted(&cfg, &request.work_dir) {
+                eprintln!("[terminal] 预信任 Claude 工作目录失败: {error}");
+            }
+        }
+    }
     let extra_args: Vec<String> = request
         .args
         .clone()
@@ -389,7 +478,9 @@ fn start_terminal(
         master: spawned.master,
         child: spawned.child,
         pid: spawned.pid,
+        recent_output: Arc::new(Mutex::new(String::new())),
     };
+    let recent_output = process.recent_output.clone();
     state.sessions.lock().map_err(|_| "终端状态锁已损坏")?.insert(id.clone(), process);
 
     let app2 = app.clone();
@@ -403,7 +494,7 @@ fn start_terminal(
                 Ok(0) => break,
                 Ok(size) => {
                     pending_utf8.extend_from_slice(&buffer[..size]);
-                    emit_terminal_output(&app2, &id2, &mut pending_utf8);
+                    emit_terminal_output(&app2, &id2, &mut pending_utf8, &recent_output);
                 }
                 Err(error) => {
                     let _ = app2.emit(
@@ -416,6 +507,7 @@ fn start_terminal(
         }
         if !pending_utf8.is_empty() {
             let data = String::from_utf8_lossy(&pending_utf8).to_string();
+            append_recent_output(&recent_output, &data);
             let _ = app2.emit(
                 "terminal-output",
                 serde_json::json!({ "sessionId": id2, "data": data }),
@@ -502,8 +594,11 @@ async fn run_supervise(
         return Err(format!("工作目录不存在: {}", request.work_dir));
     }
     // 无头模式：同目录可并发（产物按 task_id 隔离）。先分配 id 再 spawn，
-    // 以便 SUPERVISE_TASK_ID 进入子进程环境。
-    let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
+    // 以便 SUPERVISE_TASK_ID 进入子进程环境。id 必须越过注册表/磁盘已有编号。
+    let task_id = {
+        let tasks = state.tasks.lock().map_err(|_| "任务状态锁已损坏".to_string())?;
+        alloc_task_id(&tasks, &work_dir)
+    };
 
     let mut child = match supervise_runner::spawn_supervise(&request, Some(&task_id)) {
         Ok(c) => c,
@@ -654,6 +749,20 @@ impl PaneIo for TerminalPaneAdapter {
         let state = self.app.state::<TerminalState>();
         sessions_dir_of(&state, &self.session_id)
     }
+
+    fn recent_output(&self) -> String {
+        let state = self.app.state::<TerminalState>();
+        state
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .get(&self.session_id)
+                    .and_then(|p| p.recent_output.lock().ok().map(|g| g.clone()))
+            })
+            .unwrap_or_default()
+    }
 }
 
 fn sessions_dir_of(state: &TerminalState, session_id: &str) -> Option<String> {
@@ -729,7 +838,10 @@ async fn run_supervise_terminal(
 
     let rounds = level_rounds(request.level.as_deref(), request.max_rounds);
     let model = request.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
-    let task_id = format!("task-{}", TASK_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let task_id = {
+        let tasks = state.tasks.lock().map_err(|_| "任务状态锁已损坏".to_string())?;
+        alloc_task_id(&tasks, &work_dir)
+    };
     // 令牌需单次运行唯一：task_id 在应用重启后从头计数，若令牌只带 task_id，
     // 前一次运行的陈旧会话会与新任务同令牌、被预钉误命中（真实事故：同目录
     // 二次运行 task-2，注入实际落进新会话，引擎却钉死旧会话，审查/确认全对着错文件）
@@ -1330,5 +1442,82 @@ mod tests {
         busy.insert("terminal-1".into());
         assert!(!engine_session_available(&busy, "terminal-1"));
         assert!(engine_session_available(&busy, "terminal-2"));
+    }
+
+    fn stub_task(id: &str, work_dir: &str) -> TaskInfo {
+        TaskInfo {
+            id: id.into(),
+            work_dir: work_dir.into(),
+            task: "t".into(),
+            kind: TaskKind::Engine,
+            status: TaskStatus::Accepted,
+            rounds: 1,
+            last_reason: String::new(),
+            log: vec![],
+            mock: false,
+            started_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn append_recent_output_truncates_on_char_boundary() {
+        let buf = Arc::new(Mutex::new(String::new()));
+        // 中文多字节 + 超过 24KB：截断点若不在字符边界会 panic
+        let chunk = "监督引擎".repeat(3000);
+        append_recent_output(&buf, &chunk);
+        let s = buf.lock().unwrap().clone();
+        assert!(s.len() <= 24_000 + 12);
+        assert!(s.chars().next().is_some());
+    }
+
+    #[test]
+    fn parse_task_num_only_task_prefix() {
+        assert_eq!(parse_task_num("task-1"), Some(1));
+        assert_eq!(parse_task_num("task-12"), Some(12));
+        assert_eq!(parse_task_num("task-x"), None);
+        assert_eq!(parse_task_num("other-1"), None);
+    }
+
+    #[test]
+    fn known_floor_uses_registry_and_does_not_share_across_dirs_on_disk() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ha-taskid-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let ws_a = tmp.join("ws-a");
+        let ws_b = tmp.join("ws-b");
+        std::fs::create_dir_all(ws_a.join(".supervise").join("tasks").join("task-3")).unwrap();
+        std::fs::create_dir_all(ws_b.join(".supervise").join("tasks").join("task-1")).unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(
+            "task-3".into(),
+            stub_task("task-3", &ws_a.to_string_lossy()),
+        );
+        // 注册表最大是 3，b 盘上的 task-1 不应把全局编号打回 1
+        assert_eq!(known_task_num_floor(&map, &ws_b.to_string_lossy()), 3);
+
+        let id = alloc_task_id(&map, &ws_b.to_string_lossy());
+        let n = parse_task_num(&id).expect("alloc 应返回 task-N");
+        assert!(n > 3, "新空间也应从全局已占用编号继续: {id}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn artifacts_live_under_the_task_work_dir_not_a_shared_root() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ha-art-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let ws_a = tmp.join("first-ws");
+        let ws_b = tmp.join("second-ws");
+        let a_dir = supervise_runner::resolve_artifact_dir(&ws_a.to_string_lossy(), Some("task-1"));
+        let b_dir = supervise_runner::resolve_artifact_dir(&ws_b.to_string_lossy(), Some("task-1"));
+        assert!(a_dir.starts_with(&ws_a), "{}", a_dir.display());
+        assert!(b_dir.starts_with(&ws_b), "{}", b_dir.display());
+        assert_ne!(a_dir, b_dir);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

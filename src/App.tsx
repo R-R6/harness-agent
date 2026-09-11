@@ -277,12 +277,15 @@ function App() {
     void loadTasks();
   }, [activeWorkspace, loadTasks]);
 
-  /** 终端驱动监督启动后切到终端 tab */
+  const terminalRef = useRef<TerminalWorkspaceHandle>(null);
+
+  /** 终端驱动监督启动后切到终端 tab，并把焦点交给 Claude xterm */
   const handleDriveStarted = useCallback(() => {
     setTab("terminals");
+    requestAnimationFrame(() => {
+      terminalRef.current?.focusActiveClaude();
+    });
   }, []);
-
-  const terminalRef = useRef<TerminalWorkspaceHandle>(null);
 
   /** 会话列表「在终端中续聊」：切到终端工作台，以对应 CLI 的 resume 参数启动；
    *  会话带原始 cwd（Claude JSONL 记录）则还原该会话的工作目录 */

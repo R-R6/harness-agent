@@ -71,6 +71,8 @@ export interface TerminalWorkspaceHandle {
   /** 始终新建 Claude PTY（驱动任务用），返回 session id */
   startClaudeForTask: (workDir?: string) => Promise<string>;
   focusSession: (sessionId: string) => void;
+  /** 把键盘焦点交给当前 Claude xterm（切到终端 tab 后收键） */
+  focusActiveClaude: () => void;
 }
 
 interface Props {
@@ -421,14 +423,29 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       startClaudeForTask: (workDir) => {
         const run = async () => {
           if (workDir !== undefined) onProjectWorkDirChange?.(workDir);
+          const target = (workDir ?? projectWorkDir ?? "").trim();
+          // 驱动任务必须换新 PTY：同目录里已经冻在信任菜单上的会话不会自己恢复。
+          const stale = claudeTabsRef.current.filter((tab) => {
+            const dir = tab.pane.session?.work_dir ?? "";
+            return Boolean(target) && isBusyStatus(tab.pane.status) && dir && samePath(dir, target);
+          });
+          for (const tab of stale) {
+            const sessionId = tab.pane.session?.id;
+            if (!sessionId) continue;
+            patchClaudeTab(tab.id, { status: "stopping", error: "" });
+            try {
+              await stopTerminal(sessionId);
+            } catch {
+              // 旧进程杀不掉也不阻断新启动；新 pane 才是可交互的那一个。
+            }
+            patchClaudeTab(tab.id, { status: "exited", session: null, error: "" });
+          }
           const idle = claudeTabsRef.current.find(
             (t) => !isBusyStatus(t.pane.status) && !t.pane.session,
           );
           const tabId = idle?.id ?? addClaudeTab();
-          if (idle) {
-            patchClaudeTab(idle.id, { status: "starting", error: "" });
-            focusClaudeTab(idle.id);
-          }
+          focusClaudeTab(tabId);
+          if (idle) patchClaudeTab(idle.id, { status: "starting", error: "" });
           const terminal = terminals.current.get(tabId);
           const sessionId = await startPane(
             tabId,
@@ -452,8 +469,11 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         const tab = claudeTabsRef.current.find((t) => t.pane.session?.id === sessionId);
         if (tab) focusClaudeTab(tab.id);
       },
+      focusActiveClaude: () => {
+        terminals.current.get(activeClaudeIdRef.current)?.focus();
+      },
     }),
-    [addClaudeTab, focusClaudeTab, onProjectWorkDirChange, patchClaudeTab, pickClaudeTabForResume, startPane],
+    [addClaudeTab, focusClaudeTab, onProjectWorkDirChange, patchClaudeTab, pickClaudeTabForResume, projectWorkDir, startPane],
   );
 
   const handleStop = useCallback(
@@ -859,6 +879,12 @@ function TerminalSurface({
   }, [workspaceActive, surfaceVisible]);
 
   useEffect(() => {
+    if (workspaceActive && surfaceVisible) {
+      terminalRef.current?.focus();
+    }
+  }, [workspaceActive, surfaceVisible]);
+
+  useEffect(() => {
     callbacksRef.current = { onMount, onUnmount, onInput, onResize, onFitAddon, onLoadError };
   }, [onInput, onMount, onResize, onUnmount, onFitAddon, onLoadError]);
 
@@ -931,6 +957,7 @@ function TerminalSurface({
         mountedRef.current = true;
         writeIdleBanner(terminal, agent);
         dataListenerRef.current = terminal.onData((data) => callbacksRef.current.onInput(data));
+        terminal.focus();
         if (agent.id === "codex") {
           cursorPinRef.current = pinCursorSteady(terminal);
           terminal.write(CODEX_CURSOR_PIN);

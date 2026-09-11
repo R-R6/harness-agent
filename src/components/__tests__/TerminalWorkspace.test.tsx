@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => {
     writes: string[] = [];
     options: unknown;
     onDataHandler: ((data: string) => void) | null = null;
+    focus = vi.fn();
     dispose = vi.fn();
     reset = vi.fn(function (this: MockTerminal) {
       this.writes = [];
@@ -527,6 +528,7 @@ describe("TerminalWorkspace", () => {
     expect(firstId).toBe("terminal-claude-1");
     expect(secondId).toBe("terminal-claude-2");
     expect(mocks.invoke.mock.calls.filter((call) => call[0] === "start_terminal")).toHaveLength(2);
+    expect(mocks.invoke.mock.calls.filter((call) => call[0] === "stop_terminal")).toHaveLength(1);
     expect(screen.queryByText(/终端已在运行/)).not.toBeInTheDocument();
   });
 

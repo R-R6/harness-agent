@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { continueSuperviseTerminal, runSupervise, runSuperviseTerminal } from "../lib/api";
 import { Icon } from "./Icon";
-import type { TaskInfo, TaskStatus } from "../types";
+import type { SuperviseRequest, TaskInfo, TaskStatus } from "../types";
 
 interface Props {
   /** 工作目录（受控：由 App 持有的项目上下文，与 Claude 终端 pane 同源） */
@@ -69,21 +69,22 @@ export function SupervisePanel({
     setStarting(true);
     try {
       const dir = workDir.trim();
-      const req = {
+      const req: SuperviseRequest = {
         task: task.trim(),
         work_dir: dir,
         level,
         mock,
-        ...(driveTerminal && prepareDriveTerminal
-          ? { terminal_session_id: await prepareDriveTerminal(dir) }
-          : {}),
       };
+      if (driveTerminal && prepareDriveTerminal) {
+        req.terminal_session_id = await prepareDriveTerminal(dir);
+        // 先切到终端，让 xterm 挂上并能收键；引擎会等信任对话框结束再注入。
+        onDriveStarted?.();
+      }
       const taskId = driveTerminal
         ? await runSuperviseTerminal(req)
         : await runSupervise(req);
       onStarted(taskId);
       setTask("");
-      if (driveTerminal) onDriveStarted?.();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -98,8 +99,8 @@ export function SupervisePanel({
     setContinueError("");
     try {
       await continueSuperviseTerminal({
-        taskId: focusedTask.id,
-        workDir: focusedTask.work_dir,
+        task_id: focusedTask.id,
+        work_dir: focusedTask.work_dir,
       });
       onContinue?.(focusedTask.id);
     } catch (e) {
@@ -132,7 +133,20 @@ export function SupervisePanel({
             <span className={`task-badge task-badge--${focusedTask.status}`}>
               {TASK_STATUS_LABEL[focusedTask.status]}
             </span>
+            {focusedTask.status === "rejected" && (
+              <button
+                type="button"
+                className="task-continue__btn"
+                onClick={() => void continueRound()}
+                disabled={continuing}
+                title="注入上轮审查意见，Claude 同会话继续落地并重新审查"
+              >
+                <Icon name="refresh" size={14} />
+                {continuing ? "再来一轮…" : "再来一轮"}
+              </button>
+            )}
           </div>
+          {continueError && <div className="error">{continueError}</div>}
           <pre className="task-detail__desc">{focusedTask.task}</pre>
         </div>
         {focusedTask.log.length > 0 ? (
@@ -144,23 +158,6 @@ export function SupervisePanel({
           </div>
         ) : (
           <div className="log-stream log-stream--empty">暂无日志</div>
-        )}
-        {focusedTask.status === "rejected" && (
-          <div className="task-continue">
-            {continueError && <div className="error">{continueError}</div>}
-            <button
-              type="button"
-              className="task-continue__btn"
-              onClick={() => void continueRound()}
-              disabled={continuing}
-            >
-              <Icon name="refresh" size={14} />
-              {continuing ? "再来一轮…" : "再来一轮"}
-            </button>
-            <span className="task-continue__hint">
-              注入上轮审查意见，Claude 同会话继续落地并重新审查
-            </span>
-          </div>
         )}
       </div>
     );

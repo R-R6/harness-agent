@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 mod launch;
+mod claude_trust;
 pub use launch::terminal_command;
+pub use claude_trust::{claude_config_path, ensure_folder_trusted};
 
 pub struct SpawnedTerminal {
     pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,

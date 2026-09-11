@@ -27,6 +27,10 @@ pub trait PaneIo: Send + Sync {
     /// pane 当前绑定的工作目录（会话被停掉/替换/目录不符时返回 None 或不等的值，
     /// 引擎据此中止——防止意见注入到错误目录的会话）
     fn current_work_dir(&self) -> Option<String>;
+    /// 最近一段 PTY 输出（用于识别信任对话框 / 输入栏是否已出现）。测试假 pane 默认为空。
+    fn recent_output(&self) -> String {
+        String::new()
+    }
 }
 
 /// 日志回调（lib.rs 转 supervise-log 事件）
@@ -53,6 +57,9 @@ pub struct EngineOptions {
     /// 在输入就绪前可达十几秒，单发 \r 会被吞、正文停在输入栏；首轮确认用
     /// delivery_confirm + 本字段，期间每 2s 补回车，覆盖启动期。
     pub first_inject_confirm: Duration,
+    /// 首轮注入前等待窗口（默认 60s）：信任菜单可见时只等用户手动处理；
+    /// 菜单消失或从未出现后注入。测试设 0 跳过。
+    pub input_ready_wait: Duration,
     /// 产物目录（.supervise/tasks/<id> 或测试目录）：逐轮 review-N.md + final-report.json。
     /// None 则不落盘（纯测试用）。只清 review-*.md/final-report.json，不整目录删。
     pub artifacts_dir: Option<PathBuf>,
@@ -75,6 +82,7 @@ impl Default for EngineOptions {
             poll_interval: Duration::from_millis(500),
             delivery_confirm: Duration::from_secs(15),
             first_inject_confirm: Duration::from_secs(30),
+            input_ready_wait: Duration::from_secs(60),
             artifacts_dir: None,
             task_token: None,
             reviewer_label: String::new(),
@@ -201,12 +209,142 @@ fn confirm_inject<F: FnMut() -> bool>(
             return true;
         }
         if last_enter.elapsed() >= Duration::from_millis(2000) {
+            // 只补回车。信任菜单只在 wait_for_input_ready 里等待用户处理，这里不改键。
             let _ = pane.write("\r");
             last_enter = Instant::now();
         }
         std::thread::sleep(poll);
     }
     !cancel.is_some_and(|c| c.load(Ordering::Relaxed)) && confirm()
+}
+
+fn visible_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for x in chars.by_ref() {
+                        if ('@'..='~').contains(&x) {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 只看输出尾部：PTY recent_output 会保留旧帧，「Yes, I trust」在信任过后仍可能留在缓冲里。
+fn output_tail(output: &str) -> String {
+    const TAIL: usize = 4000;
+    let vis = visible_text(output);
+    if vis.len() <= TAIL {
+        vis
+    } else {
+        // 中文 TUI 文案是多字节 UTF-8，起始下标必须落在字符边界上
+        let mut start = vis.len() - TAIL;
+        while !vis.is_char_boundary(start) {
+            start += 1;
+        }
+        vis[start..].to_string()
+    }
+}
+
+/// TUI 输入栏的可见标记（就绪/负向判据共用）。不作为注入的必要条件——
+/// 真机 TUI 文案/ANSI 变体对不上时不得因此空跑整轮。
+const INPUT_BAR_MARKERS: [&str; 3] = ["for shortcuts", "bypassing permissions", "shift+tab"];
+
+fn has_input_bar_marker(s: &str) -> bool {
+    INPUT_BAR_MARKERS.iter().any(|m| s.contains(m))
+}
+
+fn looks_like_trust_prompt(output: &str) -> bool {
+    let s = output_tail(output).to_ascii_lowercase();
+    // 输入栏已出现则当前不是信任菜单（尾部可能同时有历史碎片）
+    if has_input_bar_marker(&s) {
+        return false;
+    }
+    s.contains("yes, i trust")
+        || s.contains("trust this folder")
+        || s.contains("do you trust")
+        || s.contains("i trust this folder")
+        || s.contains("no, exit")
+        || s.contains("信任此文件夹")
+        || s.contains("是否信任")
+}
+
+fn looks_like_input_ready(output: &str) -> bool {
+    if looks_like_trust_prompt(output) {
+        return false;
+    }
+    let s = output_tail(output).to_ascii_lowercase();
+    has_input_bar_marker(&s) || s.contains("welcome to claude")
+}
+
+/// 首轮注入前：若屏幕上仍是文件夹信任菜单，只等待用户手动选完，绝不灌任务正文、
+/// 也不自动按键。菜单消失（或从未出现）后即可注入——不要求必须匹配
+/// `? for shortcuts` 等就绪文案（真机：TUI 文案/ANSI 变体对不上时会空跑整轮）。
+fn wait_for_input_ready(
+    opts: &EngineOptions,
+    pane: &Arc<dyn PaneIo>,
+    cancel: &AtomicBool,
+    on_log: &OnLog,
+) -> Result<(), String> {
+    if opts.input_ready_wait.is_zero() {
+        return Ok(());
+    }
+    on_log("[ENGINE] 等待 Claude 终端就绪（若出现信任对话框请手动选 Yes，选完后自动注入）…");
+    let started = Instant::now();
+    let deadline = started + opts.input_ready_wait;
+    let mut logged_trust = false;
+    let mut clear_since: Option<Instant> = None;
+    // 从未见到信任菜单时，给 TUI 一点冷启动时间再注入，避免刚 spawn 就灌键。
+    let startup_grace = Duration::from_secs(2).min(opts.input_ready_wait);
+    while Instant::now() < deadline {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消，未注入任务".into());
+        }
+        let out = pane.recent_output();
+        if looks_like_trust_prompt(&out) {
+            clear_since = None;
+            if !logged_trust {
+                on_log("[ENGINE] 检测到文件夹信任对话框，请手动选择 Yes；选完后继续注入…");
+                logged_trust = true;
+            }
+            std::thread::sleep(opts.poll_interval);
+            continue;
+        }
+        if logged_trust {
+            let since = *clear_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(500) {
+                on_log("[ENGINE] 信任对话框已消失，开始注入");
+                return Ok(());
+            }
+        } else if looks_like_input_ready(&out) || started.elapsed() >= startup_grace {
+            on_log("[ENGINE] Claude 终端已就绪，开始注入");
+            return Ok(());
+        }
+        std::thread::sleep(opts.poll_interval);
+    }
+    if looks_like_trust_prompt(&pane.recent_output()) {
+        return Err(
+            "Claude 仍停在文件夹信任对话框，未注入以免卡死选择菜单（请先手动选 Yes 后再启动）"
+                .into(),
+        );
+    }
+    // 超时但仍不像信任菜单：宁可注入，也不要空跑整轮（真机事故：等就绪文案导致零注入）。
+    on_log("[ENGINE] 等待就绪超时且未见信任对话框，继续注入");
+    Ok(())
 }
 
 fn read_lines(path: &Path) -> Vec<String> {    match std::fs::read(path) {
@@ -571,6 +709,29 @@ fn run_loop(
         reset_artifacts(dir);
     }
 
+    if opts.starting_round == 0 && !opts.input_ready_wait.is_zero() {
+        match wait_for_input_ready(opts, &pane, cancel, on_log) {
+            Ok(()) => {}
+            Err(msg) => {
+                // 取消与中止统一走 Err 返回，由 cancel 标志区分语义（不做字符串协议）
+                if cancel.load(Ordering::Relaxed) {
+                    on_log("[ENGINE] 已取消");
+                    return EngineOutcome {
+                        status: EngineStatus::Cancelled,
+                        rounds: 0,
+                        last_reason: String::new(),
+                    };
+                }
+                on_log(&format!("[ENGINE] {msg}"));
+                return EngineOutcome {
+                    status: EngineStatus::Aborted(msg.clone()),
+                    rounds: 0,
+                    last_reason: msg,
+                };
+            }
+        }
+    }
+
     let mut last_reason = String::new();
     let mut first_inject = true;
     let mut session_pin: Option<String> = None;
@@ -891,6 +1052,18 @@ mod tests {
         dir_ok: Mutex<Option<String>>,
         writes: Mutex<Vec<String>>,
         fail_write: AtomicBool,
+        recent: Mutex<String>,
+    }
+
+    impl FakePane {
+        fn ok(dir: impl Into<String>) -> Arc<Self> {
+            Arc::new(Self {
+                dir_ok: Mutex::new(Some(dir.into())),
+                writes: Mutex::new(vec![]),
+                fail_write: AtomicBool::new(false),
+                recent: Mutex::new(String::new()),
+            })
+        }
     }
 
     impl PaneIo for FakePane {
@@ -903,6 +1076,9 @@ mod tests {
         }
         fn current_work_dir(&self) -> Option<String> {
             self.dir_ok.lock().unwrap().clone()
+        }
+        fn recent_output(&self) -> String {
+            self.recent.lock().unwrap().clone()
         }
     }
 
@@ -960,6 +1136,7 @@ mod tests {
             poll_interval: Duration::from_millis(30),
             delivery_confirm: Duration::from_millis(200),
             first_inject_confirm: Duration::from_millis(0),
+            input_ready_wait: Duration::from_millis(0),
             artifacts_dir: None,
             task_token: None,
             reviewer_label: "mock".into(),
@@ -975,6 +1152,256 @@ mod tests {
             "F--project-workspace-side-my-skils"
         );
         assert_eq!(project_slug("C:\\Work\\My Project"), "C--Work-My-Project");
+    }
+
+    #[test]
+    fn output_tail_never_splits_utf8() {
+        // 中文 TUI 输出是多字节 UTF-8：尾部截断落在字符中间曾直接 panic。
+        // 文本不含信任词/就绪标记，两判据都应为假。
+        let long = "中文多字节终端输出".repeat(800);
+        let tail = output_tail(&long);
+        assert!(!tail.is_empty());
+        assert!(!looks_like_trust_prompt(&long));
+        assert!(!looks_like_input_ready(&long));
+        // 截断边界处的字符必须完整（不以不完整 UTF-8 序列开头）
+        let first = tail.chars().next().unwrap();
+        assert!(tail.starts_with(first));
+    }
+
+    #[test]
+    fn trust_prompt_is_not_input_ready() {
+        assert!(looks_like_trust_prompt(
+            "Do you trust the files in this folder?\n> Yes, I trust this folder\n  No, exit"
+        ));
+        assert!(!looks_like_input_ready(
+            "Do you trust the files in this folder?\n> Yes, I trust this folder"
+        ));
+        assert!(looks_like_input_ready("Claude Code\r\n? for shortcuts"));
+        assert!(looks_like_trust_prompt(
+            "\u{1b}[32mYes, I trust this folder\u{1b}[0m\nNo, exit"
+        ));
+        assert!(!looks_like_input_ready(
+            "\u{1b}[32mYes, I trust this folder\u{1b}[0m"
+        ));
+        // 续跑/同 PTY：历史里留着信任文案，但当前已是输入栏 → 不得再当信任菜单
+        assert!(!looks_like_trust_prompt(
+            "Yes, I trust this folder\nNo, exit\n\nClaude Code\n? for shortcuts"
+        ));
+        assert!(looks_like_input_ready(
+            "Yes, I trust this folder\nNo, exit\n\nClaude Code\n? for shortcuts"
+        ));
+    }
+
+    #[test]
+    fn confirm_inject_keeps_sending_enter_even_if_history_has_trust_text() {
+        let pane = FakePane::ok("D:\\work");
+        *pane.recent.lock().unwrap() =
+            "Do you trust the files in this folder?\nYes, I trust this folder\nNo, exit\n? for shortcuts"
+                .into();
+        let pane_io: Arc<dyn PaneIo> = pane.clone();
+        // confirm_inject 每 2s 才补一次键；窗口略大于 2s 才能观察到写入
+        let deadline = Instant::now() + Duration::from_millis(2300);
+        let ok = confirm_inject(|| false, &pane_io, deadline, Duration::from_millis(50), None);
+        assert!(!ok);
+        let writes = pane.writes.lock().unwrap();
+        assert!(
+            writes.iter().any(|w| w == "\r"),
+            "历史含信任文案时仍应补裸回车，不能改发方向键: {writes:?}"
+        );
+        assert!(
+            writes.iter().all(|w| !w.contains("\u{1b}[A")),
+            "confirm_inject 不得因历史信任文案发送 TRUST_ACCEPT: {writes:?}"
+        );
+    }
+
+    #[test]
+    fn injects_after_startup_grace_without_shortcut_banner() {
+        // 真机：TUI 不一定打出 "? for shortcuts"；不得因此空跑整轮。
+        let dir = tmp_dir("splash-then-inject");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("session-1.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let marker_file = dir.join("markers.jsonl");
+        std::fs::write(&marker_file, "").unwrap();
+
+        let pane = FakePane::ok(dir.to_string_lossy());
+        *pane.recent.lock().unwrap() = "Loading Claude Code…".into();
+        simulate_worker(
+            pane.clone(),
+            transcript,
+            marker_file.clone(),
+            slug_dir,
+            vec![],
+        );
+        let mut opts = quick_opts(&dir, 1);
+        // startup_grace = min(2s, input_ready_wait)；给足宽限后应注入
+        opts.input_ready_wait = Duration::from_secs(3);
+        let on_log: OnLog = Arc::new(|_: &str| {});
+        let src = MarkerSource::new(marker_file);
+        let outcome = run(
+            &opts,
+            pane.clone(),
+            Arc::new(MockReviewer::always(Ok(Verdict {
+                pass: true,
+                reason: "ok".into(),
+            }))),
+            &src,
+            &projects_root,
+            &AtomicBool::new(false),
+            &on_log,
+        );
+        assert_eq!(outcome.status, EngineStatus::Accepted);
+        let writes = pane.writes.lock().unwrap();
+        assert!(
+            writes.iter().any(|w| w.contains("写计算器")),
+            "无 shortcuts 文案时仍应注入: {writes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn injects_when_prompt_already_ready() {
+        let dir = tmp_dir("prompt-ready");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("session-1.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let marker_file = dir.join("markers.jsonl");
+        std::fs::write(&marker_file, "").unwrap();
+
+        let pane = FakePane::ok(dir.to_string_lossy());
+        *pane.recent.lock().unwrap() = "? for shortcuts".into();
+        simulate_worker(
+            pane.clone(),
+            transcript,
+            marker_file.clone(),
+            slug_dir,
+            vec![],
+        );
+        let mut opts = quick_opts(&dir, 1);
+        opts.input_ready_wait = Duration::from_secs(3);
+        let on_log: OnLog = Arc::new(|_: &str| {});
+        let src = MarkerSource::new(marker_file);
+        let outcome = run(
+            &opts,
+            pane.clone(),
+            Arc::new(MockReviewer::always(Ok(Verdict {
+                pass: true,
+                reason: "ok".into(),
+            }))),
+            &src,
+            &projects_root,
+            &AtomicBool::new(false),
+            &on_log,
+        );
+        assert_eq!(outcome.status, EngineStatus::Accepted);
+        let writes = pane.writes.lock().unwrap();
+        assert!(
+            writes.iter().any(|w| w.contains("写计算器")),
+            "输入栏就绪后应注入: {writes:?}"
+        );
+        assert!(
+            writes.iter().all(|w| !w.contains("\u{1b}[A")),
+            "已就绪时不应再打信任菜单方向键: {writes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aborts_without_injecting_if_trust_dialog_stays() {
+        let dir = tmp_dir("trust-stuck");
+        let pane = FakePane::ok(dir.to_string_lossy());
+        *pane.recent.lock().unwrap() =
+            "Do you trust the files in this folder?\nYes, I trust this folder\nNo, exit".into();
+        let mut opts = quick_opts(&dir, 1);
+        opts.input_ready_wait = Duration::from_millis(180);
+        let on_log: OnLog = Arc::new(|_: &str| {});
+        let src = MarkerSource::new(dir.join("none.jsonl"));
+        let outcome = run(
+            &opts,
+            pane.clone(),
+            Arc::new(MockReviewer::always(Ok(Verdict {
+                pass: true,
+                reason: "ok".into(),
+            }))),
+            &src,
+            &dir.join("projects"),
+            &AtomicBool::new(false),
+            &on_log,
+        );
+        assert!(matches!(outcome.status, EngineStatus::Aborted(_)), "{:?}", outcome.status);
+        let writes = pane.writes.lock().unwrap();
+        assert!(
+            writes.iter().all(|w| !w.contains("写计算器")),
+            "信任菜单未消失时不得注入任务正文: {writes:?}"
+        );
+        assert!(
+            writes.is_empty(),
+            "不得自动向信任菜单发键（用户自己选 Yes）: {writes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waits_out_trust_dialog_before_injecting_task() {
+        let dir = tmp_dir("trust-then-ready");
+        let slug = project_slug(&dir.to_string_lossy());
+        let projects_root = dir.join("projects");
+        let slug_dir = projects_root.join(&slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let transcript = slug_dir.join("session-1.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let marker_file = dir.join("markers.jsonl");
+        std::fs::write(&marker_file, "").unwrap();
+
+        let pane = FakePane::ok(dir.to_string_lossy());
+        *pane.recent.lock().unwrap() = "Yes, I trust this folder\nNo, exit".into();
+        let pane2 = pane.clone();
+        // 模拟用户手动选 Yes：信任文案消失
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            *pane2.recent.lock().unwrap() = "? for shortcuts".into();
+        });
+        simulate_worker(
+            pane.clone(),
+            transcript,
+            marker_file.clone(),
+            slug_dir,
+            vec![],
+        );
+
+        let mut opts = quick_opts(&dir, 1);
+        opts.input_ready_wait = Duration::from_secs(4);
+        let on_log: OnLog = Arc::new(|_: &str| {});
+        let src = MarkerSource::new(marker_file);
+        let outcome = run(
+            &opts,
+            pane.clone(),
+            Arc::new(MockReviewer::always(Ok(Verdict {
+                pass: true,
+                reason: "ok".into(),
+            }))),
+            &src,
+            &projects_root,
+            &AtomicBool::new(false),
+            &on_log,
+        );
+        assert_eq!(outcome.status, EngineStatus::Accepted);
+        let writes = pane.writes.lock().unwrap();
+        assert!(
+            writes.iter().any(|w| w.contains("写计算器")),
+            "用户选完 Yes 后应注入任务: {writes:?}"
+        );
+        assert!(
+            writes.iter().all(|w| !w.contains("\u{1b}[A")),
+            "不得自动发方向键选 Yes: {writes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1072,11 +1499,7 @@ mod tests {
         let marker_file = dir.join("markers.jsonl");
         std::fs::write(&marker_file, "").unwrap();
 
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok(dir.to_string_lossy());
         simulate_worker(pane.clone(), transcript.clone(), marker_file.clone(), slug_dir.clone(), vec![]);
 
         // 第 1 轮 REVIEW（缺校验），第 2 轮 PASS
@@ -1165,11 +1588,7 @@ mod tests {
         std::fs::write(&transcript, "{}\n").unwrap();
         let marker_file = dir.join("markers.jsonl");
 
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok(dir.to_string_lossy());
         simulate_worker(pane.clone(), transcript, marker_file.clone(), slug_dir, vec![]);
 
         let reviewer = MockReviewer::always(Ok(Verdict { pass: false, reason: "还是不行".into() }));
@@ -1193,11 +1612,7 @@ mod tests {
     #[test]
     fn engine_aborts_when_pane_rebound_to_other_dir() {
         let dir = tmp_dir("rebind");
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some("D:\\somewhere-else".into())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok("D:\\somewhere-else");
         let reviewer = MockReviewer::always(Ok(Verdict { pass: true, reason: String::new() }));
         let cancel = AtomicBool::new(false);
         let on_log: OnLog = Arc::new(|_: &str| {});
@@ -1227,11 +1642,7 @@ mod tests {
         let transcript = slug_dir.join("s.jsonl");
         std::fs::write(&transcript, "static content\n").unwrap();
 
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok(dir.to_string_lossy());
         // 不启动 simulate_worker（不写 marker），静默路径生效
         let reviewer = MockReviewer::always(Ok(Verdict { pass: true, reason: "ok".into() }));
         let cancel = AtomicBool::new(false);
@@ -1262,11 +1673,7 @@ mod tests {
         std::fs::write(&transcript, "x\n").unwrap();
         let marker_file = dir.join("markers.jsonl");
 
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok(dir.to_string_lossy());
         simulate_worker(pane.clone(), transcript, marker_file.clone(), slug_dir, vec![]);
         let reviewer = MockReviewer::always(Err("codex 挂了".into()));
         let cancel = AtomicBool::new(false);
@@ -1315,11 +1722,7 @@ mod tests {
         let marker_file = dir.join("markers.jsonl");
         std::fs::write(&marker_file, "").unwrap();
 
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok(dir.to_string_lossy());
         let pane2 = pane.clone();
         let marker2 = marker_file.clone();
         let transcript2 = transcript.clone();
@@ -1448,11 +1851,7 @@ mod tests {
         let marker_file = dir.join("markers.jsonl");
         std::fs::write(&marker_file, "").unwrap();
 
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok(dir.to_string_lossy());
         let pane2 = pane.clone();
         let marker2 = marker_file.clone();
         let transcript2 = transcript.clone();
@@ -1557,11 +1956,7 @@ mod tests {
         let marker_file = dir.join("markers.jsonl");
         std::fs::write(&marker_file, "").unwrap();
 
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok(dir.to_string_lossy());
         let pane2 = pane.clone();
         let transcript2 = transcript.clone();
         let marker2 = marker_file.clone();
@@ -1651,11 +2046,7 @@ mod tests {
         .unwrap();
         let marker_file = dir.join("markers.jsonl");
 
-        let pane = Arc::new(FakePane {
-            dir_ok: Mutex::new(Some(dir.to_string_lossy().to_string())),
-            writes: Mutex::new(vec![]),
-            fail_write: AtomicBool::new(false),
-        });
+        let pane = FakePane::ok(dir.to_string_lossy());
         // worker：只响应第一次注入（写一次用户行 + marker），此后沉默——
         // 模拟第 2 轮注入被终端空闲状态吞掉
         {

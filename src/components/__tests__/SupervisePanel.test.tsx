@@ -163,6 +163,10 @@ describe("SupervisePanel", () => {
     await userEvent.click(screen.getByLabelText("驱动 Claude 终端"));
     await userEvent.click(screen.getByRole("button", { name: "启动监督闭环" }));
     await waitFor(() => expect(prepareDriveTerminal).toHaveBeenCalledWith("D:\\work"));
+    await waitFor(() => expect(onDriveStarted).toHaveBeenCalledTimes(1));
+    expect(onDriveStarted.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.invoke.mock.invocationCallOrder[0],
+    );
     expect(mocks.invoke).toHaveBeenCalledWith("run_supervise_terminal", {
       request: {
         task: "任务B",
@@ -172,7 +176,6 @@ describe("SupervisePanel", () => {
         terminal_session_id: "terminal-99",
       },
     });
-    await waitFor(() => expect(onDriveStarted).toHaveBeenCalledTimes(1));
   });
 
   it("查看态：渲染只读描述与日志，不渲染表单", () => {
@@ -193,13 +196,13 @@ describe("SupervisePanel", () => {
     });
     const btn = screen.getByRole("button", { name: "再来一轮" });
     expect(btn).toBeInTheDocument();
-    expect(screen.getByText(/注入上轮审查意见/)).toBeInTheDocument();
+    expect(screen.getByText("未通过").closest(".task-detail__head")).toContainElement(btn);
 
     await userEvent.click(btn);
     expect(mocks.invoke).toHaveBeenCalledWith(
       "continue_supervise_terminal",
       expect.objectContaining({
-        request: expect.objectContaining({ taskId: "task-1", workDir: "D:\\work" }),
+        request: expect.objectContaining({ task_id: "task-1", work_dir: "D:\\work" }),
       }),
     );
     await waitFor(() => expect(onContinue).toHaveBeenCalledWith("task-1"));

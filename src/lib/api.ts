@@ -45,8 +45,9 @@ export async function runSuperviseTerminal(req: SuperviseRequest): Promise<strin
 }
 
 export interface SuperviseContinueRequest {
-  taskId: string;
-  workDir: string;
+  /** 与 Rust SuperviseContinueRequest 对齐（serde 默认 snake_case） */
+  task_id: string;
+  work_dir: string;
 }
 
 /** 「再来一轮」：rejected 任务复用原 Claude 会话追加一轮完整闭环 */

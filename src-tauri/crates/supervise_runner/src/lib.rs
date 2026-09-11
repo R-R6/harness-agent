@@ -40,9 +40,12 @@ pub struct SuperviseRequest {
 
 /// 「再来一轮」请求：rejected 任务复用原 Claude 会话追加一轮完整闭环
 /// （注入上轮审查意见 → 落地 → Stop hook → codex 审查 → verdict）
+/// alias 兼容前端误发 camelCase（真实事故：缺 alias 时报 missing field `task_id`）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuperviseContinueRequest {
+    #[serde(alias = "taskId")]
     pub task_id: String,
+    #[serde(alias = "workDir")]
     pub work_dir: String,
 }
 
@@ -325,6 +328,23 @@ mod tests {
     // ---- 产物解析 ----
 
     #[test]
+    fn continue_request_accepts_snake_and_camel_case() {
+        let snake: SuperviseContinueRequest = serde_json::from_value(serde_json::json!({
+            "task_id": "task-1",
+            "work_dir": "D:\\work"
+        }))
+        .unwrap();
+        assert_eq!(snake.task_id, "task-1");
+        let camel: SuperviseContinueRequest = serde_json::from_value(serde_json::json!({
+            "taskId": "task-1",
+            "workDir": "D:\\work"
+        }))
+        .unwrap();
+        assert_eq!(camel.task_id, "task-1");
+        assert_eq!(camel.work_dir, "D:\\work");
+    }
+
+    #[test]
     fn parse_review_md_extracts_fields() {
         let md = "# 第 3 轮审查意见\n\n- 判定：REVIEW\n- 审查模型：gpt-5.6-luna\n- 会话：mock-0001\n- 会话文件：C:\\Users\\u\\.claude\\projects\\p\\s.jsonl\n\n## 意见\n\n缺少输入校验，请补充。\n";
         let a = parse_review_md(md).expect("应解析成功");
@@ -554,6 +574,17 @@ mod tests {
             None => std::env::remove_var("HARNESS_SUPERVISE_SCRIPT"),
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_artifact_dir_is_isolated_per_work_dir() {
+        let a = std::path::PathBuf::from(r"D:\space-alpha");
+        let b = std::path::PathBuf::from(r"D:\space-beta");
+        let da = resolve_artifact_dir(&a.to_string_lossy(), Some("task-1"));
+        let db = resolve_artifact_dir(&b.to_string_lossy(), Some("task-1"));
+        assert_ne!(da, db, "同名 task-1 必须落在各自工作空间下");
+        assert_eq!(da, a.join(".supervise").join("tasks").join("task-1"));
+        assert_eq!(db, b.join(".supervise").join("tasks").join("task-1"));
     }
 
     #[test]
