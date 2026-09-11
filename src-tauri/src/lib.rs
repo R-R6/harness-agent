@@ -407,6 +407,16 @@ fn normalize_path(p: &str) -> String {
 
 // ---------------- 会话 commands（阶段 1） ----------------
 
+/// Agent 注册表状态（多 Agent 监督）：每个 CLI 的角色能力与本机安装/会话探测
+#[tauri::command]
+fn agent_catalog() -> Vec<agent_registry::AgentStatus> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    agent_registry::status_all(&home)
+}
+
 /// 列出会话（agent 可选：claude / codex；limit 可选：每 agent 条数，默认 20 上限 200）
 #[tauri::command]
 fn list_sessions(agent: Option<String>, limit: Option<usize>) -> Result<Vec<SessionInfo>, String> {
@@ -1377,6 +1387,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            agent_catalog,
             list_sessions,
             get_transcript,
             search_sessions,

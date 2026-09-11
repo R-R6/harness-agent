@@ -115,6 +115,19 @@ fn find_on_path(file_name: &str) -> Option<PathBuf> {
     })
 }
 
+/// 探测本机是否安装了某个 agent CLI（供 agent_registry 状态卡使用）。
+/// claude：claude.cmd / claude.exe / 无扩展启动器任一在 PATH；其余：`<name>.cmd`/`<name>.exe`。
+/// 不 spawn 进程，纯文件系统探测。
+pub fn agent_command_exists(agent: &str) -> bool {
+    if agent == "claude" {
+        return find_on_path("claude.cmd").is_some()
+            || find_on_path("claude.exe").is_some()
+            || find_on_path("claude").is_some();
+    }
+    find_on_path(&format!("{agent}.cmd")).is_some()
+        || find_on_path(&format!("{agent}.exe")).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

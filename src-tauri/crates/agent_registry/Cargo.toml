@@ -1,0 +1,9 @@
+[package]
+name = "agent_registry"
+version = "0.1.0"
+description = "多 Agent 监督：CLI Agent profile 注册表（角色能力 / headless 模板 / 会话根目录 / 探测）"
+edition = "2021"
+
+[dependencies]
+terminal_host = { path = "../terminal_host" }
+serde = { version = "1", features = ["derive"] }
