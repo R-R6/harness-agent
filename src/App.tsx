@@ -288,7 +288,7 @@ function App() {
   const handleDriveStarted = useCallback(() => {
     setTab("terminals");
     requestAnimationFrame(() => {
-      terminalRef.current?.focusActiveClaude();
+      terminalRef.current?.focusWorkerPane();
     });
   }, []);
 

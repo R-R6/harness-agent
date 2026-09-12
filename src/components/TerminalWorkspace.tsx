@@ -66,6 +66,28 @@ const SIDE_LABEL: Record<SideKey, string> = {
   reviewer: "监督方",
 };
 
+/** 侧选择持久化键（与监督表单共用，保持两处选择一致） */
+const SIDE_AGENT_STORAGE: Record<SideKey, string> = {
+  worker: "ha-worker-agent",
+  reviewer: "ha-reviewer-agent",
+};
+
+function safeGetItem(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeSetItem(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // 存储不可用（隐私模式等）：选择仅本次会话有效
+  }
+}
+
 function paneKeyOf(side: SideKey, agentId: string) {
   return `${side}:${agentId}`;
 }
@@ -91,8 +113,8 @@ export interface TerminalWorkspaceHandle {
   /** 始终新建 Claude PTY（驱动任务用），返回 session id */
   startClaudeForTask: (workDir?: string) => Promise<string>;
   focusSession: (sessionId: string) => void;
-  /** 把键盘焦点交给当前被监督方 xterm（切到终端 tab 后收键） */
-  focusActiveClaude: () => void;
+  /** 把键盘焦点交给被监督方当前选中的 xterm（切到终端 tab 后收键） */
+  focusWorkerPane: () => void;
   /** 找到指定 Agent 在该目录下的空闲已启动 pane，返回 session id（多 Agent 驱动用） */
   claimIdleAgentPane: (agentId: string, workDir: string) => string | null;
 }
@@ -111,8 +133,8 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   /** 后端通知横幅（预信任失败等：不致命，但用户必须在启动终端前看见） */
   const [terminalNotice, setTerminalNotice] = useState("");
 
-  const workerSelInit = localStorage.getItem("ha-worker-agent") || "claude";
-  const reviewerSelInit = localStorage.getItem("ha-reviewer-agent") || "codex";
+  const workerSelInit = safeGetItem(SIDE_AGENT_STORAGE.worker) || "claude";
+  const reviewerSelInit = safeGetItem(SIDE_AGENT_STORAGE.reviewer) || "codex";
   const [workerSide, setWorkerSide] = useState<SideState>(() => ({
     agentId: workerSelInit,
     panes: { [workerSelInit]: initialPane() },
@@ -153,7 +175,10 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   const ratio = clampRatio(stacked ? stackedRatio : wideRatio, minRatio, maxRatio);
   const setRatio = stacked ? setStackedRatio : setWideRatio;
 
-  const sideRef = (side: SideKey) => (side === "worker" ? workerSideRef : reviewerSideRef);
+  const sideRef = useCallback(
+    (side: SideKey) => (side === "worker" ? workerSideRef : reviewerSideRef),
+    [],
+  );
 
   const patchPane = useCallback((paneKey: string, patch: Partial<PaneState>) => {
     const parsed = parsePaneKey(paneKey);
@@ -169,16 +194,21 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     commit(nextSide);
   }, []);
 
-  const selectAgent = useCallback((side: SideKey, agentId: string) => {
-    const ref = side === "worker" ? workerSideRef : reviewerSideRef;
-    const commit = side === "worker" ? setWorkerSide : setReviewerSide;
-    const panes = { ...ref.current.panes };
+  /**
+   * 切换一侧选中的 Agent。persist=false 用于程序化激活（监督驱动/会话跳转）——
+   * 不覆写用户的角色记忆，避免驱动链路反向改写任务表单已记的选择。
+   */
+  const selectAgent = useCallback(
+    (side: SideKey, agentId: string, persist = true) => {
+    const panes = { ...sideRef(side).current.panes };
     if (!panes[agentId]) panes[agentId] = initialPane();
     const nextSide: SideState = { agentId, panes };
+    const ref = sideRef(side);
+    const commit = side === "worker" ? setWorkerSide : setReviewerSide;
     ref.current = nextSide;
     commit(nextSide);
-    localStorage.setItem(side === "worker" ? "ha-worker-agent" : "ha-reviewer-agent", agentId);
-  }, []);
+    if (persist) safeSetItem(SIDE_AGENT_STORAGE[side], agentId);
+  }, [sideRef]);
 
   /** tab 标题/横幅用 meta：静态表优先，注册表条目兜底（新 Agent 未适配静态文案时） */
   const agentMetaFor = useCallback(
@@ -445,8 +475,12 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     ref,
     () => ({
       startWith: (agent, opts) => {
-        // 续聊归属侧：claude → 工人侧；codex → 监督侧；其余工人候选 → 工人侧
-        const side: SideKey = agent === "codex" ? "reviewer" : "worker";
+        // 续聊归属侧：该 agent 已在某一侧有 pane 就地打开；否则按默认角色
+        // 归属（claude → 工人侧，codex → 监督侧，其余工人候选 → 工人侧）
+        const existingSide = (["worker", "reviewer"] as SideKey[]).find(
+          (side) => sideRef(side).current.panes[agent] !== undefined,
+        );
+        const side: SideKey = existingSide ?? (agent === "codex" ? "reviewer" : "worker");
         selectAgent(side, agent);
         if (opts?.workDir !== undefined) {
           if (side === "worker") onProjectWorkDirChange?.(opts.workDir);
@@ -459,17 +493,13 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       startClaudeForTask: (workDir) => {
         const run = async () => {
           if (workDir !== undefined) onProjectWorkDirChange?.(workDir);
-          const target = (workDir ?? projectWorkDir ?? "").trim();
-          selectAgent("worker", "claude");
-          // 驱动任务必须换新 PTY：同目录里已经冻在信任菜单上的会话不会自己恢复。
-          const panes = workerSideRef.current.panes;
-          const staleSession = panes.claude?.session?.id;
-          const staleBusy =
-            Boolean(target) &&
-            panes.claude &&
-            isBusyStatus(panes.claude.status) &&
-            samePath(panes.claude.session?.work_dir ?? "", target);
-          if (staleSession && staleBusy) {
+          // 程序化激活：不改写用户在任务表单记下的工人选择
+          selectAgent("worker", "claude", false);
+          // 驱动任务必须换新 PTY：旧会话（同目录冻在信任菜单的、或切了工作区
+          // 遗留在别处的）一律先停——单 pane 模型下直接换绑 session 会让旧 PTY
+          // 失去 UI 归属，其输出/退出事件落入 orphan 缓冲永不清理（泄漏）
+          const staleSession = workerSideRef.current.panes.claude?.session?.id;
+          if (staleSession) {
             patchPane(paneKeyOf("worker", "claude"), { status: "stopping", error: "" });
             try {
               await stopTerminal(staleSession);
@@ -503,14 +533,14 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           const panes = sideRef(side).current.panes;
           for (const [agentId, pane] of Object.entries(panes)) {
             if (pane.session?.id === sessionId) {
-              selectAgent(side, agentId);
+              selectAgent(side, agentId, false);
               terminals.current.get(paneKeyOf(side, agentId))?.focus();
               return;
             }
           }
         }
       },
-      focusActiveClaude: () => {
+      focusWorkerPane: () => {
         terminals.current.get(paneKeyOf("worker", workerSideRef.current.agentId))?.focus();
       },
       claimIdleAgentPane: (agentId, workDir) => {
@@ -520,13 +550,13 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           !isBusyStatus(pane.status) &&
           samePath(pane.session.work_dir ?? "", workDir.trim())
         ) {
-          selectAgent("worker", agentId);
+          selectAgent("worker", agentId, false);
           return pane.session.id;
         }
         return null;
       },
     }),
-    [onProjectWorkDirChange, patchPane, projectWorkDir, selectAgent, startPane],
+    [onProjectWorkDirChange, patchPane, projectWorkDir, selectAgent, setReviewerWorkDir, startPane],
   );
 
   const handleStop = useCallback(
@@ -581,10 +611,14 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       ? (dir: string) => onProjectWorkDirChange?.(dir)
       : setReviewerWorkDir;
     const sideWorkDir = side === "worker" ? projectWorkDir ?? "" : reviewerWorkDir;
-    const options = catalog.filter((c) => c.can_work);
-    const selectOptions = options.length
+    // 工人侧限 can_work（要开交互终端）；监督侧放宽到 can_review 联合——
+    // 未来纯审查型 agent 也能出现在右侧
+    const options = catalog.filter((c) =>
+      side === "worker" ? c.can_work : c.can_work || c.can_review,
+    );
+    const selectOptions: { id: string; name: string; installed: boolean }[] = options.length
       ? options
-      : [{ id: side === "worker" ? "claude" : "codex", name: side === "worker" ? "Claude Code" : "Codex CLI", installed: true, sessions_present: false, can_work: true, can_review: true }];
+      : [{ id: side === "worker" ? "claude" : "codex", name: side === "worker" ? "Claude Code" : "Codex CLI", installed: true }];
     return (
       <div className="terminal-side" data-side={side}>
         <div className="terminal-side__head">
@@ -599,7 +633,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
             aria-label={`${SIDE_LABEL[side]} Agent`}
             title={`切换${SIDE_LABEL[side]}的 CLI Agent（每个 Agent 保留独立终端）`}
           >
-            {(selectOptions as { id: string; name: string; installed: boolean }[]).map((c) => (
+            {selectOptions.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
                 {c.installed ? "" : "（未检测到安装）"}
