@@ -585,7 +585,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         <div>
           <span className="eyebrow">LOCAL CLI WORKBENCH</span>
           <h2>本地 CLI 工作台</h2>
-          <p>按需启动本机已安装的 Claude Code 和 Codex CLI。Claude 可开多个标签；切换工作区不会结束进程。</p>
+          <p>按需启动注册表中的 CLI Agent（Claude / Codex / Gemini / Grok / DSH…）。工人 Agent 可开多个标签；切换工作区不会结束进程。</p>
         </div>
         <div className="terminal-intro__note">
           <Icon name="shield" size={15} />
@@ -629,7 +629,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
                 >
                   <Icon name={entry.id === "claude" ? "spark" : "terminal"} size={13} />
                   {entry.name}
-                  {!entry.installed ? " ·未装" : entry.sessions_present ? " ·有会话" : ""}
+                  {!entry.installed ? " ·未安装" : entry.sessions_present ? " ·有历史会话" : ""}
                 </button>
               ))}
           </div>
