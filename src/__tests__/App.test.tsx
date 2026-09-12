@@ -67,8 +67,8 @@ describe("App 集成", () => {
   it("启动即加载会话列表", async () => {
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("Claude Code")).toBeInTheDocument();
-      expect(screen.getByText("Codex")).toBeInTheDocument();
+      expect(screen.getByText("Claude Code", { selector: ".badge" })).toBeInTheDocument();
+      expect(screen.getByText("Codex", { selector: ".badge" })).toBeInTheDocument();
     });
     expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 });
   });
@@ -152,13 +152,13 @@ describe("App 集成", () => {
 
   it("切换 tab 后会话列表状态保留（双视图常驻）", async () => {
     render(<App />);
-    await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Claude Code", { selector: ".badge" })).toBeInTheDocument());
     // 切到监督闭环再切回
     await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
     await userEvent.click(screen.getByRole("button", { name: "会话浏览" }));
     // 会话列表仍在（组件未卸载）
-    expect(screen.getByText("Claude Code")).toBeInTheDocument();
-    expect(screen.getByText("Codex")).toBeInTheDocument();
+    expect(screen.getByText("Claude Code", { selector: ".badge" })).toBeInTheDocument();
+    expect(screen.getByText("Codex", { selector: ".badge" })).toBeInTheDocument();
   });
 
   it("后端报错时显示错误信息", async () => {

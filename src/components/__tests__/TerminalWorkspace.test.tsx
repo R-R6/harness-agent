@@ -250,9 +250,9 @@ describe("TerminalWorkspace", () => {
     expect(mocks.terminals[0].writes.some((line) => line.includes("点击启动后"))).toBe(true);
   });
 
-  it("Claude 与 Codex 终端之间提供可访问的拖动分隔线", async () => {
+  it("被监督方与监督方终端之间提供可访问的拖动分隔线（默认对称 50/50）", async () => {
     renderHost();
-    const splitter = await screen.findByRole("separator", { name: "调整 Claude 与 Codex 终端区域" });
+    const splitter = await screen.findByRole("separator", { name: "调整被监督方与监督方终端区域" });
     expect(splitter).toHaveAttribute("aria-orientation", "vertical");
     expect(splitter).toHaveAttribute("aria-valuenow", "50");
   });
@@ -532,27 +532,13 @@ describe("TerminalWorkspace", () => {
     expect(screen.queryByText(/终端已在运行/)).not.toBeInTheDocument();
   });
 
-  it("点击 + 新增一个空闲的 Claude 终端标签", async () => {
-    renderHost();
-    await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
-
-    // 初始只有一个 Claude 标签
-    expect(screen.getAllByRole("tab")).toHaveLength(1);
-
-    await userEvent.click(screen.getByRole("button", { name: "新增 Claude 终端" }));
-
-    // 新增后有两个标签，新标签为空闲态（可再启动）
-    expect(screen.getAllByRole("tab")).toHaveLength(2);
-    expect(screen.getByRole("tab", { name: /Claude CLI 2/ })).toBeInTheDocument();
-  });
-
-  it("agent 启动条：注册表渲染芯片，点击新开对应 Agent 标签", async () => {
+  it("两侧各有 Agent 选择器：切工人侧到 Gemini，监督侧独立保持 Codex", async () => {
     mocks.invoke.mockImplementation((command: string) => {
       if (command === "agent_catalog") {
         return Promise.resolve([
           { id: "claude", name: "Claude Code", can_work: true, can_review: true, installed: true, sessions_present: true },
+          { id: "codex", name: "Codex CLI", can_work: true, can_review: true, installed: true, sessions_present: true },
           { id: "gemini", name: "Gemini CLI", can_work: true, can_review: true, installed: true, sessions_present: false },
-          { id: "dsh", name: "DeepSeek DSH", can_work: true, can_review: true, installed: false, sessions_present: false },
         ]);
       }
       if (command === "start_terminal") {
@@ -568,13 +554,21 @@ describe("TerminalWorkspace", () => {
     renderHost();
     await waitFor(() => expect(screen.getAllByRole("button", { name: "启动" })[0]).toBeEnabled());
 
-    // 启动条渲染注册表条目（含未安装的 dsh，弱化展示）
-    expect(screen.getByRole("button", { name: /Gemini CLI/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /DeepSeek DSH/ })).toBeInTheDocument();
+    // 两侧选择器都来自注册表
+    const workerSelect = screen.getByRole("combobox", { name: "被监督方 Agent" });
+    const reviewerSelect = screen.getByRole("combobox", { name: "监督方 Agent" });
+    expect(workerSelect).toHaveValue("claude");
+    expect(reviewerSelect).toHaveValue("codex");
 
-    // 点击 gemini 芯片 → 新开 Gemini 标签（工人列泛化）
-    await userEvent.click(screen.getByRole("button", { name: /Gemini CLI/ }));
-    expect(await screen.findByRole("tab", { name: /Gemini CLI 2/ })).toBeInTheDocument();
+    // 工人侧切到 Gemini：pane 标题随之切换，监督侧不受影响
+    await userEvent.selectOptions(workerSelect, "gemini");
+    expect(screen.getByText("Gemini CLI", { selector: ".terminal-pane strong" })).toBeInTheDocument();
+    expect(reviewerSelect).toHaveValue("codex");
+
+    // 再切回 Claude：原实例保留（同一 pane 不重建、不堆叠）
+    await userEvent.selectOptions(workerSelect, "claude");
+    expect(screen.getByText("Claude CLI", { selector: ".terminal-pane strong" })).toBeInTheDocument();
+    expect(screen.getAllByText(/Claude CLI/).length).toBeGreaterThan(0);
   });
 
   it("停止与自行退出竞态：invoke 失败不再回滚 running 卡死面板", async () => {

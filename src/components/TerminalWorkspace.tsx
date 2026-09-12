@@ -16,7 +16,6 @@ const TERMINAL_STACK_WIDTH = 720;
 const TERMINAL_MIN_WIDTH = 320;
 const TERMINAL_MIN_HEIGHT = 220;
 const SPLITTER_SIZE = 12;
-const CODEX_KEY = "codex";
 
 function clampRatio(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), Math.max(min, max));
@@ -43,19 +42,38 @@ function exitErrorMessage(code?: number | null) {
   return code != null && code !== 0 ? `CLI 异常退出（代码 ${code}）` : "";
 }
 
-interface ClaudeTab {
-  id: string;
-  /** 该 tab 绑定的 CLI Agent（注册表 id；Claude 列已泛化为工人列） */
-  agentId: string;
-  pane: PaneState;
-}
-
 const AGENTS: { id: TerminalAgent; label: string; description: string }[] = [
   { id: "claude", label: "Claude CLI", description: "本机 Claude Code CLI" },
   { id: "codex", label: "Codex CLI", description: "本机 codex CLI" },
 ];
 
-const CODEX_META = AGENTS[1];
+/**
+ * 工作台两栏对称：左 = 被监督方（工人），右 = 监督方（审查者）。
+ * 每栏上方一个 Agent 选择器，选谁显示谁的终端；
+ * 每个 Agent 每栏最多一个 pane（paneKey = `side:agentId`），不会堆叠标签。
+ */
+type SideKey = "worker" | "reviewer";
+
+interface SideState {
+  /** 当前选中的 Agent（选择器值） */
+  agentId: string;
+  /** agentId → pane（保留各 Agent 的终端实例，切换选择不丢会话） */
+  panes: Record<string, PaneState>;
+}
+
+const SIDE_LABEL: Record<SideKey, string> = {
+  worker: "被监督方",
+  reviewer: "监督方",
+};
+
+function paneKeyOf(side: SideKey, agentId: string) {
+  return `${side}:${agentId}`;
+}
+
+function parsePaneKey(paneKey: string): { side: SideKey; agentId: string } | null {
+  const m = paneKey.match(/^(worker|reviewer):(.+)$/);
+  return m ? { side: m[1] as SideKey, agentId: m[2] } : null;
+}
 
 function writeIdleBanner(terminal: Terminal, agent: { label: string; description: string }) {
   terminal.writeln(`\x1b[90m${agent.label} · ${agent.description}\x1b[0m`);
@@ -72,42 +90,43 @@ export interface TerminalWorkspaceHandle {
   startWith: (agent: TerminalAgent, opts?: StartOptions) => void;
   /** 始终新建 Claude PTY（驱动任务用），返回 session id */
   startClaudeForTask: (workDir?: string) => Promise<string>;
+  focusSession: (sessionId: string) => void;
+  /** 把键盘焦点交给当前被监督方 xterm（切到终端 tab 后收键） */
+  focusActiveClaude: () => void;
   /** 找到指定 Agent 在该目录下的空闲已启动 pane，返回 session id（多 Agent 驱动用） */
   claimIdleAgentPane: (agentId: string, workDir: string) => string | null;
-  focusSession: (sessionId: string) => void;
-  /** 把键盘焦点交给当前 Claude xterm（切到终端 tab 后收键） */
-  focusActiveClaude: () => void;
 }
 
 interface Props {
   active: boolean;
   onRunningChange?: (count: number) => void;
-  /** 项目工作目录（Claude pane 的共享上下文，由 App 持有，监督闭环同源） */
+  /** 项目工作目录（工人侧的共享上下文，由 App 持有，监督闭环同源） */
   projectWorkDir?: string;
   onProjectWorkDirChange?: (dir: string) => void;
   ref?: Ref<TerminalWorkspaceHandle>;
 }
 
-/**
- * Claude 可多开（一任务一 PTY）；Codex 保持单 pane。
- * 浏览器只渲染 xterm；Rust 侧拥有 PTY / 子进程。
- */
 export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onProjectWorkDirChange, ref }: Props) {
-  const claudeSeqRef = useRef(1);
-  const [claudeTabs, setClaudeTabs] = useState<ClaudeTab[]>(() => [
-    { id: "claude-1", agentId: "claude", pane: initialPane() },
-  ]);
-  /** Agent 注册表状态（工作台启动条 + tab 标题），挂载时拉取一次 */
-  const catalog = useAgentCatalog();  const [activeClaudeId, setActiveClaudeId] = useState("claude-1");
-  const [codexPane, setCodexPane] = useState<PaneState>(initialPane);
+  const catalog = useAgentCatalog();
   /** 后端通知横幅（预信任失败等：不致命，但用户必须在启动终端前看见） */
   const [terminalNotice, setTerminalNotice] = useState("");
-  const claudeTabsRef = useRef(claudeTabs);
-  const activeClaudeIdRef = useRef(activeClaudeId);
-  const codexPaneRef = useRef(codexPane);
+
+  const workerSelInit = localStorage.getItem("ha-worker-agent") || "claude";
+  const reviewerSelInit = localStorage.getItem("ha-reviewer-agent") || "codex";
+  const [workerSide, setWorkerSide] = useState<SideState>(() => ({
+    agentId: workerSelInit,
+    panes: { [workerSelInit]: initialPane() },
+  }));
+  const [reviewerSide, setReviewerSide] = useState<SideState>(() => ({
+    agentId: reviewerSelInit,
+    panes: { [reviewerSelInit]: initialPane() },
+  }));
+  const workerSideRef = useRef(workerSide);
+  const reviewerSideRef = useRef(reviewerSide);
+
   const terminals = useRef(new Map<string, Terminal>());
   const inputQueuesRef = useRef(new Map<string, Promise<void>>());
-  const codexStabilizerRef = useRef(createOutputStabilizer());
+  const stabilizersRef = useRef(new Map<string, ReturnType<typeof createOutputStabilizer>>());
   const noticeTimerRef = useRef<number | null>(null);
   const pendingOutputRef = useRef(new Map<string, { sessionId: string; data: string }>());
   /** sessionId → 尚未绑定到 pane 的输出（start_terminal 返回前 PTY 已可能吐字） */
@@ -115,8 +134,11 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   /** sessionId → 早于 pane 绑定到达的退出事件（CLI 秒退/崩溃时 terminal-exit 先于 invoke 返回） */
   const orphanExitRef = useRef(new Map<string, { code?: number | null }>());
   const outputFrameRef = useRef<number | null>(null);
-  const claudeStartChainRef = useRef(Promise.resolve());
-  const [codexWorkDir, setCodexWorkDir] = useStoredString("ha-workdir-codex", "");
+  const workerStartChainRef = useRef(Promise.resolve());
+  const [reviewerWorkDir, setReviewerWorkDir] = useStoredString(
+    "ha-workdir-reviewer",
+    localStorage.getItem("ha-workdir-codex") ?? "",
+  );
   const gridRef = useRef<HTMLDivElement>(null);
   const gridSize = useElementSize(gridRef);
   const stacked = gridSize.width > 0 && gridSize.width < TERMINAL_STACK_WIDTH;
@@ -131,22 +153,31 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   const ratio = clampRatio(stacked ? stackedRatio : wideRatio, minRatio, maxRatio);
   const setRatio = stacked ? setStackedRatio : setWideRatio;
 
-  const syncClaudeTabs = useCallback((next: ClaudeTab[]) => {
-    claudeTabsRef.current = next;
-    setClaudeTabs(next);
+  const sideRef = (side: SideKey) => (side === "worker" ? workerSideRef : reviewerSideRef);
+
+  const patchPane = useCallback((paneKey: string, patch: Partial<PaneState>) => {
+    const parsed = parsePaneKey(paneKey);
+    if (!parsed) return;
+    const ref = parsed.side === "worker" ? workerSideRef : reviewerSideRef;
+    const commit = parsed.side === "worker" ? setWorkerSide : setReviewerSide;
+    const current = ref.current.panes[parsed.agentId] ?? initialPane();
+    const nextSide: SideState = {
+      ...ref.current,
+      panes: { ...ref.current.panes, [parsed.agentId]: { ...current, ...patch } },
+    };
+    ref.current = nextSide;
+    commit(nextSide);
   }, []);
 
-  const patchClaudeTab = useCallback((tabId: string, patch: Partial<PaneState>) => {
-    const next = claudeTabsRef.current.map((tab) =>
-      tab.id === tabId ? { ...tab, pane: { ...tab.pane, ...patch } } : tab,
-    );
-    syncClaudeTabs(next);
-  }, [syncClaudeTabs]);
-
-  const patchCodex = useCallback((patch: Partial<PaneState>) => {
-    const next = { ...codexPaneRef.current, ...patch };
-    codexPaneRef.current = next;
-    setCodexPane(next);
+  const selectAgent = useCallback((side: SideKey, agentId: string) => {
+    const ref = side === "worker" ? workerSideRef : reviewerSideRef;
+    const commit = side === "worker" ? setWorkerSide : setReviewerSide;
+    const panes = { ...ref.current.panes };
+    if (!panes[agentId]) panes[agentId] = initialPane();
+    const nextSide: SideState = { agentId, panes };
+    ref.current = nextSide;
+    commit(nextSide);
+    localStorage.setItem(side === "worker" ? "ha-worker-agent" : "ha-reviewer-agent", agentId);
   }, []);
 
   /** tab 标题/横幅用 meta：静态表优先，注册表条目兜底（新 Agent 未适配静态文案时） */
@@ -166,19 +197,15 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     [catalog],
   );
 
-  const addClaudeTab = useCallback((agentId: string = "claude") => {
-    claudeSeqRef.current += 1;
-    const id = `claude-${claudeSeqRef.current}`;
-    const next = [...claudeTabsRef.current, { id, agentId, pane: initialPane() }];
-    syncClaudeTabs(next);
-    activeClaudeIdRef.current = id;
-    setActiveClaudeId(id);
-    return id;
-  }, [syncClaudeTabs]);
-
-  const focusClaudeTab = useCallback((tabId: string) => {
-    activeClaudeIdRef.current = tabId;
-    setActiveClaudeId(tabId);
+  /** codex 输出经过稳定器平滑（ANSI 光标重绘）；其余 agent 原样透传 */
+  const stabilizerFor = useCallback((paneKey: string, agentId: string) => {
+    if (agentId !== "codex") return null;
+    let s = stabilizersRef.current.get(paneKey);
+    if (!s) {
+      s = createOutputStabilizer();
+      stabilizersRef.current.set(paneKey, s);
+    }
+    return s;
   }, []);
 
   const unmountTerminal = useCallback((paneKey: string) => {
@@ -191,10 +218,10 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     pendingOutputRef.current.clear();
     let deferred = false;
     for (const [paneKey, chunk] of output) {
-      const pane =
-        paneKey === CODEX_KEY
-          ? codexPaneRef.current
-          : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane;
+      const parsed = parsePaneKey(paneKey);
+      const pane = parsed
+        ? (parsed.side === "worker" ? workerSideRef : reviewerSideRef).current.panes[parsed.agentId]
+        : undefined;
       if (pane?.session?.id !== chunk.sessionId) continue;
       const term = terminals.current.get(paneKey);
       if (!term) {
@@ -205,7 +232,8 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         deferred = true;
         continue;
       }
-      const data = paneKey === CODEX_KEY ? codexStabilizerRef.current.push(chunk.data) : chunk.data;
+      const stabilizer = parsed ? stabilizerFor(paneKey, parsed.agentId) : null;
+      const data = stabilizer ? stabilizer.push(chunk.data) : chunk.data;
       if (data) term.write(data);
     }
     if (deferred && outputFrameRef.current === null) {
@@ -213,7 +241,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       const frame = window.requestAnimationFrame(flushOutput);
       if (outputFrameRef.current === -1) outputFrameRef.current = frame;
     }
-  }, []);
+  }, [stabilizerFor]);
 
   const enqueueOutput = useCallback((paneKey: string, sessionId: string, data: string) => {
     const pending = pendingOutputRef.current.get(paneKey);
@@ -235,12 +263,14 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
     const term = terminals.current.get(paneKey);
     // 同步写入：避免 rAF 晚于 starting→reset 把欢迎屏清掉
     if (term) {
-      const data = paneKey === CODEX_KEY ? codexStabilizerRef.current.push(buffered) : buffered;
+      const parsed = parsePaneKey(paneKey);
+      const stabilizer = parsed ? stabilizerFor(paneKey, parsed.agentId) : null;
+      const data = stabilizer ? stabilizer.push(buffered) : buffered;
       if (data) term.write(data);
       return;
     }
     enqueueOutput(paneKey, sessionId, buffered);
-  }, [enqueueOutput]);
+  }, [enqueueOutput, stabilizerFor]);
 
   const mountTerminal = useCallback((paneKey: string, terminal: Terminal) => {
     terminals.current.set(paneKey, terminal);
@@ -263,18 +293,20 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
   }, []);
 
   const runningCount =
-    claudeTabs.filter((tab) => tab.pane.status === "running").length +
-    (codexPane.status === "running" ? 1 : 0);
+    Object.values(workerSide.panes).filter((p) => p.status === "running").length +
+    Object.values(reviewerSide.panes).filter((p) => p.status === "running").length;
 
   useEffect(() => {
     onRunningChange?.(runningCount);
   }, [onRunningChange, runningCount]);
 
   const findPaneKeyBySession = useCallback((sessionId: string): string | null => {
-    for (const tab of claudeTabsRef.current) {
-      if (tab.pane.session?.id === sessionId) return tab.id;
+    for (const [agentId, pane] of Object.entries(workerSideRef.current.panes)) {
+      if (pane.session?.id === sessionId) return paneKeyOf("worker", agentId);
     }
-    if (codexPaneRef.current.session?.id === sessionId) return CODEX_KEY;
+    for (const [agentId, pane] of Object.entries(reviewerSideRef.current.panes)) {
+      if (pane.session?.id === sessionId) return paneKeyOf("reviewer", agentId);
+    }
     return null;
   }, []);
 
@@ -298,19 +330,17 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         const paneKey = findPaneKeyBySession(sessionId);
         if (!paneKey) {
           // CLI 在 start_terminal 返回、session 绑定到 pane 之前就退出了（例如二进制
-          // 秒退/崩溃）。此时会话尚未写入 tabs/pane，直接丢弃会永久卡在"运行中"：
+          // 秒退/崩溃）。此时会话尚未写入 pane，直接丢弃会永久卡在"运行中"：
           // 先缓冲，等 startPane 拿到 session 后立即应用。
           orphanExitRef.current.set(sessionId, { code });
           return;
         }
         orphanExitRef.current.delete(sessionId);
-        const patch = {
-          status: "exited" as const,
+        patchPane(paneKey, {
+          status: "exited",
           session: null,
           error: exitErrorMessage(code),
-        };
-        if (paneKey === CODEX_KEY) patchCodex(patch);
-        else patchClaudeTab(paneKey, patch);
+        });
       },
     );
     const stopError = listenWhileMounted<{ sessionId?: string; message: string }>(
@@ -319,14 +349,15 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         if (event.payload.sessionId) {
           const paneKey = findPaneKeyBySession(event.payload.sessionId);
           if (!paneKey) return;
-          if (paneKey === CODEX_KEY) patchCodex({ status: "error", error: event.payload.message });
-          else patchClaudeTab(paneKey, { status: "error", error: event.payload.message });
+          patchPane(paneKey, { status: "error", error: event.payload.message });
           return;
         }
-        for (const tab of claudeTabsRef.current) {
-          patchClaudeTab(tab.id, { status: "error", error: event.payload.message });
+        for (const side of ["worker", "reviewer"] as SideKey[]) {
+          const ref = sideRef(side);
+          for (const agentId of Object.keys(ref.current.panes)) {
+            patchPane(paneKeyOf(side, agentId), { status: "error", error: event.payload.message });
+          }
         }
-        patchCodex({ status: "error", error: event.payload.message });
       },
     );
 
@@ -342,7 +373,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       stopError();
       stopNotice();
     };
-  }, [enqueueOutput, findPaneKeyBySession, patchClaudeTab, patchCodex]);
+  }, [enqueueOutput, findPaneKeyBySession, patchPane]);
 
   const startPane = useCallback(
     async (
@@ -353,30 +384,22 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
       opts?: StartOptions,
       options?: { skipBusyGate?: boolean },
     ): Promise<string | null> => {
-      const pane =
-        paneKey === CODEX_KEY
-          ? codexPaneRef.current
-          : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane;
-      if (!pane) return null;
+      const parsed = parsePaneKey(paneKey);
+      if (!parsed) return null;
+      const pane = sideRef(parsed.side).current.panes[parsed.agentId] ?? initialPane();
       if (!options?.skipBusyGate && isBusyStatus(pane.status)) {
-        const patch = { error: "终端已在运行：请先停止当前会话再续聊/启动" };
-        if (paneKey === CODEX_KEY) patchCodex(patch);
-        else patchClaudeTab(paneKey, patch);
+        patchPane(paneKey, { error: "终端已在运行：请先停止当前会话再续聊/启动" });
         return null;
       }
-      const workDir = (opts?.workDir ?? (agent === "claude" ? projectWorkDir ?? "" : codexWorkDir)).trim();
+      const workDir = (
+        opts?.workDir ?? (parsed.side === "worker" ? projectWorkDir ?? "" : reviewerWorkDir)
+      ).trim();
       if (!workDir) {
-        const patch = { status: "error" as const, error: "请输入工作目录" };
-        if (paneKey === CODEX_KEY) patchCodex(patch);
-        else patchClaudeTab(paneKey, patch);
+        patchPane(paneKey, { status: "error" as const, error: "请输入工作目录" });
         return null;
       }
-      if (paneKey === CODEX_KEY) {
-        patchCodex({ status: "starting", error: "" });
-        codexStabilizerRef.current.reset();
-      } else {
-        patchClaudeTab(paneKey, { status: "starting", error: "" });
-      }
+      patchPane(paneKey, { status: "starting", error: "" });
+      if (agent === "codex") stabilizerFor(paneKey, agent)?.reset();
       // 同步清屏，避免 useEffect(reset) 在 orphan 回放之后才跑把画面清空
       terminals.current.get(paneKey)?.reset();
       try {
@@ -392,17 +415,14 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           orphanExitRef.current.delete(session.id);
           // 退出前若有残余输出也一并回放，避免"已退出但缺最后一帧"
           claimOrphanOutput(paneKey, session.id);
-          const patch = {
-            status: "exited" as const,
+          patchPane(paneKey, {
+            status: "exited",
             session: null,
             error: exitErrorMessage(orphanExit.code),
-          };
-          if (paneKey === CODEX_KEY) patchCodex(patch);
-          else patchClaudeTab(paneKey, patch);
+          });
           return null;
         }
-        if (paneKey === CODEX_KEY) patchCodex({ session, status: "running", error: "" });
-        else patchClaudeTab(paneKey, { session, status: "running", error: "" });
+        patchPane(paneKey, { session, status: "running", error: "" });
         claimOrphanOutput(paneKey, session.id);
         const term = terminals.current.get(paneKey);
         if (term?.cols && term.rows) {
@@ -414,73 +434,54 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         }
         return session.id;
       } catch (error) {
-        const patch = { status: "error" as const, error: String(error) };
-        if (paneKey === CODEX_KEY) patchCodex(patch);
-        else patchClaudeTab(paneKey, patch);
+        patchPane(paneKey, { status: "error" as const, error: String(error) });
         return null;
       }
     },
-    [claimOrphanOutput, patchClaudeTab, patchCodex, projectWorkDir, codexWorkDir],
+    [claimOrphanOutput, patchPane, projectWorkDir, reviewerWorkDir, stabilizerFor],
   );
-
-  const pickClaudeTabForResume = useCallback(() => {
-    const activeId = activeClaudeIdRef.current;
-    const activeTab = claudeTabsRef.current.find((t) => t.id === activeId);
-    if (activeTab && !isBusyStatus(activeTab.pane.status)) return activeTab.id;
-    const idle = claudeTabsRef.current.find((t) => !isBusyStatus(t.pane.status));
-    if (idle) {
-      focusClaudeTab(idle.id);
-      return idle.id;
-    }
-    return addClaudeTab();
-  }, [addClaudeTab, focusClaudeTab]);
 
   useImperativeHandle(
     ref,
     () => ({
       startWith: (agent, opts) => {
+        // 续聊归属侧：claude → 工人侧；codex → 监督侧；其余工人候选 → 工人侧
+        const side: SideKey = agent === "codex" ? "reviewer" : "worker";
+        selectAgent(side, agent);
         if (opts?.workDir !== undefined) {
-          if (agent === "claude") onProjectWorkDirChange?.(opts.workDir);
-          else setCodexWorkDir(opts.workDir);
+          if (side === "worker") onProjectWorkDirChange?.(opts.workDir);
+          else setReviewerWorkDir(opts.workDir);
         }
-        if (agent === "codex") {
-          const terminal = terminals.current.get(CODEX_KEY);
-          void startPane(CODEX_KEY, "codex", terminal?.cols ?? 120, terminal?.rows ?? 30, opts);
-          return;
-        }
-        const tabId = pickClaudeTabForResume();
-        const terminal = terminals.current.get(tabId);
-        void startPane(tabId, "claude", terminal?.cols ?? 120, terminal?.rows ?? 30, opts);
+        const paneKey = paneKeyOf(side, agent);
+        const terminal = terminals.current.get(paneKey);
+        void startPane(paneKey, agent, terminal?.cols ?? 120, terminal?.rows ?? 30, opts);
       },
       startClaudeForTask: (workDir) => {
         const run = async () => {
           if (workDir !== undefined) onProjectWorkDirChange?.(workDir);
           const target = (workDir ?? projectWorkDir ?? "").trim();
+          selectAgent("worker", "claude");
           // 驱动任务必须换新 PTY：同目录里已经冻在信任菜单上的会话不会自己恢复。
-          const stale = claudeTabsRef.current.filter((tab) => {
-            const dir = tab.pane.session?.work_dir ?? "";
-            return Boolean(target) && isBusyStatus(tab.pane.status) && dir && samePath(dir, target);
-          });
-          for (const tab of stale) {
-            const sessionId = tab.pane.session?.id;
-            if (!sessionId) continue;
-            patchClaudeTab(tab.id, { status: "stopping", error: "" });
+          const panes = workerSideRef.current.panes;
+          const staleSession = panes.claude?.session?.id;
+          const staleBusy =
+            Boolean(target) &&
+            panes.claude &&
+            isBusyStatus(panes.claude.status) &&
+            samePath(panes.claude.session?.work_dir ?? "", target);
+          if (staleSession && staleBusy) {
+            patchPane(paneKeyOf("worker", "claude"), { status: "stopping", error: "" });
             try {
-              await stopTerminal(sessionId);
+              await stopTerminal(staleSession);
             } catch {
               // 旧进程杀不掉也不阻断新启动；新 pane 才是可交互的那一个。
             }
-            patchClaudeTab(tab.id, { status: "exited", session: null, error: "" });
+            patchPane(paneKeyOf("worker", "claude"), { status: "exited", session: null, error: "" });
           }
-          const idle = claudeTabsRef.current.find(
-            (t) => !isBusyStatus(t.pane.status) && !t.pane.session,
-          );
-          const tabId = idle?.id ?? addClaudeTab();
-          focusClaudeTab(tabId);
-          if (idle) patchClaudeTab(idle.id, { status: "starting", error: "" });
-          const terminal = terminals.current.get(tabId);
+          const paneKey = paneKeyOf("worker", "claude");
+          const terminal = terminals.current.get(paneKey);
           const sessionId = await startPane(
-            tabId,
+            paneKey,
             "claude",
             terminal?.cols ?? 120,
             terminal?.rows ?? 30,
@@ -490,84 +491,78 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           if (!sessionId) throw new Error("无法启动 Claude 终端");
           return sessionId;
         };
-        const queued = claudeStartChainRef.current.then(run, run);
-        claudeStartChainRef.current = queued.then(
+        const queued = workerStartChainRef.current.then(run, run);
+        workerStartChainRef.current = queued.then(
           () => undefined,
           () => undefined,
         );
         return queued;
       },
       focusSession: (sessionId) => {
-        const tab = claudeTabsRef.current.find((t) => t.pane.session?.id === sessionId);
-        if (tab) focusClaudeTab(tab.id);
+        for (const side of ["worker", "reviewer"] as SideKey[]) {
+          const panes = sideRef(side).current.panes;
+          for (const [agentId, pane] of Object.entries(panes)) {
+            if (pane.session?.id === sessionId) {
+              selectAgent(side, agentId);
+              terminals.current.get(paneKeyOf(side, agentId))?.focus();
+              return;
+            }
+          }
+        }
       },
       focusActiveClaude: () => {
-        terminals.current.get(activeClaudeIdRef.current)?.focus();
+        terminals.current.get(paneKeyOf("worker", workerSideRef.current.agentId))?.focus();
       },
       claimIdleAgentPane: (agentId, workDir) => {
-        const tab = claudeTabsRef.current.find(
-          (t) =>
-            t.agentId === agentId &&
-            t.pane.session?.id &&
-            !isBusyStatus(t.pane.status) &&
-            samePath(t.pane.session.work_dir ?? "", workDir.trim()),
-        );
-        if (!tab) return null;
-        focusClaudeTab(tab.id);
-        return tab.pane.session?.id ?? null;
+        const pane = workerSideRef.current.panes[agentId];
+        if (
+          pane?.session?.id &&
+          !isBusyStatus(pane.status) &&
+          samePath(pane.session.work_dir ?? "", workDir.trim())
+        ) {
+          selectAgent("worker", agentId);
+          return pane.session.id;
+        }
+        return null;
       },
     }),
-    [addClaudeTab, focusClaudeTab, onProjectWorkDirChange, patchClaudeTab, pickClaudeTabForResume, projectWorkDir, startPane],
+    [onProjectWorkDirChange, patchPane, projectWorkDir, selectAgent, startPane],
   );
 
   const handleStop = useCallback(
     async (paneKey: string) => {
-      const pane =
-        paneKey === CODEX_KEY
-          ? codexPaneRef.current
-          : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane;
+      const parsed = parsePaneKey(paneKey);
+      if (!parsed) return;
+      const pane = sideRef(parsed.side).current.panes[parsed.agentId];
       const session = pane?.session;
       if (!session) return;
-      if (paneKey === CODEX_KEY) patchCodex({ status: "stopping", error: "" });
-      else patchClaudeTab(paneKey, { status: "stopping", error: "" });
+      patchPane(paneKey, { status: "stopping", error: "" });
       try {
         await stopTerminal(session.id);
       } catch (error) {
-        const still =
-          paneKey === CODEX_KEY
-            ? codexPaneRef.current.session?.id === session.id
-            : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane.session?.id === session.id;
+        const still = sideRef(parsed.side).current.panes[parsed.agentId]?.session?.id === session.id;
         if (still) {
-          const patch = { status: "running" as const, error: String(error) };
-          if (paneKey === CODEX_KEY) patchCodex(patch);
-          else patchClaudeTab(paneKey, patch);
+          patchPane(paneKey, { status: "running" as const, error: String(error) });
         }
       }
     },
-    [patchClaudeTab, patchCodex],
+    [patchPane],
   );
 
   const handleInput = useCallback(
     (paneKey: string, data: string) => {
-      const pane =
-        paneKey === CODEX_KEY
-          ? codexPaneRef.current
-          : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane;
-      const session = pane?.session;
+      const parsed = parsePaneKey(paneKey);
+      if (!parsed) return;
+      const session = sideRef(parsed.side).current.panes[parsed.agentId]?.session;
       if (!session) return;
       const sessionId = session.id;
       const write = async () => {
-        const current =
-          paneKey === CODEX_KEY
-            ? codexPaneRef.current.session?.id
-            : claudeTabsRef.current.find((t) => t.id === paneKey)?.pane.session?.id;
+        const current = sideRef(parsed.side).current.panes[parsed.agentId]?.session?.id;
         if (current !== sessionId) return;
         try {
           await writeTerminal(sessionId, data);
         } catch (error) {
-          const patch = { status: "error" as const, error: String(error) };
-          if (paneKey === CODEX_KEY) patchCodex(patch);
-          else patchClaudeTab(paneKey, patch);
+          patchPane(paneKey, { status: "error" as const, error: String(error) });
         }
       };
       const prev = inputQueuesRef.current.get(paneKey) ?? Promise.resolve();
@@ -576,8 +571,83 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         prev.catch(() => undefined).then(write),
       );
     },
-    [patchClaudeTab, patchCodex],
+    [patchPane],
   );
+
+  /** 一侧的渲染：选择器 + 各 agent 的 pane（选中的可见，其余保持挂载保实例） */
+  const renderSide = (side: SideKey) => {
+    const state = side === "worker" ? workerSide : reviewerSide;
+    const setDir = side === "worker"
+      ? (dir: string) => onProjectWorkDirChange?.(dir)
+      : setReviewerWorkDir;
+    const sideWorkDir = side === "worker" ? projectWorkDir ?? "" : reviewerWorkDir;
+    const options = catalog.filter((c) => c.can_work);
+    const selectOptions = options.length
+      ? options
+      : [{ id: side === "worker" ? "claude" : "codex", name: side === "worker" ? "Claude Code" : "Codex CLI", installed: true, sessions_present: false, can_work: true, can_review: true }];
+    return (
+      <div className="terminal-side" data-side={side}>
+        <div className="terminal-side__head">
+          <span className={`terminal-side__role terminal-side__role--${side}`}>
+            {side === "worker" ? <Icon name="spark" size={13} /> : <Icon name="shield" size={13} />}
+            {SIDE_LABEL[side]}
+          </span>
+          <select
+            className="terminal-side__select"
+            value={state.agentId}
+            onChange={(e) => selectAgent(side, e.currentTarget.value)}
+            aria-label={`${SIDE_LABEL[side]} Agent`}
+            title={`切换${SIDE_LABEL[side]}的 CLI Agent（每个 Agent 保留独立终端）`}
+          >
+            {(selectOptions as { id: string; name: string; installed: boolean }[]).map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+                {c.installed ? "" : "（未检测到安装）"}
+              </option>
+            ))}
+          </select>
+        </div>
+        {Object.entries(state.panes).map(([agentId, pane]) => {
+          const paneKey = paneKeyOf(side, agentId);
+          const visible = agentId === state.agentId;
+          return (
+            <div
+              key={agentId}
+              className={`terminal-side-host ${visible ? "is-active" : ""}`}
+              hidden={!visible}
+              style={{ display: visible ? "flex" : "none" }}
+            >
+              <TerminalPane
+                agent={agentMetaFor(agentId)}
+                paneKey={paneKey}
+                workspaceActive={active && visible}
+                surfaceVisible={visible}
+                pane={pane}
+                workDir={sideWorkDir}
+                onMount={(terminal) => mountTerminal(paneKey, terminal)}
+                onUnmount={() => unmountTerminal(paneKey)}
+                onStart={(_agent, cols, rows) => {
+                  void startPane(paneKey, agentId, cols, rows);
+                }}
+                onStop={() => {
+                  void handleStop(paneKey);
+                }}
+                onInput={(_agent, data) => handleInput(paneKey, data)}
+                onResize={async (sessionId, cols, rows) => {
+                  try {
+                    await resizeTerminal(sessionId, cols, rows);
+                  } catch (error) {
+                    patchPane(paneKey, { error: String(error) });
+                  }
+                }}
+                onWorkDirChange={setDir}
+              />
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
 
   return (
     <div className={`terminal-workspace ${active ? "is-active" : ""}`}>
@@ -585,7 +655,7 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         <div>
           <span className="eyebrow">LOCAL CLI WORKBENCH</span>
           <h2>本地 CLI 工作台</h2>
-          <p>按需启动注册表中的 CLI Agent（Claude / Codex / Gemini / Grok / DSH…）。工人 Agent 可开多个标签；切换工作区不会结束进程。</p>
+          <p>左侧是被监督方（干活），右侧是监督方（审查）。两侧各选一个 CLI Agent，选中即显示其终端；切换工作区不会结束进程。</p>
         </div>
         <div className="terminal-intro__note">
           <Icon name="shield" size={15} />
@@ -611,90 +681,10 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
         ref={gridRef}
         style={{ "--terminal-primary-size": `${ratio}%` } as CSSProperties}
       >
-        <div className="terminal-claude-stack">
-          <div className="terminal-agent-bar" role="toolbar" aria-label="Agent 启动条">
-            {catalog
-              .filter((c) => c.can_work)
-              .map((entry) => (
-                <button
-                  key={entry.id}
-                  type="button"
-                  className={`terminal-agent-chip ${entry.installed ? "" : "terminal-agent-chip--missing"}`}
-                  onClick={() => addClaudeTab(entry.id)}
-                  title={
-                    entry.installed
-                      ? `新开一个 ${entry.name} 终端标签`
-                      : `${entry.name} 未检测到安装（仍可尝试启动）`
-                  }
-                >
-                  <Icon name={entry.id === "claude" ? "spark" : "terminal"} size={13} />
-                  {entry.name}
-                  {!entry.installed ? " ·未安装" : entry.sessions_present ? " ·有历史会话" : ""}
-                </button>
-              ))}
-          </div>
-          <div className="terminal-claude-tabs" role="tablist" aria-label="CLI 终端标签">
-            {claudeTabs.map((tab, index) => (
-              <button
-                key={tab.id}
-                type="button"
-                role="tab"
-                aria-selected={tab.id === activeClaudeId}
-                className={`terminal-claude-tab ${tab.id === activeClaudeId ? "is-active" : ""}`}
-                onClick={() => focusClaudeTab(tab.id)}
-              >
-                {agentMetaFor(tab.agentId).label} {index + 1}
-                {tab.pane.status === "running" ? " · 运行中" : ""}
-              </button>
-            ))}
-            <button
-              type="button"
-              className="terminal-claude-tab terminal-claude-tab--add"
-              onClick={() => addClaudeTab("claude")}
-              aria-label="新增 Claude 终端"
-              title="新增一个 Claude 终端会话"
-            >
-              <Icon name="plus" size={13} />
-            </button>
-          </div>
-          {claudeTabs.map((tab) => (
-            <div
-              key={tab.id}
-              className={`terminal-claude-host ${tab.id === activeClaudeId ? "is-active" : ""}`}
-              hidden={tab.id !== activeClaudeId}
-              style={{ display: tab.id === activeClaudeId ? "flex" : "none" }}
-            >
-              <TerminalPane
-                agent={agentMetaFor(tab.agentId)}
-                paneKey={tab.id}
-                workspaceActive={active && tab.id === activeClaudeId}
-                surfaceVisible={tab.id === activeClaudeId}
-                pane={tab.pane}
-                workDir={projectWorkDir ?? ""}
-                onMount={(terminal) => mountTerminal(tab.id, terminal)}
-                onUnmount={() => unmountTerminal(tab.id)}
-                onStart={(_agent, cols, rows) => {
-                  void startPane(tab.id, tab.agentId, cols, rows);
-                }}
-                onStop={() => {
-                  void handleStop(tab.id);
-                }}
-                onInput={(_agent, data) => handleInput(tab.id, data)}
-                onResize={async (sessionId, cols, rows) => {
-                  try {
-                    await resizeTerminal(sessionId, cols, rows);
-                  } catch (error) {
-                    patchClaudeTab(tab.id, { error: String(error) });
-                  }
-                }}
-                onWorkDirChange={(workDir) => onProjectWorkDirChange?.(workDir)}
-              />
-            </div>
-          ))}
-        </div>
+        {renderSide("worker")}
         <SplitHandle
           orientation={stacked ? "horizontal" : "vertical"}
-          label="调整 Claude 与 Codex 终端区域"
+          label="调整被监督方与监督方终端区域"
           value={ratio}
           min={minRatio}
           max={maxRatio}
@@ -702,33 +692,9 @@ export function TerminalWorkspace({ active, onRunningChange, projectWorkDir, onP
           pixelsPerUnit={Math.max(1, axisSize - SPLITTER_SIZE) / 100}
           step={5}
           className="terminal-split"
-          valueText={`Claude 终端区域占比 ${Math.round(ratio)}%`}
+          valueText={`被监督方终端区域占比 ${Math.round(ratio)}%`}
         />
-        <TerminalPane
-          agent={CODEX_META}
-          paneKey={CODEX_KEY}
-          workspaceActive={active}
-          surfaceVisible
-          pane={codexPane}
-          workDir={codexWorkDir}
-          onMount={(terminal) => mountTerminal(CODEX_KEY, terminal)}
-          onUnmount={() => unmountTerminal(CODEX_KEY)}
-          onStart={(_agent, cols, rows) => {
-            void startPane(CODEX_KEY, "codex", cols, rows);
-          }}
-          onStop={() => {
-            void handleStop(CODEX_KEY);
-          }}
-          onInput={(_agent, data) => handleInput(CODEX_KEY, data)}
-          onResize={async (sessionId, cols, rows) => {
-            try {
-              await resizeTerminal(sessionId, cols, rows);
-            } catch (error) {
-              patchCodex({ error: String(error) });
-            }
-          }}
-          onWorkDirChange={setCodexWorkDir}
-        />
+        {renderSide("reviewer")}
       </div>
     </div>
   );
@@ -1012,7 +978,7 @@ function TerminalSurface({
     }
   }, []);
 
-  // Mount xterm while the terminals workspace is open (all Claude tabs keep instances).
+  // Mount xterm while the terminals workspace is open (all panes keep instances).
   useEffect(() => {
     if (!workspaceActive || !hostRef.current || terminalRef.current || mountingRef.current) return;
     mountingRef.current = true;
