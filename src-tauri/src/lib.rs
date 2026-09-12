@@ -850,15 +850,9 @@ async fn run_supervise_terminal(
     if !worker_profile.can_work {
         return Err(format!("{} 不支持作为被监督方（无交互终端模式）", worker_profile.name));
     }
-    // v1 引擎边界：令牌预钉/Stop hook/会话定位均为 Claude Code 专属链路，
-    // 其他工人的会话适配（engine 按 session_roots 定位）接入前显式阻断，
-    // 避免任务启动后每轮 Timeout 空转
-    if worker_agent != "claude" {
-        return Err(format!(
-            "{} 作为被监督方的会话适配尚未接入（当前仅支持 Claude Code 被监督）；可先将其添加为监督方",
-            worker_profile.name
-        ));
-    }
+    // 非 claude 工人走工作区审查模式（无 Stop hook/会话文件：轮末按终端静默
+    // 判定，审查者检查工作目录）；claude 保持完整链路（token 预钉 + Stop hook）
+    let workspace_review = worker_agent != "claude";
     // 启动前预检工人 CLI 端点可用（403/未登录等在此拦下，不烧任务轮次）
     supervise_runner::preflight_agent(worker_agent, &work_dir)?;
 
@@ -1004,8 +998,19 @@ async fn run_supervise_terminal(
             (false, Some(m)) => m.to_string(),
             (false, None) => format!("{} 默认模型", reviewer_profile.name),
         },
+        workspace_review,
         ..Default::default()
     };
+    if workspace_review {
+        // 首条日志写明降级行为，用户知道轮末判定方式不同
+        state.tasks.lock().unwrap().entry(task_id.clone()).and_modify(|t| {
+            t.log.push(format!(
+                "[ENGINE] {} 工人：工作区审查模式（无 Stop hook，轮末按终端静默判定）",
+                worker_profile.name
+            ));
+        });
+        persist_tasks(&app);
+    }
     let reviewer: Arc<dyn Reviewer> = if request.mock {
         // mock：第 1 轮模拟返工意见、第 2 轮通过（无 CLI 环境也能演示全链路）
         Arc::new(MockReviewer::scripted(vec![
@@ -1297,6 +1302,7 @@ async fn continue_supervise_terminal(
 
     // 6) opts + reviewer（沿用原令牌/审查方式；未通过注入审查意见返工，
     // 中止/取消以原任务正文重启——中止时 last_reason 是失败原因，不是审查意见）
+    let workspace_review = worker_agent != "claude";
     let rework_text = if is_rework {
         format!("上一轮审查未通过，请按要求返工：{last_reason}")
     } else {
@@ -1309,7 +1315,15 @@ async fn continue_supervise_terminal(
         starting_round: task.rounds,
         artifacts_dir: Some(artifacts_dir),
         task_token: Some(format!("{}:{started_at}", request.task_id)),
-        reviewer_label: if mock { "mock".into() } else { "codex 默认模型".into() },
+        reviewer_label: if mock {
+            "mock".into()
+        } else {
+            match agent_registry::get(&reviewer_agent) {
+                Some(p) => format!("{} 默认模型", p.name),
+                None => "codex 默认模型".into(),
+            }
+        },
+        workspace_review,
         ..Default::default()
     };
     let reviewer: Arc<dyn supervise_engine::Reviewer> = if mock {

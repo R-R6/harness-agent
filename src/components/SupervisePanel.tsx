@@ -232,6 +232,7 @@ export function SupervisePanel({
                 <option key={c.id} value={c.id}>
                   {c.name}
                   {c.installed ? "" : "（未检测到安装）"}
+                  {c.id !== "claude" ? "（实验：终端静默判定轮末）" : ""}
                 </option>
               ))}
             </select>

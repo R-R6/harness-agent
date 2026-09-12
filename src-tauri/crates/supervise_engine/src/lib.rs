@@ -68,6 +68,9 @@ pub struct EngineOptions {
     pub task_token: Option<String>,
     /// 审查者标签（写产物用：模型名 / "mock"）
     pub reviewer_label: String,
+    /// 工作区审查模式（非 claude 工人）：无 Stop hook/会话文件可依赖——
+    /// 轮末以终端输出静默判定，审查者检查工作目录而非会话 transcript
+    pub workspace_review: bool,
 }
 
 impl Default for EngineOptions {
@@ -86,6 +89,7 @@ impl Default for EngineOptions {
             artifacts_dir: None,
             task_token: None,
             reviewer_label: String::new(),
+            workspace_review: false,
         }
     }
 }
@@ -482,6 +486,37 @@ pub enum RoundEnd {
     Cancelled,
 }
 
+/// 工作区模式的轮末判定：无会话文件可监视，以终端输出静默为准——
+/// recent_output 长度出现增长即"有活动"，此后保持 opts.silence 无增长即判轮末。
+fn wait_round_end_silence(
+    opts: &EngineOptions,
+    pane: &Arc<dyn PaneIo>,
+    cancel: &AtomicBool,
+) -> RoundEnd {
+    let start = Instant::now();
+    let mut last_len = pane.recent_output().len();
+    let mut last_change = Instant::now();
+    let mut saw_activity = false;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return RoundEnd::Cancelled;
+        }
+        let len = pane.recent_output().len();
+        if len != last_len {
+            last_len = len;
+            last_change = Instant::now();
+            saw_activity = true;
+        }
+        if saw_activity && last_change.elapsed() >= opts.silence {
+            return RoundEnd::Silence;
+        }
+        if start.elapsed() >= opts.round_timeout {
+            return RoundEnd::Timeout;
+        }
+        std::thread::sleep(opts.poll_interval);
+    }
+}
+
 fn wait_round_end(
     opts: &EngineOptions,
     markers: &MarkerSource,
@@ -852,7 +887,7 @@ fn run_loop(
         // 提交由 confirm_inject 补回车完成；窗口 = delivery_confirm + first_inject_confirm
         //（覆盖 Claude 冷启动十几秒）。窗口内未确认 = 正文被吞（输入栏空）→ 重写正文
         // 再等一个窗口。窗口内只补回车不重写，故不会「任务两遍」。
-        if session_pin.is_none() {
+        if session_pin.is_none() && !opts.workspace_review {
             if let Some(tok) = opts.task_token.as_deref().filter(|s| !s.is_empty()) {
                 let token = format!("[supervise-task:{tok}]");
                 let window = opts.delivery_confirm + opts.first_inject_confirm;
@@ -908,8 +943,11 @@ fn run_loop(
             }
         }
 
-        let (transcript, ended) =
-            wait_round_end(opts, markers, projects_root, &slug, cutoff, &mut session_pin, cancel);
+        let (transcript, ended) = if opts.workspace_review {
+            (None, wait_round_end_silence(opts, &pane, cancel))
+        } else {
+            wait_round_end(opts, markers, projects_root, &slug, cutoff, &mut session_pin, cancel)
+        };
         if ended == RoundEnd::Cancelled {
             return EngineOutcome {
                 status: EngineStatus::Cancelled,
@@ -927,10 +965,15 @@ fn run_loop(
             }
         ));
 
-        let Some(transcript) = transcript else {
-            last_reason = "未找到会话文件（无 marker 也无新会话），无法审查".into();
-            on_log(&format!("[ENGINE] {last_reason}"));
-            continue;
+        let transcript = match transcript {
+            Some(t) => t,
+            // 工作区模式：把工作目录当"审查对象"传给审查者（prompt 按 is_dir 分支）
+            None if opts.workspace_review => PathBuf::from(&opts.work_dir),
+            None => {
+                last_reason = "未找到会话文件（无 marker 也无新会话），无法审查".into();
+                on_log(&format!("[ENGINE] {last_reason}"));
+                continue;
+            }
         };
         known_transcript = Some(transcript.clone());
 
@@ -941,7 +984,7 @@ fn run_loop(
         let stat_now = std::fs::metadata(&transcript)
             .ok()
             .map(|m| (m.len(), m.modified().ok()));
-        if last_review_stat.is_some() && stat_now == last_review_stat {
+        if !opts.workspace_review && last_review_stat.is_some() && stat_now == last_review_stat {
             last_reason =
                 "会话自上轮审查后无任何变化：工人未响应返工（注入可能被终端吞掉），维持 REVIEW"
                     .into();
@@ -1141,6 +1184,7 @@ mod tests {
             task_token: None,
             reviewer_label: "mock".into(),
             starting_round: 0,
+            workspace_review: false,
         }
     }
 
@@ -1152,6 +1196,71 @@ mod tests {
             "F--project-workspace-side-my-skils"
         );
         assert_eq!(project_slug("C:\\Work\\My Project"), "C--Work-My-Project");
+    }
+
+    /// 非 claude 工人（工作区审查模式）：无 Stop hook/会话文件——轮末按终端
+    /// 输出静默判定，审查者收到工作目录；不再走令牌预钉（旧路径会直接中止）
+    #[test]
+    fn workspace_review_round_ends_by_pane_silence() {
+        let dir = tmp_dir("workspace-review");
+        let mut opts = quick_opts(&dir, 1);
+        opts.workspace_review = true;
+        opts.silence = Duration::from_millis(300);
+        opts.round_timeout = Duration::from_secs(5);
+
+        let pane = FakePane::ok(dir.to_string_lossy());
+        // 模拟工人响应：注入后 200ms 终端开始输出，然后静止
+        let pane2 = pane.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut w = pane2.writes.lock().unwrap();
+            w.push("[gemini] 好的，我开始干活……".into());
+        });
+
+        let on_log: OnLog = Arc::new(|_: &str| {});
+        let src = MarkerSource::new(dir.join("no-markers.jsonl"));
+        let outcome = run(
+            &opts,
+            pane,
+            Arc::new(MockReviewer::always(Ok(Verdict {
+                pass: true,
+                reason: "工作区检查通过".into(),
+            }))),
+            &src,
+            &dir.join("projects-empty"),
+            &AtomicBool::new(false),
+            &on_log,
+        );
+        assert_eq!(outcome.status, EngineStatus::Accepted, "{outcome:?}");
+        assert_eq!(outcome.rounds, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 工作区模式下工人始终无输出 → 单轮超时仍进入审查（审查者裁决），不空转
+    #[test]
+    fn workspace_review_timeout_still_reviews() {
+        let dir = tmp_dir("workspace-timeout");
+        let mut opts = quick_opts(&dir, 1);
+        opts.workspace_review = true;
+        opts.round_timeout = Duration::from_millis(600);
+
+        let pane = FakePane::ok(dir.to_string_lossy());
+        let on_log: OnLog = Arc::new(|_: &str| {});
+        let src = MarkerSource::new(dir.join("no-markers.jsonl"));
+        let outcome = run(
+            &opts,
+            pane,
+            Arc::new(MockReviewer::always(Ok(Verdict {
+                pass: true,
+                reason: "超时但工作区无异常".into(),
+            }))),
+            &src,
+            &dir.join("projects-empty"),
+            &AtomicBool::new(false),
+            &on_log,
+        );
+        assert_eq!(outcome.status, EngineStatus::Accepted, "{outcome:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
