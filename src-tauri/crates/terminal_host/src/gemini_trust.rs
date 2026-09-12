@@ -16,7 +16,14 @@ pub fn gemini_trusted_folders_path(home: &Path) -> std::path::PathBuf {
 
 /// 把 `work_dir`（含反斜杠→斜杠变体）标记为信任：`{"<path>": true, ...}`。
 /// 已有条目保留其他字段；损坏文件返回 Err 不覆写。
+///
+/// 信任值为 Gemini 的枚举字符串（TRUST_FOLDER/TRUST_PARENT/DO_NOT_TRUST），
+/// 不是布尔——真机教训：写 `true` 会让 gemini 启动即报
+/// `Invalid trust level "true"`（老版本文档的布尔写法已废弃）。
+/// 兼容迁移：读到布尔 true/false 时升级为 TRUST_FOLDER/DO_NOT_TRUST。
 pub fn ensure_gemini_folder_trusted(config_path: &Path, work_dir: &str) -> Result<(), String> {
+    const TRUSTED: &str = "TRUST_FOLDER";
+    const NOT_TRUSTED: &str = "DO_NOT_TRUST";
     let trimmed = work_dir.trim().trim_end_matches(['/', '\\']);
     if trimmed.is_empty() {
         return Ok(());
@@ -39,19 +46,29 @@ pub fn ensure_gemini_folder_trusted(config_path: &Path, work_dir: &str) -> Resul
         BTreeMap::new()
     };
 
-    // Gemini 按 cwd 字符串精确匹配；正反斜杠都写上（Windows 大小写按原样保留）
+    // Gemini 按 cwd 字符串精确匹配；正反斜杠都写上（Windows 大小写按原样保留）。
+    // 顺带迁移旧布尔值（历史版本 bug 写入的 true/false）
     let slash = trimmed.replace('\\', "/");
     let mut changed = false;
     for key in [trimmed.to_string(), slash] {
         match root.get(&key) {
-            Some(Value::Bool(true)) => {}
+            Some(Value::String(s)) if s == TRUSTED => {}
+            Some(Value::Bool(true)) => {
+                // 旧版 bug：布尔 true 被新 gemini 拒绝，升级为枚举
+                root.insert(key, Value::String(TRUSTED.into()));
+                changed = true;
+            }
+            Some(Value::Bool(false)) => {
+                root.insert(key, Value::String(NOT_TRUSTED.into()));
+                changed = true;
+            }
             Some(_) => {
                 return Err(format!(
-                    "Gemini 信任配置 {key} 不是布尔值，未改写"
+                    "Gemini 信任配置 {key} 不是合法信任值（TRUST_FOLDER/TRUST_PARENT/DO_NOT_TRUST），未改写"
                 ));
             }
             None => {
-                root.insert(key, Value::Bool(true));
+                root.insert(key, Value::String(TRUSTED.into()));
                 changed = true;
             }
         }
@@ -83,23 +100,46 @@ mod tests {
     }
 
     #[test]
-    fn marks_both_slash_variants_trusted() {
+    fn marks_both_slash_variants_with_enum_string() {
         let path = temp_cfg();
         ensure_gemini_folder_trusted(&path, r"F:\work\proj").unwrap();
         let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(v[r"F:\work\proj"], Value::Bool(true));
-        assert_eq!(v["F:/work/proj"], Value::Bool(true));
+        // gemini 信任值是枚举字符串（TRUST_FOLDER）——布尔 true 会被 CLI 拒绝
+        assert_eq!(v[r"F:\work\proj"], Value::String("TRUST_FOLDER".into()));
+        assert_eq!(v["F:/work/proj"], Value::String("TRUST_FOLDER".into()));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn idempotent_and_keeps_other_entries() {
+    fn migrates_legacy_boolean_true() {
+        // 真机事故：旧版写 true 被 gemini 拒绝（Invalid trust level "true"）
         let path = temp_cfg();
         fs::write(&path, r#"{"D:\\other": true, "keep": "value"}"#).unwrap();
         ensure_gemini_folder_trusted(&path, r"D:\other").unwrap();
         let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(v[r"D:\other"], Value::Bool(true));
+        assert_eq!(v[r"D:\other"], Value::String("TRUST_FOLDER".into()));
         assert_eq!(v["keep"], Value::from("value"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn idempotent_when_already_enum_trusted() {
+        let path = temp_cfg();
+        fs::write(&path, r#"{"D:\\other": "TRUST_FOLDER", "keep": "value"}"#).unwrap();
+        ensure_gemini_folder_trusted(&path, r"D:\other").unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v[r"D:\other"], Value::String("TRUST_FOLDER".into()));
+        assert_eq!(v["keep"], Value::from("value"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn refuses_invalid_trust_value() {
+        let path = temp_cfg();
+        fs::write(&path, r#"{"D:\\other": "WEIRD"}"#).unwrap();
+        let err = ensure_gemini_folder_trusted(&path, r"D:\other").unwrap_err();
+        assert!(err.contains("未改写"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"D:\\other": "WEIRD"}"#);
         let _ = fs::remove_file(path);
     }
 
@@ -123,7 +163,7 @@ mod tests {
         let path = nested.join(".gemini").join("trustedFolders.json");
         ensure_gemini_folder_trusted(&path, r"F:\work\proj\").unwrap();
         let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(v[r"F:\work\proj"], Value::Bool(true));
+        assert_eq!(v[r"F:\work\proj"], Value::String("TRUST_FOLDER".into()));
         let _ = fs::remove_dir_all(nested);
     }
 }

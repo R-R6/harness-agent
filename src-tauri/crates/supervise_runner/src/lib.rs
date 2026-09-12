@@ -153,8 +153,14 @@ fn classify_preflight(timed_out: bool, exit: Option<i32>, output: &str, display:
                 || lower.contains("invalid api key")
                 || lower.contains("unauthorized")
                 || lower.contains("401")
+                // gemini：未配置认证时提示 "Please set an Auth method ... GEMINI_API_KEY"
+                || lower.contains("set an auth method")
+                || lower.contains("auth method in your")
             {
-                Err(format!("{} 未登录或凭据无效：请先在终端完成登录后重试", display))
+                Err(format!(
+                    "{} 未登录或凭据无效：请先在终端完成登录/配置 API Key 后重试",
+                    display
+                ))
             } else if lower.contains("enoent")
                 || lower.contains("不是内部或外部命令")
                 // cmd 的"不是内部或外部命令"是 GBK 字节，lossy 解码后成替换字符
