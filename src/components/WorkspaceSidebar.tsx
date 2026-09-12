@@ -11,12 +11,14 @@ interface Props {
   onRemove: (id: string) => void;
   /** 重命名空间（阶段 D：name 可编辑，默认目录 basename） */
   onRename: (id: string, name: string) => void;
+  /** 受控宽度（拖动分割线调整）；缺省时用 CSS 默认 220px */
+  width?: number;
 }
 
 /** 左侧空间栏（Codex 侧栏心智）：空间列表 + 激活态 + 添加/移除 + 重命名 */
-export function WorkspaceSidebar({ workspaces, activeId, onSelect, onAdd, onRemove, onRename }: Props) {
+export function WorkspaceSidebar({ workspaces, activeId, onSelect, onAdd, onRemove, onRename, width }: Props) {
   return (
-    <aside className="workspace-sidebar" aria-label="工作空间">
+    <aside className="workspace-sidebar" aria-label="工作空间" style={width ? { width } : undefined}>
       <div className="workspace-sidebar__head">
         <h3>工作空间</h3>
         <IconButton label="添加工作空间" onClick={onAdd}>

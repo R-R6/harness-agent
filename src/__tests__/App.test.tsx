@@ -328,6 +328,37 @@ describe("App 集成", () => {
     expect(screen.queryByTitle("打开资源管理器选择目录")).not.toBeInTheDocument();
   });
 
+  it("监督闭环工作空间栏分隔器支持拖动和键盘调整，并为主区保留宽度", async () => {
+    const wsA = { id: "ws-a", path: "D:\\space-alpha", name: "space-alpha", position: 0, createdAt: 1 };
+    localStorage.setItem("ha-workspaces", JSON.stringify([wsA]));
+    localStorage.setItem("ha-active-workspace", "ws-a");
+    render(<App />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("list_sessions", { limit: 50 }));
+    await userEvent.click(screen.getByRole("button", { name: "监督闭环" }));
+    await waitFor(() => expect(screen.getByText("space-alpha")).toBeInTheDocument());
+
+    const closedLoop = document.querySelector(".supervise-closed-loop") as HTMLDivElement;
+    Object.defineProperty(closedLoop, "clientWidth", { configurable: true, value: 900 });
+
+    const sidebar = document.querySelector(".workspace-sidebar") as HTMLElement;
+    const splitter = screen.getByRole("separator", { name: "调整工作空间栏宽度" });
+
+    fireEvent.pointerDown(splitter, { clientX: 220, pointerId: 1 });
+    fireEvent.pointerMove(splitter, { clientX: 700, pointerId: 1 });
+    fireEvent.pointerUp(splitter, { clientX: 700, pointerId: 1 });
+
+    // 900px 容器 - 520px 主区保留 - 12px 分隔器 = 368px 侧栏上限
+    expect(sidebar).toHaveStyle({ width: "368px" });
+    expect(splitter).toHaveAttribute("aria-valuemin", "160");
+    expect(splitter).toHaveAttribute("aria-valuenow", "368");
+
+    fireEvent.keyDown(splitter, { key: "ArrowLeft" });
+    expect(sidebar).toHaveStyle({ width: "344px" });
+
+    fireEvent.keyDown(splitter, { key: "Home" });
+    expect(sidebar).toHaveStyle({ width: "160px" });
+  });
+
   it("任务记录头部常驻「新建任务」按钮；点击回到可编辑表单", async () => {
     const wsA = { id: "ws-a", path: "D:\\space-alpha", name: "space-alpha", position: 0, createdAt: 1 };
     localStorage.setItem("ha-workspaces", JSON.stringify([wsA]));

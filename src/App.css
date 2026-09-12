@@ -532,7 +532,6 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
   .terminal-intro { align-items: flex-start; flex-direction: column; }
   .terminal-intro__note { white-space: normal; }
   .supervise-layout { padding: 12px; }
-  .workspace-sidebar { width: 170px; }
 }
 @media (max-width: 620px) {
   .topbar { padding: 12px; }
@@ -559,8 +558,8 @@ code, pre, .file-path-row, .session-list .time, .session-id, .model {
 .supervise-closed-loop { display: flex; min-height: 0; flex: 1; overflow: hidden; }
 .supervise-closed-loop__main { display: flex; min-width: 0; flex: 1; flex-direction: column; overflow: hidden; }
 
-/* 左侧空间栏 */
-.workspace-sidebar { width: 220px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--bg); overflow: hidden; }
+/* 左侧空间栏（分隔线由可拖动的 SplitHandle 提供，不再自绘 border-right） */
+.workspace-sidebar { width: 220px; flex-shrink: 0; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; }
 .workspace-sidebar__head { display: flex; align-items: center; gap: 8px; padding: 16px 14px 10px; }
 .workspace-sidebar__head h3 { margin: 0; font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
 .workspace-sidebar__head .icon-button { margin-left: auto; }

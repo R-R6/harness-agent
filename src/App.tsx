@@ -47,6 +47,9 @@ const SUPERVISE_WIDTH_MIN = 320;
 const SUPERVISE_WIDTH_MAX = 620;
 const SUPERVISE_HEIGHT_MIN = 240;
 const SUPERVISE_HEIGHT_MAX = 520;
+const WS_SIDEBAR_MIN = 160;
+const WS_SIDEBAR_MAX = 420;
+const WS_MAIN_TARGET_MIN = 520;      // 监督闭环主区保留的最小宽度（表单 + 看板）
 const TRANSCRIPT_PAGE = 200;           // 会话正文每页条数（与 server.js MAX_LINES 对齐）
 
 function clampWidth(width: number, min: number, max: number) {
@@ -305,9 +308,36 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useStoredNumber("ha-layout-session-sidebar-width", 320);
   const [panelWidth, setPanelWidth] = useStoredNumber("ha-layout-supervise-width", 420);
   const [panelHeight, setPanelHeight] = useStoredNumber("ha-layout-supervise-height", 320);
+  const [wsSidebarWidth, setWsSidebarWidth] = useStoredNumber("ha-layout-workspace-sidebar-width", 220);
   const sessionLayoutRef = useRef<HTMLDivElement>(null);
   const superviseLayoutRef = useRef<HTMLDivElement>(null);
+  const closedLoopRef = useRef<HTMLDivElement>(null);
   const superviseSize = useElementSize(superviseLayoutRef);
+
+  const getWorkspaceSidebarMax = useCallback(() => {
+    const layoutWidth = closedLoopRef.current?.clientWidth;
+    if (!layoutWidth) return WS_SIDEBAR_MAX;
+    return Math.max(
+      WS_SIDEBAR_MIN,
+      Math.min(WS_SIDEBAR_MAX, layoutWidth - WS_MAIN_TARGET_MIN - SPLITTER_HIT_AREA),
+    );
+  }, []);
+
+  useLayoutEffect(() => {
+    const constrainWsSidebar = () => {
+      setWsSidebarWidth((current) => clampWidth(current, WS_SIDEBAR_MIN, getWorkspaceSidebarMax()));
+    };
+
+    constrainWsSidebar();
+    if (typeof ResizeObserver === "undefined" || !closedLoopRef.current) {
+      window.addEventListener("resize", constrainWsSidebar);
+      return () => window.removeEventListener("resize", constrainWsSidebar);
+    }
+
+    const observer = new ResizeObserver(constrainWsSidebar);
+    observer.observe(closedLoopRef.current);
+    return () => observer.disconnect();
+  }, [getWorkspaceSidebarMax]);
 
   const getSessionSidebarMax = useCallback(() => {
     const layoutWidth = sessionLayoutRef.current?.clientWidth;
@@ -747,7 +777,7 @@ function App() {
         </section>
 
         <section className={`view ${tab === "supervise" ? "active" : ""}`} aria-hidden={tab !== "supervise"}>
-          <div className="supervise-closed-loop">
+          <div className="supervise-closed-loop" ref={closedLoopRef}>
             <WorkspaceSidebar
               workspaces={workspaces.list}
               activeId={workspaces.activeId}
@@ -755,6 +785,17 @@ function App() {
               onAdd={handleAddWorkspace}
               onRemove={handleRemoveWorkspace}
               onRename={handleRenameWorkspace}
+              width={wsSidebarWidth}
+            />
+            <SplitHandle
+              orientation="vertical"
+              label="调整工作空间栏宽度"
+              value={wsSidebarWidth}
+              min={WS_SIDEBAR_MIN}
+              max={getWorkspaceSidebarMax}
+              onChange={setWsSidebarWidth}
+              className="workspace-sidebar-split"
+              valueText={`工作空间栏宽度 ${Math.round(wsSidebarWidth)} 像素`}
             />
             <div className="supervise-closed-loop__main">
               {!activeWorkspace ? (
